@@ -10,7 +10,7 @@ SearXNG aggregates results from 70+ search engines — Google, Bing, DuckDuckGo,
 
 - **Multi-engine aggregation**: Queries dozens of search engines simultaneously and deduplicates results
 - **Zero tracking**: No user profiling, no ad targeting, no query logging to third parties
-- **API access**: JSON API for programmatic search queries (used by Perplexica and OpenClaw)
+- **API access**: JSON API for programmatic search queries (used by Perplexica and Hermes)
 - **Configurable engines**: Enable, disable, or weight individual search engines in `config/searxng/`
 - **Multiple categories**: Web, images, news, science, files, social media, and more
 - **Lightweight**: Runs in under 512 MB of memory
@@ -28,6 +28,12 @@ Additional configuration is managed via files in `./config/searxng/`:
 - `limiter.toml` — Rate limiting rules
 
 > **Settings file:** The config directory is mounted read-write so changes to `settings.yml` take effect after a container restart without rebuilding the image.
+
+### Search language
+
+Pixel, Hermes and Perplexica call the JSON API without a `language` parameter, so the installer sets `search.default_lang` from the install locale (`LC_ALL`, `LC_MESSAGES`, `LANG`; the Windows culture; the macOS locale). A locale SearXNG does not list falls back to `en`, because SearXNG will not start with an unknown language. A request's own `language` parameter still wins.
+
+Seznam is enabled as a fallback for when Google, DuckDuckGo, Brave and Startpage refuse the household IP. It is a Czech-market index, so unless the install locale is Czech the installer also drops `.cz` results (`hostnames.remove`). When every other engine is blocked, searches then return fewer results, not Czech shops; the response's `unresponsive_engines` shows which engines refused.
 
 ## API Endpoints
 
@@ -66,7 +72,7 @@ curl http://localhost:8888/healthz
 ```
 ┌────────────┐   GET /search?q=...   ┌──────────────┐
 │ Perplexica │──────────────────────▶│   SearXNG    │
-│  OpenClaw  │                       │  (Metasearch)│
+│   Hermes   │                       │  (Metasearch)│
 │  Browser   │◀──────────────────────│              │
 └────────────┘    JSON results       └──────┬───────┘
                                             │

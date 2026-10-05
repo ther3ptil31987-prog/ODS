@@ -130,8 +130,30 @@ _docker_server_version_for_amd_downgrade() {
 
 if [[ "$SKIP_DOCKER" == "true" ]]; then
     log "Skipping Docker installation (--skip-docker)"
-elif command -v docker &> /dev/null; then
+elif command -v docker &> /dev/null && docker --version &> /dev/null; then
     ai_ok "Docker already installed: $(docker --version)"
+elif command -v podman &> /dev/null; then
+    # Podman is installed but its docker-compatible CLI is not (Fedora ships
+    # them as separate packages). ODS drives Podman through that shim, so
+    # install the shim rather than putting Docker CE next to an existing Podman.
+    ods_progress 31 "docker" "Enabling Podman docker-compatible CLI"
+    ai "Podman found without a docker-compatible CLI; installing the podman-docker shim..."
+    if $DRY_RUN; then
+        log "[DRY RUN] Would install podman-docker (Podman present, docker CLI missing)"
+    else
+        if ! ods_sudo_available; then
+            error "Podman is installed but its docker-compatible CLI is missing, and privileged package installation is unavailable. Install the podman-docker package, then re-run ODS."
+        fi
+        pkg_update
+        # shellcheck disable=SC2046
+        pkg_install $(pkg_resolve podman-docker) || true
+        hash -r
+        if command -v docker &> /dev/null; then
+            ai_ok "Podman docker-compatible CLI installed: $(docker --version 2>/dev/null | head -1)"
+        else
+            error "Could not install the podman-docker shim. Install the podman-docker package manually, then re-run ODS."
+        fi
+    fi
 else
     ods_progress 31 "docker" "Installing Docker engine"
     ai "Installing Docker..."
@@ -143,9 +165,20 @@ else
             error "No container runtime is installed and privileged package installation is unavailable. Install Docker or Podman first, then re-run ODS."
         fi
         case "$PKG_MANAGER" in
-            apt|zypper)
-                # Docker CE via get.docker.com (supports Debian/Ubuntu/Fedora/SLES)
+            apt)
+                # Docker CE via get.docker.com (supports Debian/Ubuntu)
                 if ! _docker_install_from_script; then
+                    error "Docker installation failed. Check network connectivity and try again."
+                fi
+                ;;
+            zypper)
+                # openSUSE and SLES ship Docker and the Compose plugin in their
+                # own repositories; get.docker.com refuses openSUSE. Keep the
+                # script as the fallback for the SLES variants it supports.
+                if pkg_install docker docker-compose-plugin; then
+                    ods_sudo systemctl enable --now docker.service 2>>"$LOG_FILE" \
+                        || warn "Could not enable docker.service; start it with: sudo systemctl enable --now docker"
+                elif ! _docker_install_from_script; then
                     error "Docker installation failed. Check network connectivity and try again."
                 fi
                 ;;
@@ -278,10 +311,33 @@ elif command -v docker-compose &> /dev/null; then
     fi
     ai_ok "Docker Compose v1 available (using docker-compose)"
 else
+    # Podman's `docker compose` delegates to an external provider, and the
+    # docker-compose-plugin package only exists in Docker's repositories, so a
+    # Podman host gets podman-compose instead. In a dry run the shim may not be
+    # installed yet, so a podman-only host counts as Podman too.
+    _compose_provider_is_podman() {
+        # No pipeline here: under pipefail, `docker --version | grep -q` can
+        # report the SIGPIPE'd left side even when it matched.
+        local cli_version=""
+        cli_version="$(docker --version 2>/dev/null || true)"
+        case "$cli_version" in
+            *[Pp]odman*) return 0 ;;
+        esac
+        ! command -v docker &> /dev/null && command -v podman &> /dev/null
+    }
     if [[ "$SKIP_DOCKER" == "true" ]]; then
         warn "Docker Compose not found (docker compose / docker-compose). Install manually or re-run without --skip-docker."
     elif $DRY_RUN; then
-        log "[DRY RUN] Would install Docker Compose plugin"
+        if _compose_provider_is_podman; then
+            log "[DRY RUN] Would install podman-compose (compose provider for Podman's docker-compatible CLI)"
+        else
+            log "[DRY RUN] Would install Docker Compose plugin"
+        fi
+    elif _compose_provider_is_podman; then
+        ai "Installing podman-compose (compose provider for Podman)..."
+        pkg_update
+        # shellcheck disable=SC2046
+        pkg_install $(pkg_resolve podman-compose)
     else
         ai "Installing Docker Compose plugin..."
         pkg_update
@@ -366,7 +422,7 @@ _docker_compose_detect_cmd() {
     fi
 
     # v1 fallback
-    if command -v docker-compose &>/dev/null; then
+    if command -v docker-compose &>/dev/null && docker-compose --version &>/dev/null 2>&1; then
         echo "docker-compose"
         return 0
     fi
@@ -398,6 +454,17 @@ _docker_compose_verify() {
 _runtime_is_podman() {
     docker_run version 2>/dev/null | grep -qi 'podman' && return 0
     return 1
+}
+
+_docker_is_wsl_host() {
+    [[ "${CAP_PLATFORM_ID:-}" == "wsl" ]] && return 0
+    grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null
+}
+
+_docker_nvidia_runtime_available() {
+    local runtimes=""
+    runtimes=$(docker_run info --format '{{json .Runtimes}}' 2>/dev/null || true)
+    [[ "$runtimes" =~ \"nvidia\"[[:space:]]*: ]]
 }
 
 _ensure_podman_dockerhub_search() {
@@ -461,7 +528,12 @@ _docker_post_install_checks
 # NVIDIA Container Toolkit (skip for AMD — uses /dev/dri + /dev/kfd passthrough)
 if [[ $GPU_COUNT -gt 0 && "$GPU_BACKEND" == "nvidia" ]]; then
     ods_progress 36 "docker" "Checking NVIDIA Container Toolkit"
-    if command -v nvidia-container-cli &> /dev/null 2>&1; then
+    if _docker_is_wsl_host && _docker_nvidia_runtime_available; then
+        # Docker Desktop owns the daemon and NVIDIA runtime on WSL2. Installing
+        # another toolkit in the distro rewrites /etc/docker/daemon.json and
+        # then fails trying to restart a docker.service that does not exist.
+        ai_ok "Docker Desktop NVIDIA runtime available"
+    elif command -v nvidia-container-cli &> /dev/null 2>&1; then
         ai_ok "NVIDIA Container Toolkit installed"
         # Always regenerate CDI spec — driver version may have changed since last run
         if command -v nvidia-ctk &>/dev/null && ! $DRY_RUN; then

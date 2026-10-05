@@ -10,7 +10,7 @@
 #   Change ODS_VERSION for custom builds. Must match constants.sh VERSION.
 # ============================================================================
 
-$script:ODS_VERSION = "2.6.0"
+$script:ODS_VERSION = "3.0.0"
 
 # Install location (override via $env:ODS_HOME)
 # NOTE: $(if ...) syntax required for PS 5.1 compatibility (bare if-as-expression is PS 7+ only)
@@ -24,23 +24,32 @@ $script:ODS_PREFLIGHT_REPORT = Join-Path $env:TEMP "ods-windows-preflight.json"
 # PID file is shared -- only one native inference server runs at a time
 $script:INFERENCE_PID_FILE = Join-Path (Join-Path $script:ODS_INSTALL_DIR "data") "llama-server.pid"
 
-# AMD Lemonade (preferred AMD backend: Vulkan + NPU + ROCm)
-$script:LEMONADE_VERSION     = "10.0.0"
-$script:LEMONADE_MSI_FILE    = "lemonade-server-minimal.msi"
-$script:LEMONADE_MSI_URL     = "https://github.com/lemonade-sdk/lemonade/releases/download/v$($script:LEMONADE_VERSION)/$($script:LEMONADE_MSI_FILE)"
-# Default path; install-windows.ps1 resolves both Program Files roots at runtime.
-$script:LEMONADE_INSTALL_DIR = Join-Path $env:ProgramFiles "Lemonade Server"
-$script:LEMONADE_EXE         = Join-Path (Join-Path $script:LEMONADE_INSTALL_DIR "bin") "lemonade-server.exe"
-$script:LEMONADE_PORT        = 8080
-$script:LEMONADE_API_KEY     = "lemonade"
-$script:LEMONADE_HEALTH_URL  = "http://127.0.0.1:8080/api/v1/health"
+# Native llama-server (ggml-org llama.cpp, Vulkan) for AMD GPUs. Default host
+# port; .env AMD_INFERENCE_PORT is authoritative once written.
+$script:NATIVE_LLM_PORT = 8080
 
-# llama-server fallback (Vulkan build, used if Lemonade install is declined/fails)
+# The qualified runtime from %LOCALAPPDATA%\ODS\llama.cpp\<tag>-win-vulkan-x64
+# is published here, where ods.ps1, bootstrap-upgrade.sh and the host agent
+# launch it. pin.json inside is verified before every launch.
 $script:LLAMA_SERVER_DIR = Join-Path $script:ODS_INSTALL_DIR "llama-server"
 $script:LLAMA_SERVER_EXE = Join-Path $script:LLAMA_SERVER_DIR "llama-server.exe"
-$script:LLAMA_CPP_RELEASE_TAG = "b8248"
+$script:LLAMA_CPP_RELEASE_TAG = "b9014"
 $script:LLAMA_CPP_VULKAN_ASSET = "llama-$($script:LLAMA_CPP_RELEASE_TAG)-bin-win-vulkan-x64.zip"
 $script:LLAMA_CPP_VULKAN_URL = "https://github.com/ggml-org/llama.cpp/releases/download/$($script:LLAMA_CPP_RELEASE_TAG)/$($script:LLAMA_CPP_VULKAN_ASSET)"
+# SHA-256 of each Windows Vulkan archive ODS may install, keyed by release
+# tag (the default above and any tier-map LlamaCppReleaseTag). Values are
+# GitHub's per-asset digests for the official ggml-org/llama.cpp release.
+# The installer refuses an archive whose tag is missing here.
+$script:LLAMA_CPP_VULKAN_SHA256 = @{
+    "b9014" = "6cd4bc7a44256e674458b0c5ea2ae3461dca29ee87876c8d410ecc78652a3b0f"
+}
+# Exact byte size of each archive above (GitHub's asset size), checked with
+# the SHA-256 before extraction. config/backends/amd.json
+# runtime.llama_server.windows is the primary pin; native-llama-runtime.ps1
+# falls back to these two tables only while amd.json does not carry it.
+$script:LLAMA_CPP_VULKAN_SIZE = @{
+    "b9014" = 33541404
+}
 
 # Docker
 $script:DOCKER_COMPOSE_CMD = "docker compose"
@@ -55,9 +64,8 @@ $script:MIN_NVIDIA_DRIVER = 570
 $script:MIN_WINDOWS_WHISPER_CUDA_DRIVER = 575
 
 # OpenCode (host-level AI coding IDE, not a Docker service)
-$script:OPENCODE_VERSION = "1.2.18"
-$script:OPENCODE_ZIP = "opencode-windows-x64.zip"
-$script:OPENCODE_URL = "https://github.com/anomalyco/opencode/releases/download/v$($script:OPENCODE_VERSION)/$($script:OPENCODE_ZIP)"
+$script:OPENCODE_VERSION = "1.18.32"
+# Architecture-specific archives and SHA256 values: ../../lib/opencode-release.tsv
 $script:OPENCODE_DIR = Join-Path $env:USERPROFILE ".opencode"
 $script:OPENCODE_BIN = Join-Path (Join-Path $env:USERPROFILE ".opencode") "bin"
 $script:OPENCODE_EXE = Join-Path (Join-Path $env:USERPROFILE ".opencode") "bin\opencode.exe"

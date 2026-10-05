@@ -74,10 +74,13 @@ if ($gpuInfo.Backend -eq "nvidia") {
 if ($gpuInfo.Backend -eq "amd") {
     if ($gpuInfo.MemoryType -eq "unified") {
         Write-AISuccess "AMD unified memory APU detected (Strix Halo / RDNA)"
-        Write-AI "  llama-server will run natively with Vulkan (not in Docker)"
     } else {
         Write-AISuccess "AMD discrete GPU detected"
-        Write-AI "  llama-server will use the Docker Vulkan overlay"
+    }
+    # WSL2 and Docker Desktop cannot drive an AMD GPU, so the model runs on
+    # this PC as ggml-org llama-server.exe (Vulkan); the stack stays in Docker.
+    if (-not $cloudMode) {
+        Write-AI "  The model will run natively on Windows with llama.cpp (Vulkan), not in Docker"
     }
 }
 
@@ -112,12 +115,15 @@ if (-not $env:MODEL_PROFILE) {
 }
 
 $tierConfig = Resolve-TierConfig -Tier $selectedTier
+# Hermes is on by default and needs 64K context: prefer models that fit at
+# 64K themselves (a soft floor). Phase 03 re-checks once features are final.
 $tierConfig = Resolve-CatalogModelRecommendation `
     -TierConfig $tierConfig `
     -Tier $selectedTier `
     -GpuInfo $gpuInfo `
     -SystemRamGB $systemRamGB `
-    -SourceRoot $sourceRoot
+    -SourceRoot $sourceRoot `
+    -MinContext $script:HERMES_MIN_CONTEXT
 $llamaServerImage = if ($tierConfig.LlamaServerImage) { $tierConfig.LlamaServerImage } else { "" }
 $whisperCudaSupported = Test-ODSWindowsWhisperCudaSupported -GpuInfo $gpuInfo
 if ($tierConfig.LlamaCppReleaseTag) {
@@ -164,7 +170,7 @@ if (-not $_tierDisk.Sufficient) {
         $_installDirHint = "$($Matches[1].ToUpperInvariant()):\ods"
     }
     Write-AI "  To use a different drive/path, rerun from the source checkout with:"
-    Write-AI "  .\install.ps1 -InstallDir $_installDirHint"
+    Write-AI "  .\ods\installers\windows\install-windows.ps1 -InstallDir $_installDirHint"
     if (-not $force) {
         Write-AIError "Insufficient disk space. Free up space and re-run, or use --Force to override."
         throw "ODS_INSTALL_ABORTED"

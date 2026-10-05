@@ -68,6 +68,38 @@ the library modules and `lib/service-registry.sh`, parses CLI arguments, then
 sources the 13 phases in order. All files share one global bash namespace —
 everything is sourced, not exec'd.
 
+## Presentation Contract
+
+The 13 Linux implementation phases are intentionally presented to users as six
+stable macro phases: preflight, feature selection, Docker/setup, module
+downloads, service launch, and verification. Windows maps its internal setup
+steps onto the same six-phase journey; macOS already exposes six phases. Adding
+or splitting an implementation phase must not renumber the user journey without
+an explicit installer-UX review.
+
+`ODS_UI_MODE` controls presentation without changing installer behavior:
+
+- `auto` (default) enables the green/magenta ODSGATE sequence only in an
+  interactive terminal;
+- `cinematic` forces the cinematic layout for an interactive capture;
+- `plain` emits deterministic one-line output.
+
+`--non-interactive`, `NO_COLOR`, and `ODS_INSTALLER_GUI=1` always select plain
+behavior. In the default `auto` mode, `TERM=dumb`, `CI`, and redirected stdout
+also select plain behavior; `cinematic` is the explicit operator override for
+an interactive capture. Plain mode never clears the screen, rings the terminal
+bell, or emits cursor-motion animation. Detailed operational messages remain in
+the install log during cinematic runs; warnings and errors stay visible.
+`ODS_INSTALLER_GUI=1` also turns on the structured `ODS_PROGRESS` lines
+(`installers/lib/progress.sh`) for a graphical front end. None ships today:
+the unsupported Tauri desktop installer was removed.
+
+Long-wait lore and completion assurances must reflect the active runtime mode.
+Local mode may describe local inference; cloud and external-endpoint modes must
+disclose that the configured provider or endpoint can receive traffic. Do not
+add absolute privacy, telemetry, subscription, rate-limit, or data-residency
+claims unless the selected configuration proves them.
+
 ## File Header Convention
 
 Every module uses a standardized header:
@@ -106,7 +138,7 @@ Common customizations and exactly where to make them:
 |--------|-------------|-----|
 | **Add a hardware tier** | `lib/tier-map.sh` + `lib/detection.sh` | Add a `case` in `resolve_tier_config()` (tier-map.sh) and a detection path in `detection.sh`. Also update `lib/compose-select.sh` if a new compose overlay is needed, and add the tier to `QUICKSTART.md` and `README.md` hardware tables. |
 | **Swap CRT theme colors** | `lib/constants.sh` | Change the ANSI escape code variables (`GRN`, `AMB`, `RED`, etc.) near the top |
-| **Change lore messages** | `lib/ui.sh` | Edit the `LORE_MESSAGES[]` array — add, remove, or reword entries |
+| **Change lore messages** | `lib/ui.sh` | Edit the mode-specific `ODS_LOCAL_LORE_MESSAGES[]`, `ODS_CLOUD_LORE_MESSAGES[]`, and `ODS_EXTERNAL_LORE_MESSAGES[]` arrays together |
 | **Change boot splash** | `lib/ui.sh` | Edit the `show_stranger_boot()` function — it renders the CRT startup sequence |
 | **Skip a phase** | `install-core.sh` | Comment out or remove the `source` line for that phase (e.g., remove phase 07 to skip dev tools) |
 | **Add a new phase** | `installers/phases/` | Create a numbered `.sh` file with the standard header, then add a `source` line in `install-core.sh` in the right order |
@@ -124,15 +156,16 @@ done. This is the most common way install-time surprises survive a patch.
 |----------------|--------------|--------------|----------------|------------------------|
 | `.env` and core ports/secrets | `phases/06-directories.sh` | `installers/macos/lib/env-generator.sh` | `installers/windows/lib/env-generator.ps1` | `ods config`, `ods update`, installer re-runs |
 | OpenCode config | `phases/07-devtools.sh` | `installers/macos/install-macos.sh` | `installers/windows/lib/opencode-config.ps1` | `scripts/update-windows-opencode-config.ps1`, `scripts/bootstrap-upgrade.sh` |
-| LiteLLM Lemonade config | `phases/06-directories.sh` | n/a | n/a | `scripts/bootstrap-upgrade.sh`, `bin/ods-host-agent.py` |
+| LiteLLM config for a Windows `llama-server.exe` (`config/litellm/local.yaml`) | `phases/06-directories.sh` through `scripts/render-runtime-configs.py` (Portal) | n/a | `installers/windows/lib/env-generator.ps1` | `scripts/bootstrap-upgrade.sh` |
 | Perplexica config | `phases/12-health.sh`, `phases/13-summary.sh` | `installers/macos/lib/env-generator.sh`, `installers/macos/install-macos.sh` | `installers/windows/lib/env-generator.ps1`, `installers/windows/install-windows.ps1` | `scripts/bootstrap-upgrade.sh`, `scripts/repair/repair-perplexica.sh` |
 | Hermes config | `phases/11-services.sh`, `scripts/patch-hermes-config.py` | `installers/macos/install-macos.sh` | `installers/windows/phases/06-directories.ps1` | `scripts/bootstrap-upgrade.sh`, `bin/ods-host-agent.py` |
 | External text/chat route | `phases/02b-external-services.sh`, `phases/06-directories.sh` | Not installer-managed | Not installer-managed | Linux installer re-runs |
 
-Recent examples: OpenCode on Linux Lemonade mode must use `LITELLM_KEY` because
-LiteLLM enforces auth, while direct llama-server paths keep `no-key`; Lemonade
-`lemonade.yaml` must preserve `extra_body.chat_template_kwargs.enable_thinking:
-false` in install, bootstrap upgrade, and host-agent model activation paths;
+Recent examples: OpenCode must use `LITELLM_KEY` when it reaches the model
+through LiteLLM, which enforces auth, while direct llama-server paths keep
+`no-key`; the LiteLLM config for a Windows `llama-server.exe` must keep
+`extra_body.chat_template_kwargs.enable_thinking: false` and name the server
+key only by reference (`os.environ/LLAMA_SERVER_API_KEY`) in every writer;
 Perplexica's persisted `defaultChatModel` must be refreshed after bootstrap
 hot-swap.
 
@@ -151,9 +184,9 @@ What's shared vs platform-specific across the installer:
 
 | Layer | Shared | Platform-specific |
 |-------|--------|-------------------|
-| Colors, version, paths | `lib/constants.sh` | — |
-| Logging | `lib/logging.sh` | — |
-| CRT UI / spinners | `lib/ui.sh` | — |
+| Colors, version, paths | `lib/constants.sh` | `installers/macos/lib/constants.sh`, `installers/windows/lib/constants.ps1` |
+| Logging | `lib/logging.sh` | macOS and Windows UI helpers |
+| CRT UI / spinners | `lib/ui.sh` | `installers/macos/lib/ui.sh`, `installers/windows/lib/ui.ps1` |
 | GPU detection | `lib/detection.sh`, topology helpers | Backend contract JSONs (`config/backends/`) |
 | Tier → model mapping | `lib/tier-map.sh` | — |
 | Compose selection | `lib/compose-select.sh` | Per-backend compose overlays |

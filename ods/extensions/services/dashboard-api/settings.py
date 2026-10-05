@@ -12,27 +12,39 @@ from typing import Any, Optional
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException
+from jsonschema import Draft202012Validator
 
-from env_values import strip_matching_quotes
+from env_values import parse_env_value
 from host_agent_client import AgentClientError, request_json as request_agent_json
 
 # ── Regex constants ────────────────────────────────────────────────────────────
 
 _ENV_ASSIGNMENT_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _ENV_COMMENTED_ASSIGNMENT_RE = re.compile(r"^\s*#\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+# Name heuristic for keys the schema does not describe (extension-written
+# local overrides such as LibreChat's CREDS_KEY / LIBRECHAT_MEILI_KEY /
+# GOOGLE_KEY). A trailing "_KEY" is a credential unless it is a PUBLIC_KEY
+# (excluded in _is_secret_field); "_KEY_PATH" / "_KEY_FILE" stay visible.
 _SENSITIVE_ENV_KEY_RE = re.compile(
-    r"(SECRET|(?:^|_)TOKEN(?:$|_)|PASSWORD|(?:^|_)PASS(?:$|_)|API_KEY|PRIVATE_KEY|ENCRYPTION_KEY|(?:^|_)SALT(?:$|_))"
+    r"(SECRET|(?:^|_)TOKEN(?:$|_)|PASSWORD|(?:^|_)PASS(?:$|_)|API_KEY|PRIVATE_KEY|ENCRYPTION_KEY|(?:^|_)SALT(?:$|_)|(?:^|_)KEY$)"
 )
 _GGUF_QUANTIZED_MODEL_RE = re.compile(
     r"(?:^|[-_.])q[2-8](?:_[a-z0-9]+)*(?:$|[-_.])",
     re.IGNORECASE,
 )
+_SCALAR_CONSTRAINT_MESSAGES = {
+    "minimum": "Must be at least {limit}.",
+    "maximum": "Must be at most {limit}.",
+    "minLength": "Must contain at least {limit} characters.",
+    "maxLength": "Must contain at most {limit} characters.",
+    "pattern": "Must match the format required by the configuration schema.",
+}
 
 # ── Apply-plan constants ───────────────────────────────────────────────────────
 
 _SETTINGS_APPLY_ALLOWED_SERVICES = frozenset({
     "llama-server", "open-webui", "litellm", "langfuse", "n8n",
-    "hermes", "hermes-proxy", "openclaw", "opencode", "perplexica", "searxng", "qdrant",
+    "hermes", "hermes-proxy", "opencode", "perplexica", "searxng", "qdrant",
     "tts", "whisper", "embeddings", "token-spy", "comfyui",
     "ape", "privacy-shield", "ods-proxy", "model-router",
 })
@@ -66,6 +78,24 @@ _LIVE_READ_ENV_KEYS = {
     # agent fallback, so recreating services would only add downtime.
     "HF_TOKEN",
 }
+# Keys of the removed legacy OpenClaw extension, the removed AMD GAIA
+# library recipe and the removed Lemonade runtime; marked "deprecated" and
+# described as "Retired:" in .env.schema.json. ODS reads none of them, so
+# saving one restarts nothing (a GAIA copy installed before the removal
+# picks up its keys when it next starts), and clearing one removes it from
+# .env.
+_RETIRED_ENV_KEYS = frozenset({
+    "BOOTSTRAP_MODEL", "HOST_LAN_IP", "OPENCLAW_API_KEY", "OPENCLAW_CONFIG",
+    "OPENCLAW_DANGEROUSLY_DISABLE_DEVICE_AUTH", "OPENCLAW_HTTP_API",
+    "OPENCLAW_LLM_URL", "OPENCLAW_PORT", "OPENCLAW_TOKEN",
+    "GAIA_AGENT_UI_VERSION", "GAIA_DISABLE_UPDATE", "GAIA_LEMONADE_BASE_URL",
+    "GAIA_PORT", "GAIA_SKIP_GAIA_INIT", "GAIA_UI_SERVE_ONLY",
+    # Lemonade (round F); scripts/migrate-lemonade-install.py removes them.
+    "AMDGPU_TARGET", "HSA_XNACK", "LEMONADE_API_BASE_PATH", "LEMONADE_API_KEY",
+    "LEMONADE_BASE_URL", "LEMONADE_CONTAINER_BASE_URL", "LEMONADE_EXTERNAL",
+    "LEMONADE_HOST_TRANSPORT", "LEMONADE_LLAMACPP", "LEMONADE_LLAMACPP_ROCM_BIN",
+    "LEMONADE_MODEL", "LEMONADE_SERVER_IMAGE", "LITELLM_LEMONADE_API_KEY", "LLAMA_CPP_REF",
+})
 _READ_ONLY_ENV_FIELDS = {
     "ODS_MODE": "Runtime mode is selected by the installer and cannot be changed from the dashboard.",
     "TIER": "The active tier is managed by Model Manager so model consumers stay synchronized.",
@@ -75,7 +105,6 @@ _READ_ONLY_ENV_FIELDS = {
     "GGUF_SHA256": "Model integrity metadata is managed by Model Manager.",
     "CTX_SIZE": "The active context is managed by Model Manager so the runtime and every model consumer remain synchronized.",
     "MAX_CONTEXT": "The active context is managed by Model Manager so the runtime and every model consumer remain synchronized.",
-    "LEMONADE_MODEL": "The Lemonade model identity is resolved and managed during transactional activation.",
     "MODEL_RUNTIME_PROFILE": "The runtime profile is selected and managed during model activation.",
     "MODEL_RUNTIME_PROFILE_LABEL": "The runtime profile is selected and managed during model activation.",
     "MODEL_RUNTIME_PROFILE_SOURCE": "The runtime profile is selected and managed during model activation.",
@@ -123,7 +152,9 @@ def _parse_env_text(raw_text: str) -> tuple[dict[str, str], list[dict[str, Any]]
             continue
 
         key, value = match.groups()
-        values[key] = strip_matching_quotes(value)
+        # Compose grammar: comments, quotes and the writer's escape set, so a
+        # save writes back exactly the value the containers already see.
+        values[key] = parse_env_value(value)
 
     return values, issues
 
@@ -199,6 +230,10 @@ def _build_env_fields(
     fields: dict[str, dict[str, Any]] = {}
 
     for key, definition in schema_properties.items():
+        # Retired keys stay in the schema so older .env files that still
+        # carry them keep validating. Show one only when this file has it.
+        if definition.get("deprecated") is True and key not in values:
+            continue
         field_type = definition.get("type", "string")
         value = values.get(key, "")
         fields[key] = {
@@ -215,6 +250,7 @@ def _build_env_fields(
             "hasValue": value != "",
             "readOnly": key in _READ_ONLY_ENV_FIELDS,
             "readOnlyReason": _READ_ONLY_ENV_FIELDS.get(key, ""),
+            **{name: definition[name] for name in _SCALAR_CONSTRAINT_MESSAGES if name in definition},
         }
 
     for key, value in values.items():
@@ -241,6 +277,18 @@ def _build_env_fields(
     return fields
 
 
+def _scalar_constraint_issues(key: str, value: Any, field: dict[str, Any]) -> list[dict[str, str]]:
+    constraints = {name: field[name] for name in _SCALAR_CONSTRAINT_MESSAGES if name in field}
+    # ValidationError.message includes the instance, which may be a credential.
+    # Only return schema-derived bounds and fixed text to the browser.
+    return [
+        {"key": key, "message": _SCALAR_CONSTRAINT_MESSAGES[error.validator].format(
+            limit=error.validator_value,
+        )}
+        for error in Draft202012Validator(constraints).iter_errors(value)
+    ]
+
+
 def _validate_env_values(
     values: dict[str, str],
     fields: dict[str, dict[str, Any]],
@@ -263,9 +311,11 @@ def _validate_env_values(
             issues.append({"key": key, "message": f"Must be one of: {', '.join(enum_values)}."})
             continue
 
+        issue_count = len(issues)
+        typed_value: Any = value
         if field_type == "integer":
             try:
-                int(str(value).strip())
+                typed_value = int(str(value).strip())
             except (TypeError, ValueError):
                 issues.append({"key": key, "message": "Must be a whole number."})
         elif field_type == "boolean":
@@ -300,6 +350,9 @@ def _validate_env_values(
                     "key": key,
                     "message": "Must be an HTTP(S) OpenAI-compatible embeddings base URL.",
                 })
+
+        if len(issues) == issue_count:
+            issues.extend(_scalar_constraint_issues(key, typed_value, field))
 
     embedding_model = str(values.get("EMBEDDING_MODEL", "")).strip() or "BAAI/bge-base-en-v1.5"
     rag_model = str(values.get("RAG_EMBEDDING_MODEL", "")).strip()
@@ -365,6 +418,10 @@ def _empty_value_unsets_env_key(key: str, field: dict[str, Any]) -> bool:
     """Return true when an empty form value should remove a runtime env key."""
     if field.get("required") or field.get("secret"):
         return False
+    # Nothing reads a retired key, so clearing it removes the line instead of
+    # leaving an empty assignment that keeps the field listed.
+    if key in _RETIRED_ENV_KEYS:
+        return True
     return key.startswith("LLAMA_ARG_") or key in {
         "RAG_EMBEDDING_MODEL",
         "RAG_OPENAI_API_BASE_URL",
@@ -403,8 +460,6 @@ def _match_apply_service(key: str) -> Optional[str]:
         return "hermes"
     if key.startswith("ODS_PROXY_"):
         return "ods-proxy"
-    if key.startswith("OPENCLAW_"):
-        return "openclaw"
     if key.startswith("COMFYUI_"):
         return "comfyui"
     if key.startswith("RAG_"):
@@ -472,7 +527,7 @@ def _compute_env_apply_plan(
         return False
 
     for key in changed_keys:
-        if key in _LIVE_READ_ENV_KEYS:
+        if key in _LIVE_READ_ENV_KEYS or key in _RETIRED_ENV_KEYS:
             continue
         if key == "EMBEDDING_MODEL":
             schedule("embeddings")
@@ -525,12 +580,12 @@ def _compute_env_apply_plan(
     if rag_admin_sync_required:
         post_apply_actions.append({
             "id": "open-webui-rag-sync",
-            "title": "Apply RAG settings in Open WebUI",
+            "title": "Check RAG settings in Open WebUI",
             "message": (
-                "After Open WebUI is healthy, open Admin Panel / Settings / "
-                "Documents and set the embedding engine, endpoint, model, and "
-                "credential to the saved values. Open WebUI persists these settings "
-                "in its database after first boot."
+                "Open WebUI reads its embedding settings from ODS each time it "
+                "starts, so the recreated container uses the saved engine, "
+                "endpoint, model, and credential. After it is healthy, Admin "
+                "Panel / Settings / Documents shows them."
             ),
         })
     if rag_reindex_required:

@@ -7,6 +7,9 @@ on:
       - main
       - master
 
+permissions:
+  contents: read
+
 jobs:
   env-schema:
     runs-on: ubuntu-latest
@@ -59,7 +62,6 @@ jobs:
           SEARXNG_SECRET=test-searxng-secret
           N8N_USER=admin@ods.local
           N8N_PASS=test-pass-changeme
-          OPENCLAW_TOKEN=sk-test-openclaw-token
           ODS_VERSION=2.1.0
           ODS_TIER=${{ matrix.tier }}
           GPU_BACKEND=cpu
@@ -80,21 +82,18 @@ jobs:
           LITELLM_KEY=sk-test-key
           LITELLM_MASTER_KEY=sk-test-master
           WHISPER_MODEL=base
-          WHISPER_PORT=9300
-          TTS_PORT=8860
+          WHISPER_PORT=9000
+          TTS_PORT=8880
           QDRANT_PORT=6333
-          EMBEDDINGS_PORT=8800
-          SEARXNG_PORT=8080
+          EMBEDDINGS_PORT=8090
+          SEARXNG_PORT=8888
           APE_PORT=7890
-          OPENCLAW_PORT=3100
-          OPENCLAW_CONFIG=prosumer.json
-          OPENCLAW_API_KEY=sk-test-openclaw
           PRIVACY_SHIELD_PORT=8085
-          TOKEN_SPY_PORT=3003
+          TOKEN_SPY_PORT=3005
           LIVEKIT_PORT=7880
           LIVEKIT_API_KEY=devkey
           LIVEKIT_API_SECRET=devsecret
-          LANGFUSE_PORT=3005
+          LANGFUSE_PORT=3006
           LANGFUSE_POSTGRES_PORT=5433
           LANGFUSE_CLICKHOUSE_PORT=9005
           LANGFUSE_CLICKHOUSE_HTTP=8124

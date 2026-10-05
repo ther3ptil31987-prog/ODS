@@ -241,59 +241,136 @@ else
 fi
 
 cat > "$ENV_PATH" <<'ENV'
-ODS_MODE=lemonade
-GPU_BACKEND=amd
+ODS_MODE=local
+GPU_BACKEND=cpu
+LLM_BACKEND=external
 LLM_API_URL=http://litellm:4000
 HERMES_LLM_BASE_URL=http://litellm:4000/v1
-LEMONADE_EXTERNAL=true
-LEMONADE_BASE_URL=http://localhost:13305
-LEMONADE_CONTAINER_BASE_URL=http://host.docker.internal:13305
-LITELLM_LEMONADE_API_KEY=sk-ods-lemonade-fixture
-AMD_INFERENCE_RUNTIME=lemonade
-AMD_INFERENCE_MANAGED=false
-AMD_INFERENCE_RUNTIME_MODE=external-lemonade
+EXTERNAL_LLM_URL=http://host.lima.internal:8080
+EXTERNAL_LLM_PROVIDER=openai-compatible
+EXTERNAL_LLM_MODEL=Qwen3.5-9B-Q4_K_M.gguf
 ENV
 cat > "$FLAGS_PATH" <<'FLAGS'
--f docker-compose.base.yml -f docker-compose.cloud.yml -f docker-compose.lemonade-external.yml
+-f docker-compose.base.yml -f docker-compose.cpu.yml
+FLAGS
+
+(cd "$ROOT_DIR" && PATH="$FAKE_BIN:$PATH" bash scripts/ods-doctor.sh "$REPORT" >/dev/null 2>&1) || true
+if jq -e '
+    .runtime.inference_contract.expected_inference_owner == "external" and
+    .runtime.inference_contract.expected_gateway == "litellm" and
+    ([.runtime.inference_contract.issues[].id] | index("ODS-RUNTIME-LOCAL-LITELLM-ROUTE") | not)
+' "$REPORT" >/dev/null; then
+    pass "generic external inference treats LiteLLM as the expected gateway"
+else
+    fail "generic external inference was misclassified as an unexpected local LiteLLM route"
+fi
+
+# The Windows Portal's llama-server (host-native): LiteLLM is the gateway,
+# ODS owns the runtime, and LiteLLM needs the server's key.
+cat > "$ENV_PATH" <<'ENV'
+ODS_MODE=local
+GPU_BACKEND=cpu
+LLM_BACKEND=llama-server
+LLM_API_URL=http://litellm:4000
+HERMES_LLM_BASE_URL=http://litellm:4000/v1
+NATIVE_LLM_BASE_URL=http://localhost:8080
+NATIVE_LLM_CONTAINER_BASE_URL=http://host.docker.internal:8080
+AMD_INFERENCE_RUNTIME=llama-server
+AMD_INFERENCE_BACKEND=vulkan
+AMD_INFERENCE_LOCATION=host
+AMD_INFERENCE_PORT=8080
+AMD_INFERENCE_SUPPORTED_BACKENDS=vulkan
+AMD_INFERENCE_RUNTIME_MODE=windows-portal-llama-server
+AMD_INFERENCE_MANAGED=true
+ENV
+cat > "$FLAGS_PATH" <<'FLAGS'
+-f docker-compose.base.yml -f docker-compose.host-native-llm.yml
 FLAGS
 
 if (cd "$ROOT_DIR" && bash scripts/ods-doctor.sh "$REPORT" >/dev/null 2>&1); then
-    pass "ods-doctor runs with external Lemonade fixture"
+    pass "ods-doctor runs with the host-native llama-server fixture"
 else
-    fail "ods-doctor failed with external Lemonade fixture"
+    fail "ods-doctor failed with the host-native llama-server fixture"
 fi
 
-if jq -e '.diagnoses[] | select(.id == "ODS-RUNTIME-EXTERNAL-LEMONADE-UNAUTHENTICATED-HOST-ROUTE")' "$REPORT" >/dev/null; then
-    pass "external Lemonade host route without user API key is diagnosed"
+if jq -e '
+    .runtime.inference_contract.host_native_llm == true and
+    .runtime.inference_contract.expected_inference_owner == "ods" and
+    .runtime.inference_contract.expected_gateway == "litellm" and
+    ([.runtime.inference_contract.issues[].id] | index("ODS-RUNTIME-LOCAL-LITELLM-ROUTE") | not) and
+    ([.runtime.inference_contract.issues[].id] | index("ODS-RUNTIME-HOST-NATIVE-OVERLAY-MISSING") | not)
+' "$REPORT" >/dev/null; then
+    pass "host-native llama-server routes through LiteLLM with its own overlay"
 else
-    fail "external Lemonade host route without user API key was not diagnosed"
+    fail "host-native llama-server inference contract was misclassified"
 fi
 
+if jq -e '.diagnoses[] | select(.id == "ODS-RUNTIME-HOST-NATIVE-KEY-MISSING")' "$REPORT" >/dev/null; then
+    pass "host-native route without LLAMA_SERVER_API_KEY is diagnosed"
+else
+    fail "host-native route without LLAMA_SERVER_API_KEY was not diagnosed"
+fi
+
+if jq -e '.diagnoses[] | select(.id == "ODS-RUNTIME-HOST-NATIVE-CLOUD-OVERLAY-CONFLICT")' "$REPORT" >/dev/null; then
+    fail "the host-native overlay alone must not trigger a cloud overlay conflict"
+else
+    pass "the host-native overlay keeps model-router"
+fi
+cat > "$FLAGS_PATH" <<'FLAGS'
+-f docker-compose.base.yml -f docker-compose.cloud.yml -f docker-compose.host-native-llm.yml
+FLAGS
+if (cd "$ROOT_DIR" && bash scripts/ods-doctor.sh "$REPORT" >/dev/null 2>&1) && \
+   jq -e '.diagnoses[] | select(.id == "ODS-RUNTIME-HOST-NATIVE-CLOUD-OVERLAY-CONFLICT")' "$REPORT" >/dev/null; then
+    pass "a stale cloud overlay on the host-native route is diagnosed"
+else
+    fail "a stale cloud overlay on the host-native route was not diagnosed"
+fi
+cat > "$FLAGS_PATH" <<'FLAGS'
+-f docker-compose.base.yml -f docker-compose.host-native-llm.yml
+FLAGS
+
+printf 'LLAMA_SERVER_API_KEY=%s\n' abababababababababababababababab >> "$ENV_PATH"
+if (cd "$ROOT_DIR" && bash scripts/ods-doctor.sh "$REPORT" >/dev/null 2>&1) && \
+   ! jq -e '.diagnoses[] | select(.id == "ODS-RUNTIME-HOST-NATIVE-KEY-MISSING")' "$REPORT" >/dev/null; then
+    pass "LLAMA_SERVER_API_KEY suppresses the host-native key diagnosis"
+else
+    fail "the host-native key diagnosis persisted with LLAMA_SERVER_API_KEY set"
+fi
+
+# AMD now serves llama.cpp in the stack like every GPU, so a local AMD install
+# that still routes through LiteLLM is no longer exempt from the warning.
+cat > "$ENV_PATH" <<'ENV'
+ODS_MODE=local
+GPU_BACKEND=amd
+LLM_BACKEND=llama-server
+LLM_API_URL=http://litellm:4000
+HERMES_LLM_BASE_URL=http://llama-server:8080/v1
+ENV
+cat > "$FLAGS_PATH" <<'FLAGS'
+-f docker-compose.base.yml -f docker-compose.amd.yml
+FLAGS
+if (cd "$ROOT_DIR" && bash scripts/ods-doctor.sh "$REPORT" >/dev/null 2>&1) && \
+   jq -e '.diagnoses[] | select(.id == "ODS-RUNTIME-LOCAL-LITELLM-ROUTE")' "$REPORT" >/dev/null && \
+   jq -e '.runtime.inference_contract.expected_gateway == "llama-server"' "$REPORT" >/dev/null; then
+    pass "a local AMD install routed through LiteLLM is diagnosed"
+else
+    fail "a local AMD install routed through LiteLLM was not diagnosed"
+fi
+
+# Compatibility read for one release: an unmigrated Lemonade-era .env.
 cat > "$ENV_PATH" <<'ENV'
 ODS_MODE=lemonade
 GPU_BACKEND=amd
+LLM_BACKEND=lemonade
 LLM_API_URL=http://litellm:4000
-HERMES_LLM_BASE_URL=http://litellm:4000/v1
-LEMONADE_EXTERNAL=true
-LEMONADE_BASE_URL=http://localhost:13305
-LEMONADE_CONTAINER_BASE_URL=http://host.docker.internal:13305
-LEMONADE_API_KEY=sk-user-lemonade-fixture
-LITELLM_LEMONADE_API_KEY=sk-user-lemonade-fixture
 AMD_INFERENCE_RUNTIME=lemonade
-AMD_INFERENCE_MANAGED=false
-AMD_INFERENCE_RUNTIME_MODE=external-lemonade
 ENV
-
-if (cd "$ROOT_DIR" && bash scripts/ods-doctor.sh "$REPORT" >/dev/null 2>&1); then
-    pass "ods-doctor runs with authenticated external Lemonade fixture"
+if (cd "$ROOT_DIR" && bash scripts/ods-doctor.sh "$REPORT" >/dev/null 2>&1) && \
+   jq -e '.diagnoses[] | select(.id == "ODS-RUNTIME-LEMONADE-RETIRED" and .severity == "blocker")' "$REPORT" >/dev/null && \
+   ! jq -e '.diagnoses[] | select(.id == "ODS-RUNTIME-MODE-UNKNOWN")' "$REPORT" >/dev/null; then
+    pass "Lemonade-era settings are diagnosed as retired, with the migration as the fix"
 else
-    fail "ods-doctor failed with authenticated external Lemonade fixture"
-fi
-
-if jq -e '.diagnoses[] | select(.id == "ODS-RUNTIME-EXTERNAL-LEMONADE-UNAUTHENTICATED-HOST-ROUTE")' "$REPORT" >/dev/null; then
-    fail "authenticated external Lemonade fixture still emitted unauthenticated route diagnosis"
-else
-    pass "user API key suppresses unauthenticated external Lemonade diagnosis"
+    fail "Lemonade-era settings were not diagnosed as retired"
 fi
 
 echo ""

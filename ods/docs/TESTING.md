@@ -56,22 +56,19 @@ Hermes, model routing, GPU detection, lifecycle commands, or any runtime path
 that could affect a user's install or running stack. Docs-only and cosmetic
 changes can usually rely on CI plus focused documentation checks.
 
-External Lemonade SDK compatibility has a focused fleet smoke:
+The AMD llama.cpp runtime has a CPU smoke that CI runs on a hosted runner
+(`.github/workflows/amd-cpu-smoke.yml`):
 
 ```bash
-tests/fleet-external-lemonade-e2e.sh --mock
+tests/test-amd-cpu-smoke.sh
 ```
 
-The mock lane starts a tiny OpenAI-compatible Lemonade stand-in, renders the
-external-Lemonade LiteLLM config, starts ODS's real LiteLLM compose
-service, and verifies a chat completion traverses the route. On an AMD Linux
-host with Lemonade SDK already running, use the real lane:
-
-```bash
-LEMONADE_E2E_URL=http://localhost:13305 \
-LEMONADE_E2E_MODEL=<model-from-/api/v1/models> \
-tests/fleet-external-lemonade-e2e.sh --real
-```
+It renders the AMD stacks with Docker Compose and checks the pinned Vulkan
+image (ROCm only when selected), the llama.cpp launch, `/dev/dri` without
+`/dev/kfd` for Vulkan and the absence of Lemonade-era settings. It then runs
+the pinned Vulkan image on the CPU with a tiny SHA-pinned GGUF and checks
+`/health`, `/v1/models`, a chat completion and `/metrics`. It pulls and runs
+Docker images, so never run it on a host with a live ODS stack.
 
 ## Quick Reference
 
@@ -124,7 +121,7 @@ Docker-daemon surfaces.
 Run a focused subset while debugging:
 
 ```bash
-tests/fleet-multi-distro.sh ubuntu/24.04 archlinux/current mint
+tests/fleet-multi-distro.sh ubuntu/26.04 archlinux/current mint
 tests/fleet-multi-distro.sh --no-dry-run ubuntu2404
 ```
 
@@ -132,6 +129,7 @@ The fast fleet matrix currently covers:
 
 | Distro ID | Image | Package Manager |
 |-----------|-------|-----------------|
+| `ubuntu2604` | `ubuntu:26.04` | apt |
 | `ubuntu2404` | `ubuntu:24.04` | apt |
 | `ubuntu2204` | `ubuntu:22.04` | apt |
 | `debian12` | `debian:12` | apt |
@@ -143,7 +141,7 @@ The fast fleet matrix currently covers:
 | `cachyos` | `cachyos/cachyos:latest` | pacman |
 | `opensuse` | `opensuse/tumbleweed:latest` | zypper |
 
-Aliases such as `ubuntu/24.04`, `ubuntu/22.04`, `debian/12`,
+Aliases such as `ubuntu/26.04`, `ubuntu/24.04`, `ubuntu/22.04`, `debian/12`,
 `fedora/41`, `archlinux/current`, `opensuse/tumbleweed`, and `mint` are
 accepted by the runner for quick ad-hoc checks. The matrix uses Linux Mint
 21.3 because the current Mint 22 Docker images report plain Ubuntu in
@@ -154,7 +152,7 @@ Docker daemon behavior:
 
 ```bash
 tests/fleet-incus-vm.sh
-tests/fleet-incus-vm.sh ubuntu/24.04 archlinux/current
+tests/fleet-incus-vm.sh ubuntu/26.04 archlinux/current
 tests/fleet-incus-vm.sh --keep-vms rocky9
 ```
 
@@ -164,6 +162,7 @@ covers:
 
 | Distro ID | Incus image | Package Manager | VM Checks |
 |-----------|-------------|-----------------|-----------|
+| `ubuntu2604` | `images:ubuntu/26.04` | apt | systemd, Docker daemon, installer dry-run |
 | `ubuntu2404` | `images:ubuntu/24.04` | apt | systemd, Docker daemon, installer dry-run |
 | `fedora42` | `images:fedora/42` | dnf | systemd, Docker daemon, installer dry-run |
 | `rocky9` | `images:rockylinux/9` | dnf | systemd, Docker daemon, installer dry-run |
@@ -252,6 +251,7 @@ Boot any Linux distro from a single USB drive. Pick from a menu, boot into a liv
 
 | Distro | Why | Package Manager |
 |--------|-----|-----------------|
+| Ubuntu 26.04 LTS | Current fleet target | apt |
 | Ubuntu 24.04 LTS | Primary target | apt |
 | Ubuntu 22.04 LTS | Still widely used | apt |
 | Fedora 41 | Popular with devs | dnf |

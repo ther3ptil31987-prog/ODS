@@ -1,6 +1,7 @@
 # ODS 2.6.0 Release Notes
 
-Publication status: current stable release. A strict User Green stamp is not
+Publication status: historical 2.6 release; [ODS V3](RELEASE_NOTES_3.0.0.md) is
+the latest published source release. A strict User Green stamp is not
 claimed for this release because the long six-cycle model-management matrix was
 intentionally waived.
 
@@ -95,10 +96,7 @@ yet.
   - because that matrix was waived, this candidate is not stamped strict User
     Green; publication should describe the waiver rather than claiming Model UI
     Green
-  - `dgx-gpu01` was excluded after strict SSH host-key verification failed;
-    Tower2's pinned ED25519 key is
-    `SHA256:hPPRpUClgK0nCDrZujmfHgbMIIYV70zSpKfBw4VWmdo`, while the endpoint
-    currently presents `SHA256:zgUNklRWH+N/aaQ1MmZEzmN6ABu/6XMOw2Mm3ITzwfM`
+  - `dgx-gpu01` was excluded after strict SSH host-key verification failed.
 
 ## Known Limits
 

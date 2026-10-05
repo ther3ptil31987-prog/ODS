@@ -12,7 +12,6 @@
 # get` only emits `via <gw>` when the route has a gateway; on an on-link
 # default route (WSL2, point-to-point and VPN links, some cloud VMs) the two
 # fields are absent and the column that held the address holds `uid` instead.
-# Same parse as installers/phases/06-directories.sh's HOST_LAN_IP detection.
 _ods_lan_ip() {
     local lan_ip=""
     if command -v ip >/dev/null 2>&1; then
@@ -32,9 +31,10 @@ _ods_lan_ip() {
 print_dashboard_qr() {
     local display_url="${1:-}"
     if [[ -z "$display_url" ]]; then
-        local lan_ip
+        local lan_ip remote_port="${DASHBOARD_REMOTE_PORT:-3011}"
+        [[ "$remote_port" =~ ^[0-9]+$ ]] || remote_port=3011
         lan_ip=$(_ods_lan_ip)
-        display_url="http://${lan_ip:-localhost}:3001"
+        display_url="http://${lan_ip:-localhost}:${remote_port}"
     fi
     
     echo ""
@@ -82,7 +82,9 @@ print_success_card() {
     local lan_ip
     lan_ip=$(_ods_lan_ip)
     
-    local remote_dash="http://${lan_ip:-localhost}:3001"
+    local remote_port="${DASHBOARD_REMOTE_PORT:-3011}"
+    [[ "$remote_port" =~ ^[0-9]+$ ]] || remote_port=3011
+    local remote_dash="http://${lan_ip:-localhost}:${remote_port}"
     local remote_api="http://${lan_ip:-localhost}:8000/v1"
     
     echo ""

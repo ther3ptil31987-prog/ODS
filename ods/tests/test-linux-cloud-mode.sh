@@ -45,24 +45,92 @@ contains "$flags" "extensions/services/litellm/compose.yaml" "cloud mode include
 rejects "$flags" "docker-compose.cpu.yml" "cloud mode does not include CPU llama-server overlay"
 rejects "$flags" "compose.local.yaml" "cloud mode does not include local dependency overlays"
 
-lemonade_flags="$(LEMONADE_EXTERNAL=true AMD_INFERENCE_RUNTIME=lemonade AMD_INFERENCE_MANAGED=false ODS_PYTHON_CMD="$PY" ./scripts/resolve-compose-stack.sh \
-    --script-dir "$ROOT_DIR" \
+# Installed user extensions can retain older backend-named overlays. Continue,
+# for example, used compose.nvidia.yaml solely to wait for the local
+# llama-server. Cloud mode must keep its route-agnostic base service while
+# omitting that local-only readiness edge; local mode must still include it.
+user_fixture="$(mktemp -d)"
+trap 'rm -rf "$user_fixture"' EXIT
+mkdir -p \
+    "$user_fixture/scripts" \
+    "$user_fixture/config" \
+    "$user_fixture/extensions/services" \
+    "$user_fixture/data/user-extensions/continue"
+cp scripts/resolve-compose-stack.sh "$user_fixture/scripts/"
+cp docker-compose.base.yml docker-compose.cloud.yml docker-compose.nvidia.yml "$user_fixture/"
+cp config/core-service-ids.json "$user_fixture/config/"
+cp extensions/library/services/continue/manifest.yaml \
+    extensions/library/services/continue/compose.yaml \
+    extensions/library/services/continue/compose.nvidia.yaml \
+    "$user_fixture/data/user-extensions/continue/"
+
+cloud_user_flags="$(ODS_PYTHON_CMD="$PY" "$user_fixture/scripts/resolve-compose-stack.sh" \
+    --script-dir "$user_fixture" \
     --tier CLOUD \
+    --gpu-backend nvidia \
+    --gpu-count 1 \
+    --ods-mode cloud)"
+cloud_user_flags="${cloud_user_flags//\\//}"
+contains "$cloud_user_flags" "data/user-extensions/continue/compose.yaml" \
+    "cloud mode retains route-agnostic user extension base"
+rejects "$cloud_user_flags" "data/user-extensions/continue/compose.nvidia.yaml" \
+    "cloud mode omits user overlay that requires local inference"
+
+local_user_flags="$(ODS_PYTHON_CMD="$PY" "$user_fixture/scripts/resolve-compose-stack.sh" \
+    --script-dir "$user_fixture" \
+    --tier 1 \
+    --gpu-backend nvidia \
+    --gpu-count 1 \
+    --ods-mode local)"
+local_user_flags="${local_user_flags//\\//}"
+contains "$local_user_flags" "data/user-extensions/continue/compose.nvidia.yaml" \
+    "local mode retains user overlay that requires local inference"
+
+native_flags="$(NATIVE_LLM_BASE_URL=http://localhost:8080 ODS_PYTHON_CMD="$PY" ./scripts/resolve-compose-stack.sh \
+    --script-dir "$ROOT_DIR" \
+    --tier 1 \
     --gpu-backend cpu \
     --gpu-count 0 \
-    --ods-mode lemonade)"
-lemonade_flags="${lemonade_flags//\\//}"
+    --ods-mode local)"
+native_flags="${native_flags//\\//}"
 
-contains "$lemonade_flags" "docker-compose.base.yml" "external Lemonade keeps base stack"
-contains "$lemonade_flags" "docker-compose.cloud.yml" "external Lemonade profiles managed llama-server out"
-contains "$lemonade_flags" "docker-compose.lemonade-external.yml" "external Lemonade layers dedicated overlay"
-rejects "$lemonade_flags" "docker-compose.cpu.yml" "external Lemonade does not include CPU llama-server overlay"
+contains "$native_flags" "docker-compose.base.yml" "host-native llama-server keeps base stack"
+rejects "$native_flags" "docker-compose.cloud.yml" "host-native llama-server retains model-router instead of cloud profile gate"
+contains "$native_flags" "docker-compose.host-native-llm.yml" "host-native llama-server layers dedicated overlay"
+rejects "$native_flags" "docker-compose.cpu.yml" "host-native llama-server does not include CPU llama-server overlay"
+rejects "$native_flags" "compose.local.yaml" "host-native llama-server adds no local-inference dependencies"
 
 if grep -q 'profiles:' docker-compose.cloud.yml && grep -q 'local-inference' docker-compose.cloud.yml; then
     pass "cloud overlay profiles local llama-server out of default startup"
 else
     fail "cloud overlay must profile local llama-server out of default startup"
 fi
+
+"$PY" - <<'PY'
+from pathlib import Path
+import sys
+import yaml
+
+services = yaml.safe_load(Path("docker-compose.cloud.yml").read_text(encoding="utf-8"))["services"]
+for name in ("llama-server", "model-router"):
+    service = services.get(name, {})
+    if "local-inference" not in service.get("profiles", []) or service.get("restart") != "no":
+        print(f"[FAIL] cloud mode must profile {name} out with its local dependency chain", file=sys.stderr)
+        sys.exit(1)
+if "pixel-model-relay" in services:
+    print("[FAIL] cloud overlay must not disable the enabled Pixel relay", file=sys.stderr)
+    sys.exit(1)
+print("[PASS] cloud mode profiles local inference out and retains Pixel's external gateway route")
+
+native = yaml.safe_load(Path("docker-compose.host-native-llm.yml").read_text(encoding="utf-8"))["services"]
+if native.get("llama-server", {}).get("profiles") != ["local-inference"]:
+    print("[FAIL] host-native llama-server must disable only the in-stack llama-server", file=sys.stderr)
+    sys.exit(1)
+if "profiles" in native.get("model-router", {}):
+    print("[FAIL] host-native llama-server must leave model-router enabled", file=sys.stderr)
+    sys.exit(1)
+print("[PASS] host-native llama-server disables the in-stack llama-server and keeps model-router")
+PY
 
 if grep -Fq -- '--ods-mode "${ODS_MODE:-local}"' installers/lib/compose-select.sh \
     && grep -Fq -- '--ods-mode "${ODS_MODE:-local}"' installers/phases/03-features.sh \
@@ -81,8 +149,8 @@ else
     fail "cloud health path must skip local llama-server"
 fi
 
-if grep -Fq 'image: ${HERMES_AGENT_IMAGE:-nousresearch/hermes-agent:v2026.6.5}' extensions/services/hermes/compose.yaml \
-    && grep -Fq '${HERMES_AGENT_IMAGE:-nousresearch/hermes-agent:v2026.6.5}|HERMES' installers/phases/08-images.sh \
+if grep -Fq 'image: ${HERMES_AGENT_IMAGE:-nousresearch/hermes-agent:v2026.9.24@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7}' extensions/services/hermes/compose.yaml \
+    && grep -Fq '${HERMES_AGENT_IMAGE:-nousresearch/hermes-agent:v2026.9.24@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7}|HERMES' installers/phases/08-images.sh \
     && grep -Fq 'HERMES_AGENT_IMAGE_FALLBACK' installers/phases/08-images.sh \
     && ! grep -R -q 'nousresearch/hermes-agent:sha-' extensions/services/hermes installers/phases config/dependency-lock.json; then
     pass "Hermes image default is resolvable and overrideable for cloud installs"

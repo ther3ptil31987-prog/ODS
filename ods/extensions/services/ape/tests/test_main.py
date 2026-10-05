@@ -108,6 +108,14 @@ def test_audit_endpoint_contract(make_client):
     assert isinstance(body["entries"], list)
 
 
+def test_audit_endpoint_reports_unreadable_log_without_error_text(make_client, ape_env):
+    client, _ = make_client()
+    ape_env.audit_log.write_text("not-json\n", encoding="utf-8")
+    r = client.get("/audit", params={"last_n": 5})
+    assert r.status_code == 200
+    assert r.json() == {"entries": [], "error": "audit log unreadable"}
+
+
 def test_api_key_required(make_client):
     client, _ = make_client()
     r = client.post("/verify", headers={"X-API-Key": "wrong"},
@@ -548,3 +556,36 @@ def test_strict_mode_windowed_hard_deny_raises_403(make_client):
     _verify(client, tool="spawn_agent", args={}, session="swd")
     r = _verify(client, tool="spawn_agent", args={}, session="swd")
     assert r.status_code == 403
+
+
+def test_audit_log_never_persists_the_live_approval_token(make_client, ape_env):
+    """The audit trail must not store a replayable approval token.
+
+    audit.jsonl lives under data/ape — a path `ods backup` captures — and
+    GET /audit echoes entries verbatim, so a raw token written there is a
+    live credential for the human-approval gate. /approve already logs only
+    a short prefix; the /verify audit write must do the same.
+    """
+    client, _ = make_client(policy_yaml=LOW_LIMIT_POLICY)
+    for _ in range(3):
+        _verify(client, tool="web_fetch", args={"url": "http://x"},
+                session="audtok")
+    escalated = _verify(client, tool="web_fetch", args={"url": "http://x"},
+                        session="audtok").json()
+    token = escalated["approval_token"]
+    # The caller still receives the usable token — only persistence changes.
+    assert token and token.startswith("appr_")
+
+    assert token not in ape_env.audit_log.read_text(), \
+        "live approval token was persisted in audit.jsonl"
+
+    body = client.get("/audit", params={"last_n": 50}).json()
+    assert token not in json.dumps(body), \
+        "GET /audit echoed the live approval token"
+
+    # The escalation must still be auditable and correlatable by decision id.
+    escalations = [e for e in body["entries"]
+                   if e.get("decision") == "require_approval"]
+    assert escalations, "require_approval escalation missing from audit trail"
+    assert escalations[-1]["id"] == escalated["decision_id"], \
+        "audit entry lost the decision id that correlates it to the approval"

@@ -14,6 +14,11 @@ if str(_BIN_DIR) not in sys.path:
 
 from model_switchboard import adapters as ad  # noqa: E402
 from model_switchboard import reconciler as rc  # noqa: E402
+import test_model_activate as _tma  # noqa: E402
+
+# Captured before any test pins them, for tests that drive the real chain.
+_REAL_RUNTIME_HEALTH = _tma._mod._runtime_health
+_REAL_RUNTIME_PROPS = _tma._mod._llama_runtime_props
 
 
 def _proof_result(identity="M.gguf", **overrides):
@@ -181,8 +186,8 @@ class TestContainerLlamaAdapter:
         def restart(env):
             seen["restart_env"] = env
 
-        def wait_ready(env, gguf, ctx, lemonade_model_id=""):
-            seen["wait"] = (gguf, ctx, lemonade_model_id)
+        def wait_ready(env, gguf, ctx):
+            seen["wait"] = (gguf, ctx)
             return _readiness_proof("runtime/Model.gguf", 4096)
 
         adapter = ad.ContainerLlamaAdapter(
@@ -204,7 +209,7 @@ class TestContainerLlamaAdapter:
         }
         assert run["verifiedAt"]
         assert seen["restart_env"] is env
-        assert seen["wait"] == ("Model.gguf", 4096, "")
+        assert seen["wait"] == ("Model.gguf", 4096)
 
     def test_restart_exception_becomes_stage_failure(self):
         adapter = ad.ContainerLlamaAdapter(
@@ -281,57 +286,12 @@ class TestNativeLlamaAdapter:
         assert required.issubset(set(dir(ad.FakeAdapter)))
 
 
-class TestLemonadeAdapter:
-    def test_verify_uses_resolved_lemonade_id(self):
-        seen = {}
-
-        def wait_ready(env, gguf, ctx, lemonade_model_id=""):
-            seen["args"] = (gguf, ctx, lemonade_model_id)
-            return _readiness_proof("extra.Q.gguf", 65536)
-
-        adapter = ad.LemonadeAdapter(
-            wait_ready=wait_ready,
-            expected_gguf="Q.gguf",
-            context_length=65536,
-            lemonade_model_id="extra.Q.gguf",
-        )
-        run = rc.run_runtime_activation(adapter, {})
-        assert run["ok"] is True
-        assert run["identity"] == "extra.Q.gguf"
-        assert run["contextLength"] == 65536
-        assert adapter.kind == "lemonade"
-        assert seen["args"] == ("Q.gguf", 65536, "extra.Q.gguf")
-
-    def test_missing_id_is_stage_failure(self):
-        adapter = ad.LemonadeAdapter(
-            wait_ready=lambda *a, **k: True,
-            expected_gguf="Q.gguf",
-            context_length=1024,
-            lemonade_model_id="",
-        )
-        run = rc.run_runtime_activation(adapter, {})
-        assert run["ok"] is False and run["phase"] == "stage"
-
-    def test_not_ready_is_identity_failure(self):
-        adapter = ad.LemonadeAdapter(
-            wait_ready=lambda *a, **k: {},
-            expected_gguf="Q.gguf",
-            context_length=1024,
-            lemonade_model_id="extra.Q.gguf",
-        )
-        run = rc.run_runtime_activation(adapter, {})
-        assert run["ok"] is False and run["phase"] == "verify_identity"
-
-    def test_boolean_readiness_cannot_echo_configured_lemonade_id(self):
-        adapter = ad.LemonadeAdapter(
-            wait_ready=lambda *a, **k: True,
-            expected_gguf="Q.gguf",
-            context_length=1024,
-            lemonade_model_id="extra.Q.gguf",
-        )
-        run = rc.run_runtime_activation(adapter, {})
-        assert run["ok"] is False
-        assert run["identity"] is None
+class TestSingleRuntimeFamily:
+    def test_every_managed_runtime_uses_the_llama_server_adapters(self):
+        # Round F: no Lemonade adapter; the WSL bridge, Windows, macOS and
+        # container paths all prove the same llama-server contract.
+        assert not hasattr(ad, "LemonadeAdapter")
+        assert ad.ContainerLlamaAdapter.kind == ad.NativeLlamaAdapter.kind == "llama-server"
 
 
 class TestHostAgentWiring:
@@ -339,6 +299,8 @@ class TestHostAgentWiring:
         import subprocess
         import test_model_activate as tma
 
+        real_health = _REAL_RUNTIME_HEALTH
+        real_props = _REAL_RUNTIME_PROPS
         install_dir = tma._write_model_activation_fixture(tmp_path)[0]
         monkeypatch.setattr(tma._mod, "INSTALL_DIR", install_dir)
         monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
@@ -357,19 +319,28 @@ class TestHostAgentWiring:
 
         monkeypatch.setattr(tma._mod, "_wait_for_model_readiness", spying_wait)
 
+        probed: list[str] = []
+
         def fake_run(cmd, **_kwargs):
             url = next((str(part) for part in cmd if str(part).startswith("http")), "")
-            if url.endswith("/v1/models"):
+            probed.append(url.rsplit(":8080", 1)[-1])
+            if url.endswith("/health"):
+                stdout = json.dumps({"status": "ok"})
+            elif url.endswith("/v1/models"):
                 stdout = tma._llama_identity_response("new-model.gguf")
             elif url.endswith("/props"):
                 stdout = json.dumps({
-                    "default_generation_settings": {"n_ctx": 65536}
+                    "model_path": "/models/new-model.gguf",
+                    "default_generation_settings": {"n_ctx": 65536},
                 })
             else:
                 stdout = ""
             return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
         monkeypatch.setattr(tma._mod.subprocess, "run", fake_run)
+        # Exercise the real proof chain, not the class-level pins.
+        monkeypatch.setattr(tma._mod, "_runtime_health", real_health)
+        monkeypatch.setattr(tma._mod, "_llama_runtime_props", real_props)
         assert tma._mod._switchboard_adapters is not None
 
         handler = tma._ResponseHandler()
@@ -381,6 +352,8 @@ class TestHostAgentWiring:
         )
         assert state["active"]["runtimeModelId"] == "new-model.gguf"
         assert state["active"]["proof"]["identity"] == "new-model.gguf"
+        # One proof contract: health, identity, then the served file's n_ctx.
+        assert probed[:3] == ["/health", "/v1/models", "/props"]
 
     def test_reconciler_failure_uses_existing_rollback(self, tmp_path, monkeypatch):
         import subprocess
@@ -411,6 +384,97 @@ class TestHostAgentWiring:
         assert payload["failure_phase"] == "verify_identity"
         assert "runtime did not report the staged model" in payload["failure_detail"]
         # rollback restored the pre-activation env exactly as before PR 2A
+        assert env_path.read_text(encoding="utf-8") == before_env
+
+    def test_training_context_cap_reports_cause_and_failed_runtime_log(
+        self, tmp_path, monkeypatch
+    ):
+        import subprocess
+        import test_model_activate as tma
+
+        install_dir, env_path = tma._write_model_activation_fixture(tmp_path)[:2]
+        before_env = env_path.read_text(encoding="utf-8")
+        monkeypatch.setattr(tma._mod, "INSTALL_DIR", install_dir)
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(tma._mod.time, "sleep", lambda _s: None)
+        restarts: list[dict[str, str]] = []
+        monkeypatch.setattr(
+            tma._mod,
+            "_compose_restart_llama_server",
+            lambda env: restarts.append(dict(env)),
+        )
+        new_model_probes: list[str] = []
+        log_reads: list[list[str]] = []
+
+        def staged() -> list[str]:
+            return [env.get("GGUF_FILE", "") for env in restarts]
+
+        def capped_run(cmd, **_kwargs):
+            if list(cmd[:2]) == ["docker", "logs"]:
+                # The staged container is still alive when rollback begins.
+                log_reads.append(staged())
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=(
+                        "print_info: n_ctx_train = 1024\n"
+                        "srv    load_model: the slot context (4096) exceeds the "
+                        "training context of the model (1024) - capping\n"
+                        "main: server is listening on http://0.0.0.0:8080\n"
+                    ),
+                )
+            url = next((str(part) for part in cmd if str(part).startswith("http")), "")
+            serving_new = staged()[-1:] == ["new-model.gguf"]
+            if url.endswith("/v1/models"):
+                if serving_new:
+                    new_model_probes.append(url)
+                    stdout = json.dumps({
+                        "object": "list",
+                        "data": [{
+                            "id": "new-model.gguf",
+                            "object": "model",
+                            "meta": {"n_ctx_train": 1024},
+                        }],
+                    })
+                else:
+                    stdout = tma._llama_identity_response("old-model.gguf")
+            else:
+                stdout = ""
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(tma._mod.subprocess, "run", capped_run)
+        # The class isolation pins /props to 65536; this runtime is capped.
+        monkeypatch.setattr(
+            tma._mod,
+            "_llama_runtime_props",
+            lambda *_args: (1024 if staged()[-1:] == ["new-model.gguf"] else 2048, ""),
+        )
+        handler = tma._ResponseHandler()
+        tma._mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 500
+        payload = handler.parse_response()
+        requested = int(restarts[0]["CTX_SIZE"])
+        assert requested > 1024
+        cause = (
+            f"new-model.gguf is loaded but serves a 1024-token context; {requested} "
+            "was requested, above the model's 1024-token training context "
+            "(llama.cpp caps the slot there)"
+        )
+        assert payload["rolled_back"] is True
+        assert payload["error"] == (
+            f"Health check failed — rolled back to previous model. Cause: {cause}"
+        )
+        assert payload["runtime_diagnosis"] == cause
+        assert payload["failure_phase"] == "verify_identity"
+        assert "exceeds the training context of the model (1024) - capping" in (
+            payload["runtime_log_excerpt"]
+        )
+        # One probe proves the cap is final; no multi-minute readiness window.
+        assert len(new_model_probes) == 1
+        # The log was read from the staged runtime, before rollback restarted.
+        assert log_reads == [["new-model.gguf"]]
+        assert staged() == ["new-model.gguf", "old-model.gguf"]
         assert env_path.read_text(encoding="utf-8") == before_env
 
     def test_completion_failure_detail_survives_successful_rollback(
@@ -503,9 +567,8 @@ def _isolation(monkeypatch, tmp_path, request):
         lambda: (config_dir / "opencode.json", config_dir / "config.json"),
     )
     monkeypatch.setattr(tma._mod, "_chat_completion_ready", lambda *_a, **_k: True)
-    monkeypatch.setattr(
-        tma._mod, "_llama_runtime_context_length", lambda *_args: 65536
-    )
+    monkeypatch.setattr(tma._mod, "_runtime_health", lambda _env: "ok")
+    monkeypatch.setattr(tma._mod, "_llama_runtime_props", lambda _env: (65536, ""))
     monkeypatch.setattr(tma._mod, "_container_exists", lambda _c: False)
     monkeypatch.setattr(tma._mod, "_container_running", lambda _c: False)
     monkeypatch.setattr(

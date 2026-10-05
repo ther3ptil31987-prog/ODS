@@ -14,17 +14,23 @@
 #           chapter(), ai(), ai_ok(), log(), warn(), success()
 # Provides: GPU_BACKEND, GPU_NAME, GPU_VRAM, GPU_COUNT, GPU_MEMORY_TYPE,
 #           TIER, TIER_NAME, LLM_MODEL, GGUF_FILE, GGUF_URL, MAX_CONTEXT,
-#           COMPOSE_FILE, COMPOSE_FLAGS, RAM_GB, DISK_AVAIL, BACKEND_ID,
+#           COMPOSE_FILE, COMPOSE_FLAGS, RAM_GB, MODEL_TIER_RAM_GB,
+#           DISK_AVAIL, BACKEND_ID,
 #           LLM_HEALTHCHECK_URL, LLM_PUBLIC_API_PORT,
-#           OPENCLAW_PROVIDER_NAME_DEFAULT, OPENCLAW_PROVIDER_URL_DEFAULT,
 #           GPU_TOPOLOGY_JSON, GPU_HAS_NVLINK, GPU_TOTAL_VRAM,
-#           LLM_MODEL_SIZE_MB
+#           LLM_MODEL_SIZE_MB, AMD_GFX_TARGET, AMD_INFERENCE_BACKEND
 #
 # Modder notes:
 #   Change tier auto-detection thresholds or add new hardware classes here.
 # ============================================================================
 
+# Isolated phase reuse (tests) gets the route predicate installers/lib/
+# native-llm.sh gives install-core: a host-native llama-server is in use.
+declare -F ods_native_llm_requested >/dev/null 2>&1 \
+    || ods_native_llm_requested() { [[ -n "${NATIVE_LLM_BASE_URL:-}" ]]; }
+
 [[ -f "${SCRIPT_DIR:-}/lib/safe-env.sh" ]] && . "$SCRIPT_DIR/lib/safe-env.sh"
+. "$SCRIPT_DIR/installers/lib/wsl-memory.sh"
 
 ods_progress 12 "detection" "Detecting GPU hardware"
 chapter "SYSTEM DETECTION"
@@ -37,6 +43,9 @@ GPU_BACKEND_FORCED_CPU=false
 TIER_REQUESTED="${TIER:-}"
 TIER_FORCED=false
 [[ -n "$TIER_REQUESTED" ]] && TIER_FORCED=true
+# An owner choice of the AMD llama.cpp image (vulkan or rocm) from the
+# environment; otherwise the retained .env value, then the hardware decides.
+AMD_INFERENCE_BACKEND_REQUESTED="${AMD_INFERENCE_BACKEND:-}"
 
 # Cloud mode: skip GPU detection entirely
 if [[ "${ODS_MODE:-local}" == "cloud" ]]; then
@@ -48,13 +57,9 @@ if [[ "${ODS_MODE:-local}" == "cloud" ]]; then
     GPU_MEMORY_TYPE="none"
     TIER="CLOUD"
     if grep -qi microsoft /proc/version 2>/dev/null; then
-        _wsl_ram_bytes=""
-        if command -v powershell.exe &>/dev/null; then
-            _wsl_ram_bytes=$(powershell.exe -NoProfile -Command \
-                "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory" 2>/dev/null | tr -d '\r')
-        fi
-        if [[ -n "$_wsl_ram_bytes" && "$_wsl_ram_bytes" =~ ^[0-9]+$ ]]; then
-            RAM_KB=$((_wsl_ram_bytes / 1024))
+        _wsl_host_kb="$(ods_wsl_host_ram_kb)" || _wsl_host_kb=""
+        if [[ -n "$_wsl_host_kb" ]]; then
+            RAM_KB="$_wsl_host_kb"
         else
             RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
         fi
@@ -62,12 +67,11 @@ if [[ "${ODS_MODE:-local}" == "cloud" ]]; then
         RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     fi
     RAM_GB=$((RAM_KB / 1024 / 1024))
+    MODEL_TIER_RAM_GB="$RAM_GB"
     DISK_AVAIL=$(df -Pk "$HOME" 2>/dev/null | tail -1 | awk '{printf "%d", $4 / 1048576}')
     BACKEND_ID="cpu"
     LLM_HEALTHCHECK_URL="http://127.0.0.1:4000/health/readiness"
     LLM_PUBLIC_API_PORT="4000"
-    OPENCLAW_PROVIDER_NAME_DEFAULT="litellm-cloud"
-    OPENCLAW_PROVIDER_URL_DEFAULT="http://litellm:4000/v1"
     resolve_compose_config
     resolve_tier_config
     if [[ "$INTERACTIVE" == "true" ]]; then
@@ -82,35 +86,28 @@ ai "Reading hardware telemetry..."
 
 load_capability_profile || true
 
-# RAM Detection (WSL2-aware: query Windows host RAM if available)
+# RAM detection. Runtime-profile eligibility must use the memory the VM can
+# actually address, not the Windows host's physical total. Keep a smaller
+# reserved value only for coarse tier selection; system_ram_min_gb profiles and
+# the persisted SYSTEM_RAM_GB contract describe actual addressable VM memory.
 if grep -qi microsoft /proc/version 2>/dev/null; then
-    _wsl_ram_kb=""
-    if command -v powershell.exe &>/dev/null; then
-        _wsl_ram_bytes=$(powershell.exe -NoProfile -Command \
-            "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory" 2>/dev/null | tr -d '\r')
-        if [[ -n "$_wsl_ram_bytes" && "$_wsl_ram_bytes" =~ ^[0-9]+$ ]]; then
-            _wsl_ram_kb=$((_wsl_ram_bytes / 1024))
-        fi
-    fi
-    if [[ -z "$_wsl_ram_kb" ]] && command -v wmic.exe &>/dev/null; then
-        _wsl_ram_kb=$(wmic.exe OS get TotalVisibleMemorySize /value 2>/dev/null \
-            | grep -oE '[0-9]+' | sed -n '1p')
-    fi
+    _wsl_ram_kb="$(ods_wsl_host_ram_kb)" || _wsl_ram_kb=""
+    _wsl_vm_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    RAM_KB="$_wsl_vm_kb"
+    RAM_GB=$((RAM_KB / 1024 / 1024))
+    MODEL_TIER_RAM_GB="$(ods_wsl_model_ram_budget "$RAM_GB")"
+    _wsl_headroom_gb=$((RAM_GB - MODEL_TIER_RAM_GB))
     if [[ -n "$_wsl_ram_kb" && "$_wsl_ram_kb" =~ ^[0-9]+$ ]]; then
-        RAM_KB="$_wsl_ram_kb"
-        RAM_GB=$((RAM_KB / 1024 / 1024))
-        _wsl_vm_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-        _wsl_vm_gb=$((_wsl_vm_kb / 1024 / 1024))
-        log "WSL2 detected — Windows host RAM: ${RAM_GB}GB (WSL2 VM sees: ${_wsl_vm_gb}GB)"
+        _wsl_host_gb=$((_wsl_ram_kb / 1024 / 1024))
+        log "WSL2 detected — Windows host RAM: ${_wsl_host_gb}GB; VM RAM: ${RAM_GB}GB; tier budget: ${MODEL_TIER_RAM_GB}GB (${_wsl_headroom_gb}GB reserved for ODS services)"
     else
-        RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-        RAM_GB=$((RAM_KB / 1024 / 1024))
-        log "WSL2 detected — could not query Windows host RAM (VM sees: ${RAM_GB}GB)"
+        log "WSL2 detected — could not query Windows host RAM; VM RAM: ${RAM_GB}GB; tier budget: ${MODEL_TIER_RAM_GB}GB (${_wsl_headroom_gb}GB reserved for ODS services)"
         log "For correct tier selection: use --tier N or configure .wslconfig"
     fi
 else
     RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     RAM_GB=$((RAM_KB / 1024 / 1024))
+    MODEL_TIER_RAM_GB="$RAM_GB"
     log "RAM: ${RAM_GB}GB"
 fi
 
@@ -156,6 +153,38 @@ else
         log "Capabilities override detection: backend=${GPU_BACKEND}, memory=${GPU_MEMORY_TYPE}, tier=${CAP_RECOMMENDED_TIER:-unknown}"
     fi
 
+    # AMD runs the llama.cpp image with Vulkan unless ROCm is requested or the
+    # GPU has no Vulkan driver (Instinct). The choice decides which device
+    # nodes are required (/dev/kfd only for ROCm) and the Compose overlay.
+    AMD_GFX_TARGET=""
+    if [[ "$GPU_BACKEND" == "amd" ]]; then
+        [[ -f "$SCRIPT_DIR/installers/lib/amd-topo.sh" ]] && . "$SCRIPT_DIR/installers/lib/amd-topo.sh"
+        _amd_gfx_targets=()
+        if declare -F amd_gfx_targets >/dev/null 2>&1; then
+            # An unreadable target leaves the choice to the retained value or Vulkan.
+            mapfile -t _amd_gfx_targets < <(amd_gfx_targets 2>>"$LOG_FILE" || true)
+        fi
+        for _amd_target in "${_amd_gfx_targets[@]}"; do
+            AMD_GFX_TARGET="$(ods_amd_normalize_gfx_target "$_amd_target")"
+            [[ -z "$AMD_GFX_TARGET" ]] || break
+        done
+        # No .env (a fresh install) or no saved value: the hardware decides.
+        _amd_retained_backend="$(external_llm_env_value "$INSTALL_DIR/.env" AMD_INFERENCE_BACKEND 2>/dev/null || true)"
+        if ! AMD_INFERENCE_BACKEND="$(ods_amd_select_inference_backend \
+            "$AMD_INFERENCE_BACKEND_REQUESTED" "$_amd_retained_backend" "${_amd_gfx_targets[@]}")"; then
+            error "AMD_INFERENCE_BACKEND must be vulkan or rocm, got: $AMD_INFERENCE_BACKEND_REQUESTED"
+        fi
+        log "AMD llama.cpp backend: $AMD_INFERENCE_BACKEND (gfx target: ${AMD_GFX_TARGET:-unknown})"
+        if [[ "$AMD_INFERENCE_BACKEND" == rocm \
+            && -z "$(ods_amd_hsa_override_for_target rocm "$AMD_GFX_TARGET")" \
+            && -n "$AMD_GFX_TARGET" \
+            && " $ODS_AMD_ROCM_IMAGE_TARGETS " != *" $AMD_GFX_TARGET "* ]]; then
+            ai_warn "The ROCm image is not built for ${AMD_GFX_TARGET}; set AMD_INFERENCE_BACKEND=vulkan if the model does not load."
+        fi
+        unset _amd_gfx_targets _amd_target _amd_retained_backend
+    fi
+    export AMD_GFX_TARGET AMD_INFERENCE_BACKEND
+
     if [[ "$GPU_BACKEND" == "amd" ]] && ! amd_gpu_runtime_devices_available; then
         _amd_missing_devices="$(amd_gpu_missing_devices_csv)"
         if [[ "${GPU_BACKEND_FORCED:-false}" == "true" ]]; then
@@ -189,8 +218,6 @@ fi
 load_backend_contract "$BACKEND_ID" || true
 LLM_HEALTHCHECK_URL="${BACKEND_PUBLIC_HEALTH_URL:-http://127.0.0.1:8080/health}"
 LLM_PUBLIC_API_PORT="${BACKEND_PUBLIC_API_PORT:-8080}"
-OPENCLAW_PROVIDER_NAME_DEFAULT="${BACKEND_PROVIDER_NAME:-local-llama}"
-OPENCLAW_PROVIDER_URL_DEFAULT="${BACKEND_PROVIDER_URL:-http://llama-server:8080/v1}"
 
 #-----------------------------------------------------------------------------
 # Host architecture detection
@@ -219,6 +246,9 @@ if [[ $GPU_COUNT -gt 0 && "$GPU_BACKEND" == "nvidia" ]]; then
     if [[ -n "$DRIVER_VERSION" && "$DRIVER_VERSION" =~ ^[0-9]+$ ]]; then
         log "NVIDIA driver: $DRIVER_VERSION"
         if [[ "$DRIVER_VERSION" -lt "$MIN_DRIVER_VERSION" ]]; then
+            if ods_is_wsl_host; then
+                ods_wsl_nvidia_driver_too_old "$DRIVER_VERSION"
+            fi
             ai_bad "NVIDIA driver $DRIVER_VERSION is too old. llama-server (CUDA) requires driver >= $MIN_DRIVER_VERSION."
             if nvidia_blackwell_hardware_detected; then
                 ai_bad "This is a Blackwell GPU, so install an NVIDIA open kernel module driver."
@@ -264,6 +294,17 @@ if [[ $GPU_COUNT -gt 0 && "$GPU_BACKEND" == "nvidia" ]]; then
     else
         ai_warn "Could not determine driver version — continuing anyway"
     fi
+fi
+
+# The pinned Speaches CUDA image requires driver 575+, which is stricter than
+# the llama-server CUDA floor. Keep the primary NVIDIA LLM path enabled on
+# older drivers while selecting CPU Whisper and suppressing only its GPU
+# overlay. This mirrors the existing Windows installer contract.
+ods_configure_whisper_acceleration "$GPU_BACKEND" "${DRIVER_VERSION:-0}"
+if [[ "$WHISPER_ACCELERATION_FORCED_CPU" == "true" ]]; then
+    ai_warn "Whisper CUDA requires NVIDIA driver ${MIN_WHISPER_CUDA_DRIVER_VERSION}+; detected ${DRIVER_VERSION:-unknown}. Using CPU Whisper while keeping GPU inference enabled."
+elif [[ "$WHISPER_ACCELERATION" == "cpu" && "$GPU_BACKEND" == "nvidia" ]]; then
+    log "Whisper CPU acceleration explicitly selected; NVIDIA inference remains enabled"
 fi
 
 #-----------------------------------------------------------------------------
@@ -481,11 +522,11 @@ if [[ -z "$TIER" ]]; then
         fi
     elif [[ $GPU_VRAM -ge 40000 ]]; then
         TIER=4
-    elif [[ $GPU_VRAM -ge 20000 ]] || [[ $RAM_GB -ge 96 ]]; then
+    elif [[ $GPU_VRAM -ge 20000 ]] || [[ $MODEL_TIER_RAM_GB -ge 96 ]]; then
         TIER=3
-    elif [[ $GPU_VRAM -ge 12000 ]] || [[ $RAM_GB -ge 48 ]]; then
+    elif [[ $GPU_VRAM -ge 12000 ]] || [[ $MODEL_TIER_RAM_GB -ge 48 ]]; then
         TIER=2
-    elif [[ $GPU_VRAM -lt 4000 ]] && [[ $RAM_GB -lt 12 ]]; then
+    elif [[ $GPU_VRAM -lt 4000 ]] && [[ $MODEL_TIER_RAM_GB -lt 12 ]]; then
         TIER=0
     else
         TIER=1
@@ -531,33 +572,54 @@ resolve_tier_config
 if [[ "${ODS_DISABLE_CATALOG_MODEL_SELECTOR:-false}" != "true" && "${TIER:-}" != "CLOUD" ]]; then
     _selector_script="$SCRIPT_DIR/scripts/select-model.py"
     _selector_catalog="$SCRIPT_DIR/config/model-library.json"
-    if [[ -f "$_selector_script" && -f "$_selector_catalog" ]]; then
-        _selector_python=""
-        if [[ -f "$SCRIPT_DIR/lib/python-cmd.sh" ]]; then
-            # shellcheck source=/dev/null
-            . "$SCRIPT_DIR/lib/python-cmd.sh"
-            _selector_python="$(ods_detect_python_cmd || true)"
-        fi
-        if [[ -z "$_selector_python" ]]; then
-            if command -v python3 >/dev/null 2>&1; then
-                _selector_python="python3"
-            elif command -v python >/dev/null 2>&1; then
-                _selector_python="python"
-            fi
-        fi
+    if [[ -f "$_selector_script" && -f "$_selector_catalog" ]] \
+        && declare -F ods_run_catalog_selector >/dev/null 2>&1; then
+        _selector_python="$(ods_model_selector_python)"
         if [[ -n "$_selector_python" ]]; then
-            _selector_env="$("$_selector_python" "$_selector_script" \
-                --catalog "$_selector_catalog" \
-                --backend "${GPU_BACKEND:-unknown}" \
-                --memory-type "${GPU_MEMORY_TYPE:-discrete}" \
-                --vram-mb "${GPU_VRAM:-0}" \
-                --ram-gb "${RAM_GB:-0}" \
-                --profile "${MODEL_PROFILE_EFFECTIVE:-${MODEL_PROFILE:-qwen}}" \
-                --tier "${TIER:-1}" \
-                --max-size-mb "${LLM_MODEL_SIZE_MB:-0}" \
-                --host-arch "${HOST_ARCH:-unknown}" \
-                --installable-only \
-                --env 2>>"$LOG_FILE" || true)"
+            PIXEL_AGENT_MODEL_READY=unknown
+            _pixel_default_selector=false
+            if declare -F ods_pixel_resolve_enablement >/dev/null 2>&1 \
+                && [[ "${ODS_MODE:-local}" == "local" ]] \
+                && [[ -z "${EXTERNAL_LLM_URL:-}" ]] \
+                && ! ods_native_llm_requested \
+                && [[ "$(ods_pixel_resolve_enablement "${ENABLE_PIXEL:-auto}" 2>/dev/null || true)" == "pixel" ]]; then
+                _pixel_default_selector=true
+            fi
+            # Pixel adapts its prompt and tool surface to the selected route;
+            # catalog qualification is performance guidance, never an access
+            # gate. For the default agent, choose the strongest installable
+            # model that fits measured hardware instead of inheriting the
+            # bootstrap tier's download-size ceiling.
+            _selector_max_size_mb="${LLM_MODEL_SIZE_MB:-0}"
+            if [[ "$_pixel_default_selector" == true ]]; then
+                _selector_max_size_mb=0
+                # The selector overwrites this when its chosen model has an
+                # explicit Pixel capability verdict. Fail closed if selection
+                # itself cannot produce trusted metadata.
+                PIXEL_AGENT_MODEL_READY=false
+            fi
+            # Hermes is on by default and needs 64K context: prefer models
+            # that fit at 64K themselves (a soft floor; a smaller context is
+            # chosen only when nothing fits at 64K). Phase 03 re-checks the
+            # pick once the feature set is final.
+            _run_catalog_selector() {
+                ods_run_catalog_selector "$_selector_python" "$_selector_max_size_mb" \
+                    --min-context "$ODS_HERMES_MIN_CONTEXT" \
+                    "$@"
+            }
+            ODS_SELECTOR_MAX_SIZE_MB="$_selector_max_size_mb"
+            _selector_status=0
+            _selector_env="$(_run_catalog_selector 2>>"$LOG_FILE")" || _selector_status=$?
+            if [[ "$_selector_status" -eq 2 ]]; then
+                error "No catalog model fits the detected memory and selected profile. Choose a smaller model profile or use cloud mode; refusing an unsafe tier-map fallback."
+                exit 1
+            fi
+            if [[ "$_pixel_default_selector" == true && -n "$_selector_env" ]]; then
+                log "Pixel default selected the strongest installable hardware-fit model; catalog qualification remains advisory"
+            fi
+            export PIXEL_AGENT_MODEL_READY
+            unset -f _run_catalog_selector
+            unset _selector_max_size_mb _pixel_default_selector
             if [[ -n "$_selector_env" ]]; then
                 if command -v load_model_selector_env_from_output >/dev/null 2>&1; then
                     load_model_selector_env_from_output <<< "$_selector_env"
@@ -574,10 +636,171 @@ if [[ "${ODS_DISABLE_CATALOG_MODEL_SELECTOR:-false}" != "true" && "${TIER:-}" !=
     fi
 fi
 
+# Host-native llama-server: llama-server on the Windows host serves the model
+# Windows setup chose and loaded. This Linux host cannot see that GPU, so the
+# catalog pick above describes a model nobody serves. Record the catalog model
+# the served GGUF names instead, at the context it was loaded with, so .env
+# describes what is served and the next rerun can check it
+# (scripts/preserve-active-model.py --project-native-llm). Stop rather than
+# record another model.
+_native_python=""
+if ods_native_llm_requested && [[ "${TIER:-}" != "CLOUD" ]]; then
+    _native_python="${_selector_python:-}"
+    if [[ -z "$_native_python" ]] && declare -F ods_model_selector_python >/dev/null 2>&1; then
+        _native_python="$(ods_model_selector_python)"
+    fi
+    if [[ -z "$_native_python" ]] || ! declare -F load_model_selector_env_from_output >/dev/null 2>&1; then
+        error "Python and the installer's safe env loader are required to record the model llama-server serves on Windows."
+        exit 1
+    fi
+    # The helper takes the GGUF file name, or a retired Lemonade model id
+    # from an older Windows setup, and matches exactly one catalog model.
+    _native_args=(--env "$INSTALL_DIR/.env"
+        --catalog "$SCRIPT_DIR/config/model-library.json"
+        --imports "$INSTALL_DIR/data/model-imports.json"
+        --models-dir "$INSTALL_DIR/data/models"
+        --project-native-llm "${NATIVE_LLM_MODEL:-${NATIVE_LLM_LEGACY_MODEL_ID:-}}")
+    [[ -z "${NATIVE_LLM_CONTEXT_SIZE:-}" ]] || _native_args+=(--context "$NATIVE_LLM_CONTEXT_SIZE")
+    if ! _native_model_env="$("$_native_python" "$SCRIPT_DIR/scripts/preserve-active-model.py" \
+            "${_native_args[@]}" 2>>"$LOG_FILE")"; then
+        error "llama-server on Windows serves ${NATIVE_LLM_MODEL:-${NATIVE_LLM_LEGACY_MODEL_ID:-an unnamed model}}, which is not in the ODS model catalog, so ODS cannot record it or verify it on updates. Choose a catalog model in the ODS Portal and rerun."
+        exit 1
+    fi
+    # Drop the CPU pick's runtime settings before loading the served model's
+    # contract (the loader omits unset optional values).
+    unset MODEL_RUNTIME_PROFILE MODEL_RUNTIME_PROFILE_LABEL MODEL_RUNTIME_PROFILE_SOURCE
+    unset LLAMA_SERVER_IMAGE LLAMA_SERVER_MEMORY_LIMIT
+    unset LLAMA_CPP_RELEASE_TAG_OVERRIDE LLAMA_CPP_SERVER_BINARY
+    unset LLAMA_ARG_FLASH_ATTN LLAMA_ARG_CACHE_TYPE_K LLAMA_ARG_CACHE_TYPE_V
+    unset LLAMA_ARG_N_CPU_MOE LLAMA_ARG_NO_CACHE_PROMPT
+    unset LLAMA_ARG_CHECKPOINT_EVERY_NT LLAMA_ARG_SPEC_TYPE
+    unset LLAMA_ARG_CTX_CHECKPOINTS LLAMA_ARG_CACHE_RAM
+    unset LLAMA_ARG_SPEC_DRAFT_N_MAX LLAMA_ARG_SPLIT_MODE LLAMA_ARG_TENSOR_SPLIT
+    unset MODEL_RECOMMENDED_ALTERNATIVES
+    load_model_selector_env_from_output <<< "$_native_model_env"
+    # A retired Lemonade id is now the GGUF file name llama-server serves.
+    NATIVE_LLM_MODEL="$GGUF_FILE"
+    MODEL_RECOMMENDATION_REASON="llama-server on the Windows host serves ${LLM_MODEL}${NATIVE_LLM_GPU_NAME:+ on ${NATIVE_LLM_GPU_NAME}}; Windows setup chose it for that GPU."
+    log "Host-native llama-server model recorded from its catalog entry: ${LLM_MODEL} (${GGUF_FILE}) at ${MAX_CONTEXT}"
+    unset _native_args _native_model_env
+fi
+
+# The tier/catalog result is a recommendation.  A valid local model already
+# activated through the Dashboard is operator state and must survive routine
+# installer reruns.  Keep those two concepts separate so updates can advertise
+# a newer recommendation without silently replacing the live agent model.
+INSTALLER_RECOMMENDED_MODEL="${LLM_MODEL:-}"
+INSTALLER_RECOMMENDED_GGUF="${GGUF_FILE:-}"
+INSTALLER_RECOMMENDED_CONTEXT="${MAX_CONTEXT:-}"
+MODEL_SELECTION_SOURCE="installer"
+if [[ -f "$INSTALL_DIR/.env" && "${ODS_RESELECT_MODEL:-false}" != "true" && "${TIER:-}" != "CLOUD" ]]; then
+    # The model of a host-native llama-server belongs to Windows setup, which
+    # passes it on every run. A rerun without it must not quietly switch the
+    # install to a model in this Linux environment. (The helper fails only
+    # without .env, which the condition above rules out.)
+    _retained_native="$(external_llm_env_value "$INSTALL_DIR/.env" NATIVE_LLM_BASE_URL || true)"
+    if ! ods_native_llm_requested && [[ "${ODS_MODE_EXPLICIT:-false}" != "true" && -n "$_retained_native" ]]; then
+        error "This installation uses a llama-server that Windows setup manages. Rerun Windows setup, pass --native-llm-url, or use --reselect-model to choose a model in this Linux environment."
+        exit 1
+    fi
+    unset _retained_native
+    _preserve_script="$SCRIPT_DIR/scripts/preserve-active-model.py"
+    if ods_native_llm_requested; then
+        # The served model was recorded above. Keep the saved selection's
+        # owner and context when it names the same model; repair only the
+        # mismatch earlier installs wrote (the Linux host's own pick saved
+        # next to the served model); stop on any other difference.
+        _native_status=0
+        _native_args=(--env "$INSTALL_DIR/.env"
+            --catalog "$SCRIPT_DIR/config/model-library.json"
+            --imports "$INSTALL_DIR/data/model-imports.json"
+            --models-dir "$INSTALL_DIR/data/models"
+            --state "$INSTALL_DIR/data/model-state.json")
+        # The context Windows loaded is what is served, so it wins over the
+        # saved one; without it the saved context stays.
+        [[ -z "${NATIVE_LLM_CONTEXT_SIZE:-}" ]] || _native_args+=(--context "$NATIVE_LLM_CONTEXT_SIZE")
+        _native_model_env="$("$_native_python" "$_preserve_script" "${_native_args[@]}" \
+            --native-llm --served-model "$GGUF_FILE" 2>>"$LOG_FILE")" || _native_status=$?
+        if [[ "$_native_status" -ne 0 ]]; then
+            # Earlier installs saved this host's own catalog pick next to the
+            # served model. The helper re-records only that installer-written
+            # mismatch, from the served model, and logs the change.
+            _native_status=3
+            if ! _native_model_env="$("$_native_python" "$_preserve_script" "${_native_args[@]}" \
+                    --repair-native-llm "$GGUF_FILE" 2>>"$LOG_FILE")"; then
+                error "The saved model selection differs from the model llama-server serves on Windows (${GGUF_FILE}) and was not written by the installer. Activate the model again in the Dashboard, rerun setup from the ODS Portal, or use --reselect-model."
+                exit 1
+            fi
+            ai_warn "Corrected the saved model details to describe the model llama-server serves on Windows; the served model did not change (details in the install log)."
+        fi
+        if [[ -n "$_native_model_env" ]]; then
+            unset MODEL_RUNTIME_PROFILE MODEL_RUNTIME_PROFILE_LABEL MODEL_RUNTIME_PROFILE_SOURCE
+            unset LLAMA_SERVER_IMAGE
+            load_model_selector_env_from_output <<< "$_native_model_env"
+            [[ "$_native_status" -ne 0 ]] \
+                || log "Kept the saved host-native model across installer rerun: ${LLM_MODEL} (${GGUF_FILE}) at ${MAX_CONTEXT}, selected by ${MODEL_SELECTION_SOURCE}"
+        fi
+        unset _native_status _native_args _native_model_env
+    elif [[ -f "$_preserve_script" ]]; then
+        if [[ -z "${_selector_python:-}" ]]; then
+            if [[ -f "$SCRIPT_DIR/lib/python-cmd.sh" ]]; then
+                # shellcheck source=/dev/null
+                . "$SCRIPT_DIR/lib/python-cmd.sh"
+                _selector_python="$(ods_detect_python_cmd || true)"
+            elif command -v python3 >/dev/null 2>&1; then
+                _selector_python="python3"
+            fi
+        fi
+        if [[ -n "${_selector_python:-}" ]]; then
+            _preserve_status=0
+            _preserved_model_env="$("$_selector_python" "$_preserve_script" \
+                --env "$INSTALL_DIR/.env" \
+                --catalog "$SCRIPT_DIR/config/model-library.json" \
+                --imports "$INSTALL_DIR/data/model-imports.json" \
+                --models-dir "$INSTALL_DIR/data/models" \
+                --state "$INSTALL_DIR/data/model-state.json" \
+                --backend "${GPU_BACKEND:-unknown}" \
+                --memory-type "${GPU_MEMORY_TYPE:-discrete}" \
+                --vram-mb "${GPU_VRAM:-0}" \
+                --ram-gb "${RAM_GB:-0}" \
+                --host-arch "${HOST_ARCH:-unknown}" \
+                --local-model \
+                2>>"$LOG_FILE")" || _preserve_status=$?
+            if [[ -n "$_preserved_model_env" ]] && command -v load_model_selector_env_from_output >/dev/null 2>&1; then
+                # Remove every model-selector runtime value before loading the
+                # preserved active contract. The helper omits inactive optional
+                # LLAMA_* settings intentionally: exporting them as empty makes
+                # Compose pass an empty numeric value to llama.cpp.
+                unset MODEL_RUNTIME_PROFILE MODEL_RUNTIME_PROFILE_LABEL MODEL_RUNTIME_PROFILE_SOURCE
+                unset LLAMA_SERVER_IMAGE LLAMA_SERVER_MEMORY_LIMIT
+                unset LLAMA_CPP_RELEASE_TAG_OVERRIDE LLAMA_CPP_SERVER_BINARY
+                unset LLAMA_ARG_FLASH_ATTN LLAMA_ARG_CACHE_TYPE_K LLAMA_ARG_CACHE_TYPE_V
+                unset LLAMA_ARG_N_CPU_MOE LLAMA_ARG_NO_CACHE_PROMPT
+                unset LLAMA_ARG_CHECKPOINT_EVERY_NT LLAMA_ARG_SPEC_TYPE
+                unset LLAMA_ARG_CTX_CHECKPOINTS LLAMA_ARG_CACHE_RAM
+                unset LLAMA_ARG_SPEC_DRAFT_N_MAX LLAMA_ARG_SPLIT_MODE LLAMA_ARG_TENSOR_SPLIT
+                load_model_selector_env_from_output <<< "$_preserved_model_env"
+                log "Preserved active model across installer rerun: ${LLM_MODEL} (${GGUF_FILE})"
+            fi
+            unset _preserve_status
+        fi
+    fi
+elif [[ "${ODS_RESELECT_MODEL:-false}" == "true" ]]; then
+    log "Active-model preservation disabled by --reselect-model"
+fi
+
+unset _native_python
+
 # Display hardware summary with nice formatting
 CPU_INFO=$(grep "model name" /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs || echo "Unknown")
 if [[ "$INTERACTIVE" == "true" ]]; then
-    show_hardware_summary "$GPU_NAME" "$((GPU_VRAM / 1024))" "$CPU_INFO" "$RAM_GB" "$DISK_AVAIL"
+    # A host-native llama-server (Windows under WSL) runs the model on a GPU
+    # this Linux probe cannot see; show that GPU instead of "None".
+    if ods_native_llm_requested && [[ -n "${NATIVE_LLM_GPU_NAME:-}" ]]; then
+        show_hardware_summary "${NATIVE_LLM_GPU_NAME} (llama-server on Windows)" "$(( (${NATIVE_LLM_GPU_VRAM_MB:-0} + 512) / 1024 ))" "$CPU_INFO" "$RAM_GB" "$DISK_AVAIL"
+    else
+        show_hardware_summary "$GPU_NAME" "$((GPU_VRAM / 1024))" "$CPU_INFO" "$RAM_GB" "$DISK_AVAIL"
+    fi
 
     if [[ "$TIER" == "CLOUD" ]]; then
         SPEED_EST="cloud API"

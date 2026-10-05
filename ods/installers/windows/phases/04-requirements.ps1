@@ -79,7 +79,7 @@ function Resolve-WindowsLlmPreflightPort {
     param(
         [string]$GpuBackend,
         [switch]$CloudMode,
-        [int]$LemonadeDefaultPort = 8080,
+        [int]$NativeDefaultPort = 8080,
         [string]$InstallDir = ""
     )
 
@@ -92,7 +92,7 @@ function Resolve-WindowsLlmPreflightPort {
         $persistedEnv = Get-WindowsODSEnvMap -InstallDir $InstallDir
     }
     if ($GpuBackend -eq "amd") {
-        $defaultPort = $LemonadeDefaultPort
+        $defaultPort = $NativeDefaultPort
         $candidate = $env:AMD_INFERENCE_PORT
         if (-not $candidate -and $persistedEnv.ContainsKey("AMD_INFERENCE_PORT")) {
             $candidate = $persistedEnv["AMD_INFERENCE_PORT"]
@@ -118,91 +118,90 @@ function Resolve-WindowsLlmPreflightPort {
     return $defaultPort
 }
 
-function Get-WindowsODSLemonadeProcesses {
+function Test-WindowsODSNativeLlmOwnsPort {
     <#
     .SYNOPSIS
-        Return native Lemonade processes that can reserve ODS host ports.
-    #>
-    $knownNames = @("LemonadeServer.exe", "lemonade-server.exe", "lemonade-router.exe")
-    try {
-        return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-            ($knownNames -contains $_.Name) -or
-            ($_.ExecutablePath -and (
-                $_.ExecutablePath -match '\\lemonade_server\\bin\\' -or
-                $_.ExecutablePath -match '\\Lemonade Server\\bin\\' -or
-                $_.ExecutablePath -match '\\\.cache\\lemonade\\bin\\'
-            ))
-        } | Select-Object ProcessId, Name, ExecutablePath, CommandLine)
-    } catch {
-        return @()
-    }
-}
-
-function Test-WindowsODSLemonadeOwnsPort {
-    <#
-    .SYNOPSIS
-        Return true when a listening port belongs to a known Lemonade process.
+        True when the listener is ODS's own AMD model runtime, which phase 8
+        replaces: this installation's published llama-server.exe or active
+        model-store runtime, or the Lemonade tree of an ODS-owned
+        ODSLemonadeRuntime task (exact executable and command line). Never
+        inferred from a process name, folder or port.
     #>
     param(
         [hashtable]$PortResult,
-        [object[]]$LemonadeProcesses = @()
+        [string]$InstallDir,
+        [int]$Port
     )
 
-    if (-not $PortResult -or -not $PortResult.InUse -or [int]$PortResult.ProcessId -le 0) {
+    if (-not $PortResult -or -not $PortResult.InUse -or [int]$PortResult.ProcessId -le 0 -or -not $InstallDir) {
         return $false
     }
+    $nodes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $listener = @($nodes | Where-Object { $_.ProcessId -eq [int]$PortResult.ProcessId })
+    if ($listener.Count -ne 1 -or -not $listener[0].ExecutablePath) { return $false }
+    $runtimes = @(
+        (Join-Path (Join-Path $InstallDir "llama-server") "llama-server.exe"),
+        (Get-ODSNativeLlamaLegacyProfileExecutable -InstallDir $InstallDir -EnvMap (Get-WindowsODSEnvMap -InstallDir $InstallDir))
+    ) | Where-Object { $_ }
+    if (@($runtimes | Where-Object { $_ -ieq [string]$listener[0].ExecutablePath }).Count) { return $true }
 
-    $listenerPid = [int]$PortResult.ProcessId
-    return [bool]@($LemonadeProcesses | Where-Object {
-        $_.ProcessId -and [int]$_.ProcessId -eq $listenerPid
-    }).Count
+    $lemonade = Get-ODSLegacyLemonadeRuntime -InstallDir $InstallDir -Port $Port
+    if (-not $lemonade -or -not $lemonade.Owned) { return $false }
+    # Lemonade's router can own the socket below the server process.
+    $current = $listener[0]
+    for ($depth = 0; $depth -lt 8 -and $current; $depth++) {
+        if ([string]$current.ExecutablePath -ieq [string]$lemonade.ExecutablePath -and
+            [string]$current.CommandLine -cin @($lemonade.CommandLines)) { return $true }
+        $parent = @($nodes | Where-Object { $_.ProcessId -eq $current.ParentProcessId })
+        $current = $(if ($parent.Count -eq 1) { $parent[0] } else { $null })
+    }
+    return $false
 }
 
-function Stop-WindowsODSLemonadePortConflicts {
-    <#
-    .SYNOPSIS
-        Stop native Lemonade when this install is not using Lemonade inference.
-    #>
+function Get-WindowsODSSelectedPortConflicts {
     param(
-        [switch]$UseNativeLemonade,
-        [switch]$NonInteractive,
-        [switch]$Force
+        [System.Collections.IDictionary]$PortsToCheck,
+        [string]$NativeLlmService = "",
+        [string]$InstallDir = ""
     )
 
-    if ($UseNativeLemonade) { return }
-
-    $_lemonadeProcesses = @(Get-WindowsODSLemonadeProcesses)
-    if ($_lemonadeProcesses.Count -eq 0) { return }
-
-    $_pidList = ($_lemonadeProcesses | ForEach-Object { "$($_.Name) PID $($_.ProcessId)" }) -join ", "
-    Write-AIWarn "Native Lemonade is running but this install uses Docker-backed inference."
-    Write-AI "  Lemonade can reserve localhost ports used by ODS services, including Whisper STT."
-    Write-AI "  Detected: $_pidList"
-
-    $_shouldStop = $true
-    if (-not $NonInteractive -and -not $Force) {
-        $_choice = Read-Host "  Stop native Lemonade for this ODS session? [Y/n]"
-        $_shouldStop = ($_choice -notmatch "^[nN]")
-    }
-
-    if (-not $_shouldStop) {
-        Write-AIWarn "Native Lemonade left running. Docker service readiness may fail on localhost ports."
-        return
-    }
-
-    foreach ($_proc in $_lemonadeProcesses) {
-        if ($_proc.ProcessId -gt 0) {
-            Stop-Process -Id ([int]$_proc.ProcessId) -Force -ErrorAction SilentlyContinue
+    $conflicts = @()
+    foreach ($service in $PortsToCheck.Keys) {
+        $port = [int]$PortsToCheck[$service]
+        $result = Test-WindowsPortInUse -Port $port
+        if (-not $result.InUse) { continue }
+        if ($NativeLlmService -and $service -eq $NativeLlmService -and
+            (Test-WindowsODSNativeLlmOwnsPort -PortResult $result -InstallDir $InstallDir -Port $port)) {
+            Write-AI "  Port $port is held by this installation's model runtime; setup replaces it."
+            continue
         }
+        $conflicts += "  Port $port ($service) in use by: $($result.ProcessName) (PID $($result.ProcessId))"
     }
-    Start-Sleep -Seconds 2
+    return $conflicts
+}
 
-    $_remaining = @(Get-WindowsODSLemonadeProcesses)
-    if ($_remaining.Count -gt 0) {
-        Write-AIWarn "Could not fully stop native Lemonade. Port conflicts may remain."
-    } else {
-        Write-AISuccess "Native Lemonade stopped for Docker-backed install"
+function Assert-WindowsODSSelectedPortAvailability {
+    param(
+        [string[]]$Conflicts = @(),
+        [switch]$NonInteractive,
+        [switch]$Force,
+        [switch]$DryRun
+    )
+
+    if ($Conflicts.Count -eq 0) {
+        Write-AISuccess "No port conflicts detected"
+        return $true
     }
+    Write-AIWarn "Port conflicts detected:"
+    $Conflicts | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+    Write-AI "  Stop the conflicting processes, or override ports via environment variables."
+    Write-AI '  Example: $env:WEBUI_PORT = "9090" before running the installer.'
+    Write-AI "  See .env.example for all configurable ports."
+    if ($NonInteractive -and -not $Force -and -not $DryRun) {
+        Write-AIError "Non-interactive install cannot continue with occupied service ports."
+        throw "ODS_INSTALL_ABORTED"
+    }
+    return $false
 }
 
 # ── Tier-specific RAM requirements ────────────────────────────────────────────
@@ -257,7 +256,7 @@ if (-not $_diskCheck.Sufficient) {
         $_installDirHint = "$($Matches[1].ToUpperInvariant()):\ods"
     }
     Write-AI "  To use a different drive, rerun from the source checkout with:"
-    Write-AI "  .\install.ps1 -InstallDir $_installDirHint"
+    Write-AI "  .\ods\installers\windows\install-windows.ps1 -InstallDir $_installDirHint"
     $requirementsMet = $false
 } else {
     Write-AISuccess "Disk: $($_diskCheck.FreeGB) GB free OK (>= ${_minDiskGB} GB for Tier $selectedTier)"
@@ -270,14 +269,10 @@ if ($selectedTier -notin @("0", "CLOUD") -and $gpuInfo.Backend -eq "none") {
     Write-AI "  Consider --Cloud for API mode, or --Tier 0 for CPU-optimized inference."
 }
 
-# Native Lemonade legitimately belongs to Windows AMD/Lemonade installs. On
-# Docker-backed NVIDIA/CPU installs it can shadow localhost ports such as 9000
-# and make healthy Docker services look dead from the Windows host.
-$_usesNativeLemonade = ($gpuInfo.Backend -eq "amd" -and -not $cloudMode)
-Stop-WindowsODSLemonadePortConflicts `
-    -UseNativeLemonade:$_usesNativeLemonade `
-    -NonInteractive:$nonInteractive `
-    -Force:$force
+# On AMD the model runs natively on Windows (llama-server.exe). Its port may
+# already be held by this installation's own runtime, which phase 8 replaces;
+# any other program there is a conflict. Nothing is stopped here.
+$_usesNativeLlm = ($gpuInfo.Backend -eq "amd" -and -not $cloudMode)
 
 # ── Port conflict detection ───────────────────────────────────────────────────
 # Build list of ports to check based on enabled features.
@@ -292,10 +287,10 @@ $_portsToCheck = [ordered]@{
 $_llmPortToCheck = Resolve-WindowsLlmPreflightPort `
     -GpuBackend ([string]$gpuInfo.Backend) `
     -CloudMode:$cloudMode `
-    -LemonadeDefaultPort ([int]$script:LEMONADE_PORT) `
+    -NativeDefaultPort ([int]$script:NATIVE_LLM_PORT) `
     -InstallDir $installDir
+$_llmServiceLabel = "llama-server (LLM)"
 if ($_llmPortToCheck -gt 0) {
-    $_llmServiceLabel = $(if ($gpuInfo.Backend -eq "amd") { "Lemonade (LLM)" } else { "llama-server (LLM)" })
     $_portsToCheck[$_llmServiceLabel] = $_llmPortToCheck
 }
 if ($enableRecommended) {
@@ -304,7 +299,13 @@ if ($enableRecommended) {
     $_portsToCheck["Token Spy (usage monitor)"] = 3005
 }
 if ($enableVoice) {
-    $_whisperPortToCheck = $(if ($gpuInfo.Backend -eq "amd" -and -not $cloudMode) { 9100 } else { 9000 })
+    # Preflight the exact host port phase 06 / New-ODSEnv will write: honor the
+    # process-level and persisted WHISPER_PORT override, then apply the same
+    # Lemonade-router conflict move as Resolve-WindowsWhisperHostPort.
+    $_whisperConfiguredPort = Resolve-WindowsODSPort `
+        -Name "WHISPER_PORT" -DefaultPort 9000 -InstallDir $installDir
+    $_whisperPortToCheck = [int](Resolve-WindowsWhisperHostPort `
+        -ConfiguredPort ([string]$_whisperConfiguredPort))
     $_portsToCheck["Whisper (STT)"] = $_whisperPortToCheck
     $_portsToCheck["Kokoro (TTS)"]  = 8880
 }
@@ -318,10 +319,7 @@ if ($enableRag) {
 if ($enableHermes) {
     $_portsToCheck["Hermes auth proxy"] = 9120
 }
-if ($enableOpenClaw) {
-    $_portsToCheck["OpenClaw (agents)"] = 7860
-}
-if ($enableHermes -or $enableOpenClaw) {
+if ($enableHermes) {
     $_portsToCheck["APE (agent policy engine)"] = 7890
 }
 if ($enableComfyui) {
@@ -334,35 +332,14 @@ if ($enablePrivacyShield) {
     $_portsToCheck["Privacy Shield"] = 8085
 }
 
-$_portConflicts = @()
-$_managedLemonadeProcesses = @()
-if ($_usesNativeLemonade) {
-    $_managedLemonadeProcesses = @(Get-WindowsODSLemonadeProcesses)
-}
-foreach ($svc in $_portsToCheck.Keys) {
-    $port   = $_portsToCheck[$svc]
-    $result = Test-WindowsPortInUse -Port $port
-    if ($result.InUse) {
-        if ($svc -eq "Lemonade (LLM)" -and
-            (Test-WindowsODSLemonadeOwnsPort `
-                -PortResult $result `
-                -LemonadeProcesses $_managedLemonadeProcesses)) {
-            Write-AI "  Port $port is already owned by the managed Lemonade runtime; it will be reused."
-            continue
-        }
-        $_portConflicts += "  Port $port ($svc) in use by: $($result.ProcessName) (PID $($result.ProcessId))"
-        $requirementsMet = $false
-    }
-}
-
-if ($_portConflicts.Count -gt 0) {
-    Write-AIWarn "Port conflicts detected:"
-    $_portConflicts | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
-    Write-AI "  Stop the conflicting processes, or override ports via environment variables."
-    Write-AI '  Example: $env:WEBUI_PORT = "9090" before running the installer.'
-    Write-AI "  See .env.example for all configurable ports."
-} else {
-    Write-AISuccess "No port conflicts detected"
+$_portConflicts = @(Get-WindowsODSSelectedPortConflicts `
+    -PortsToCheck $_portsToCheck `
+    -NativeLlmService $(if ($_usesNativeLlm) { $_llmServiceLabel } else { "" }) `
+    -InstallDir $installDir)
+if (-not (Assert-WindowsODSSelectedPortAvailability `
+    -Conflicts $_portConflicts -NonInteractive:$nonInteractive `
+    -Force:$force -DryRun:$dryRun)) {
+    $requirementsMet = $false
 }
 
 # ── Requirements gate ─────────────────────────────────────────────────────────

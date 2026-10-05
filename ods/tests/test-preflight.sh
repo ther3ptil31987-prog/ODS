@@ -120,19 +120,21 @@ else
     fail "Does not probe actual Docker port mapping"
 fi
 
-# 11. External Lemonade mode checks LiteLLM, not a managed llama-server container
-if grep -q 'is_external_lemonade()' "$PREFLIGHT" \
-   && grep -q 'LiteLLM external Lemonade gateway' "$PREFLIGHT" \
+# 11. A host-native llama-server (Windows Portal) checks LiteLLM, not the
+# in-stack llama-server container
+if grep -q 'ods_preflight_host_native_llm()' "$SCRIPT_DIR/../lib/preflight-llm-route.sh" \
+   && grep -q 'if ods_preflight_uses_litellm; then' "$PREFLIGHT" \
+   && grep -q 'LiteLLM gateway' "$PREFLIGHT" \
    && grep -q 'ods-litellm' "$PREFLIGHT"; then
-    pass "External Lemonade preflight checks LiteLLM gateway"
+    pass "Host-native llama-server preflight checks LiteLLM gateway"
 else
-    fail "External Lemonade preflight must not require managed ods-llama-server"
+    fail "Host-native llama-server preflight must not require the in-stack ods-llama-server"
 fi
 
 # 12. Extension health checks honor .env port overrides
-# Linux AMD/Lemonade reserves host port 9000 for Lemonade, so the installer may
-# write WHISPER_PORT=9100. Root preflight must follow that configured port
-# instead of probing a stale hard-coded default.
+# An install can keep WHISPER_PORT=9100 (earlier AMD installs moved it there).
+# Root preflight must follow that configured port instead of probing a stale
+# hard-coded default.
 if grep -q 'WHISPER_PORT_RESOLVED="${WHISPER_PORT:-9000}"' "$PREFLIGHT" \
    && grep -q 'TTS_PORT_RESOLVED="${TTS_PORT:-8880}"' "$PREFLIGHT" \
    && grep -q 'EMBEDDINGS_PORT_RESOLVED="${EMBEDDINGS_PORT:-8090}"' "$PREFLIGHT"; then

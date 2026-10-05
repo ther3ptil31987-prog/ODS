@@ -151,12 +151,38 @@ class TestStateModule:
         [
             ({"GGUF_FILE": "Qwen3.5-9B-Q4_K_M.gguf", "LLM_MODEL": "qwen3.5-9b"},
              {"catalogId": "qwen3.5-9b", "runtimeModelId": "Qwen3.5-9B-Q4_K_M.gguf", "backendKind": "llama-server"}),
-            ({"LEMONADE_MODEL": "extra.Qwen3.5-9B-Q4_K_M.gguf", "LLM_BACKEND": "lemonade"},
-             {"catalogId": "Qwen3.5-9B-Q4_K_M", "runtimeModelId": "extra.Qwen3.5-9B-Q4_K_M.gguf", "backendKind": "lemonade"}),
+            # A pre-round-F Lemonade .env: the GGUF filename is the runtime
+            # identity (--alias), never the retired LEMONADE_MODEL id.
+            ({"LEMONADE_MODEL": "extra.Qwen3.5-9B-Q4_K_M.gguf", "LLM_BACKEND": "lemonade",
+              "GGUF_FILE": "Qwen3.5-9B-Q4_K_M.gguf"},
+             {"catalogId": "Qwen3.5-9B-Q4_K_M", "runtimeModelId": "Qwen3.5-9B-Q4_K_M.gguf", "backendKind": "llama-server"}),
             ({"GGUF_FILE": "M.gguf", "AMD_INFERENCE_RUNTIME": "lemonade"},
-             {"catalogId": "M", "runtimeModelId": "M.gguf", "backendKind": "lemonade"}),
+             {"catalogId": "M", "runtimeModelId": "M.gguf", "backendKind": "llama-server"}),
             ({"LLM_MODEL": "native-model"},
              {"catalogId": "native-model", "runtimeModelId": "native-model", "backendKind": "llama-server"}),
+            # A leftover LEMONADE_MODEL line never relabels the route.
+            ({
+                "GPU_BACKEND": "amd",
+                "LLM_BACKEND": "llama-server",
+                "LEMONADE_MODEL": "Qwen3.6-35B-A3B-GGUF",
+                "LLM_MODEL": "qwen3.5-9b",
+                "GGUF_FILE": "Qwen3.5-9B-Q4_K_M.gguf",
+            }, {
+                "catalogId": "qwen3.5-9b",
+                "runtimeModelId": "Qwen3.5-9B-Q4_K_M.gguf",
+                "backendKind": "llama-server",
+            }),
+            ({
+                "LLM_BACKEND": "lemonade",
+                "AMD_INFERENCE_MANAGED": "off",
+                "LEMONADE_MODEL": "portable-model",
+                "LLM_MODEL": "stale-model",
+                "GGUF_FILE": "stale.gguf",
+            }, {
+                "catalogId": "stale-model",
+                "runtimeModelId": "stale.gguf",
+                "backendKind": "llama-server",
+            }),
         ],
     )
     def test_migrate_env_forms(self, env, expected):
@@ -167,7 +193,7 @@ class TestStateModule:
     def test_migrate_cloud_only_yields_none(self):
         env = {
             "ODS_MODE": "cloud",
-            "LLM_MODEL": "anthropic/claude-sonnet-4-5-20250514",
+            "LLM_MODEL": "anthropic/claude-sonnet-4-6",
             "GGUF_FILE": "",
             "MAX_CONTEXT": "200000",
         }
@@ -216,7 +242,7 @@ class TestStateModule:
         assert doc["active"]["contextLength"] == 65536
         assert doc["active"]["capabilities"]["agentViable"] is True
 
-    def test_initialize_uses_lemonade_endpoint_id(self, tmp_path):
+    def test_initialize_for_a_legacy_lemonade_env_uses_the_llama_server_endpoint(self, tmp_path):
         path = tmp_path / "model-state.json"
         doc = sb.initialize_if_missing(
             path,
@@ -227,13 +253,36 @@ class TestStateModule:
                 "GGUF_FILE": "Model.gguf",
             },
         )
-        assert doc["active"]["backend"]["endpointId"] == "lemonade-default"
+        assert doc["active"]["backend"] == {
+            "kind": "llama-server", "endpointId": "llama-server-default", "nativeRoute": None,
+        }
+        assert doc["active"]["runtimeModelId"] == "Model.gguf"
+
+    def test_legacy_lemonade_route_is_readable_but_never_written(self, tmp_path):
+        path = tmp_path / "model-state.json"
+        doc = _record(path, runtime="Model.gguf")
+        doc["active"]["backend"] = {
+            "kind": "lemonade", "endpointId": "lemonade-default", "nativeRoute": "extra.Model.gguf",
+        }
+        doc["active"]["runtimeModelId"] = "extra.Model.gguf"
+        doc["active"]["proof"]["identity"] = "extra.Model.gguf"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        legacy, errors = sb.read_state(path)
+        # Readable for one release so the host agent can migrate it.
+        assert errors == [] and legacy["active"]["backend"]["kind"] == "lemonade"
+        assert sb.is_legacy_route(legacy["active"]) is True
+        assert sb.is_legacy_route(_record(tmp_path / "current.json")["active"]) is False
+        before = path.read_text(encoding="utf-8")
+        for backend, endpoint in (("lemonade", "llama-server-default"), ("llama-server", "lemonade-default")):
+            with pytest.raises(sb.StateError, match="readable only"):
+                _record(path, runtime="Model.gguf", backend=backend, endpoint=endpoint)
+        assert path.read_text(encoding="utf-8") == before
 
     def test_initialize_cloud_only_writes_nothing(self, tmp_path):
         path = tmp_path / "model-state.json"
         env = {
             "ODS_MODE": "cloud",
-            "LLM_MODEL": "anthropic/claude-sonnet-4-5-20250514",
+            "LLM_MODEL": "anthropic/claude-sonnet-4-6",
             "MAX_CONTEXT": "200000",
         }
         assert sb.initialize_if_missing(path, env) is None
@@ -323,6 +372,24 @@ class TestModelStateEndpoint:
         assert any("routeSeq" in error for error in body["errors"])
         assert any("unexpected" in error for error in body["errors"])
 
+    def test_non_dict_root_state_is_diagnostic(self, test_client, monkeypatch, tmp_path):
+        path = self._point_at(monkeypatch, tmp_path)
+        path.write_text('["array", "root"]', encoding="utf-8")
+        resp = test_client.get("/api/models/state", headers=test_client.auth_headers)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["exists"] is True and body["valid"] is False
+        assert any("JSON object" in err for err in body["errors"])
+
+    def test_non_utf8_binary_state_is_diagnostic(self, test_client, monkeypatch, tmp_path):
+        path = self._point_at(monkeypatch, tmp_path)
+        path.write_bytes(b"\x80\xff\xfe\xfd")
+        resp = test_client.get("/api/models/state", headers=test_client.auth_headers)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["exists"] is True and body["valid"] is False
+        assert any("read failed" in err for err in body["errors"])
+
     def test_requires_auth(self, test_client, monkeypatch, tmp_path):
         self._point_at(monkeypatch, tmp_path)
         resp = test_client.get("/api/models/state")
@@ -340,9 +407,8 @@ class TestObserveHook:
             lambda: (config_dir / "opencode.json", config_dir / "config.json"),
         )
         monkeypatch.setattr(tma._mod, "_chat_completion_ready", lambda *_a, **_k: True)
-        monkeypatch.setattr(
-            tma._mod, "_llama_runtime_context_length", lambda *_args: 65536
-        )
+        monkeypatch.setattr(tma._mod, "_runtime_health", lambda _env: "ok")
+        monkeypatch.setattr(tma._mod, "_llama_runtime_props", lambda _env: (65536, ""))
         monkeypatch.setattr(tma._mod, "_container_exists", lambda _c: False)
         monkeypatch.setattr(tma._mod, "_container_running", lambda _c: False)
         monkeypatch.setattr(
@@ -450,6 +516,111 @@ class TestObserveHook:
             "completion": True,
         }
 
+    def test_legacy_lemonade_env_initial_route_proves_the_gguf_alias(
+        self, tmp_path, monkeypatch
+    ):
+        import test_model_activate as tma
+
+        install_dir = tma._write_model_activation_fixture(tmp_path)[0]
+        env_path = install_dir / ".env"
+        env_path.write_text(
+            "\n".join([
+                "ODS_MODE=lemonade",
+                "GPU_BACKEND=amd",
+                "LLM_BACKEND=lemonade",
+                "AMD_INFERENCE_RUNTIME=lemonade",
+                "LEMONADE_MODEL=extra.Qwen3.5-9B-Q4_K_M.gguf",
+                "LLM_MODEL=qwen3.5-9b",
+                "GGUF_FILE=Qwen3.5-9B-Q4_K_M.gguf",
+                "CTX_SIZE=65536",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        state_path = install_dir / "data" / "model-state.json"
+        reconstructed = sb.initialize_if_missing(state_path, tma._mod.load_env(env_path))
+        assert reconstructed["active"]["backend"]["kind"] == "llama-server"
+
+        readiness_calls = []
+
+        def readiness(*_args, **kwargs):
+            readiness_calls.append(kwargs)
+            return {
+                "identity": "Qwen3.5-9B-Q4_K_M.gguf",
+                "contextLength": 65536,
+                "contextVerified": True,
+                "verifiedAt": "2026-09-04T00:00:00Z",
+            }
+
+        monkeypatch.setattr(tma._mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(tma._mod, "_wait_for_model_readiness", readiness)
+
+        assert tma._mod._publish_verified_initial_switchboard_route(
+            reason="legacy-env-test", attempts=1, initial_delay=0, interval=0
+        ) is True
+        assert readiness_calls[0]["gguf_file"] == "Qwen3.5-9B-Q4_K_M.gguf"
+        assert "lemonade_model_id" not in readiness_calls[0]
+
+        doc, errors = sb.read_state(state_path)
+        assert errors == [] and doc is not None
+        assert doc["active"]["runtimeModelId"] == "Qwen3.5-9B-Q4_K_M.gguf"
+        assert doc["active"]["backend"] == {
+            "kind": "llama-server",
+            "endpointId": "llama-server-default",
+            "nativeRoute": None,
+        }
+
+    @pytest.mark.parametrize(
+        "key,new_value",
+        [
+            ("GPU_BACKEND", "nvidia"),
+            ("GGUF_FILE", "Other.gguf"),
+        ],
+    )
+    def test_initial_route_discards_proof_after_runtime_contract_changes(
+        self, tmp_path, monkeypatch, key, new_value
+    ):
+        import test_model_activate as tma
+
+        install_dir = tma._write_model_activation_fixture(tmp_path)[0]
+        env_path = install_dir / ".env"
+        original_values = {
+            "ODS_MODE": "local",
+            "GPU_BACKEND": "amd",
+            "LLM_BACKEND": "llama-server",
+            "AMD_INFERENCE_RUNTIME": "llama-server",
+            "GGUF_FILE": "portable-model.gguf",
+            "CTX_SIZE": "65536",
+        }
+        original = "".join(f"{name}={value}\n" for name, value in original_values.items())
+        env_path.write_text(original, encoding="utf-8")
+        state_path = install_dir / "data" / "model-state.json"
+        sb.initialize_if_missing(state_path, tma._mod.load_env(env_path))
+
+        def readiness(*_args, **_kwargs):
+            changed_values = dict(original_values)
+            changed_values[key] = new_value
+            env_path.write_text(
+                "".join(f"{name}={value}\n" for name, value in changed_values.items()),
+                encoding="utf-8",
+            )
+            return {
+                "identity": "portable-model.gguf",
+                "contextLength": 65536,
+                "contextVerified": True,
+                "verifiedAt": "2026-09-04T00:00:00Z",
+            }
+
+        monkeypatch.setattr(tma._mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(tma._mod, "_wait_for_model_readiness", readiness)
+
+        assert tma._mod._publish_verified_initial_switchboard_route(
+            reason="runtime-race-test", attempts=1, initial_delay=0, interval=0
+        ) is False
+        doc, errors = sb.read_state(state_path)
+        assert errors == [] and doc is not None
+        assert doc["active"]["reconstructed"] is True
+
     def test_initial_reconstructed_state_stays_unroutable_without_proof(
         self, tmp_path, monkeypatch
     ):
@@ -501,7 +672,7 @@ class TestObserveHook:
             reason="test", attempts=1, initial_delay=0, interval=0
         ) is False
 
-    def test_cancelled_initial_route_readiness_never_warms_lemonade(
+    def test_cancelled_initial_route_readiness_never_probes_the_runtime(
         self, tmp_path, monkeypatch
     ):
         import test_model_activate as tma
@@ -527,7 +698,6 @@ class TestObserveHook:
             model_id="qwen3-4b-instruct-2507-q4",
             gguf_file="Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
             llm_model_name="Qwen3-4B-Instruct-2507-Q4_K_M",
-            lemonade_model_id="Qwen3-4B-Instruct-2507-Q4_K_M",
             attempts=60,
             initial_delay=0,
             interval=5,

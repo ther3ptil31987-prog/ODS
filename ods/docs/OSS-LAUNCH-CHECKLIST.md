@@ -1,7 +1,14 @@
 # ODS OSS Launch Checklist
 
 Date: 2026-03-02
-Scope: `/home/user/ods` (Strix Halo variant)
+Historical scope: March 2026 Strix Halo development checkout.
+
+**Archived checklist, not a current release gate.** The completed/open labels
+below describe the original work session. Root and product license files and
+`.env.example` now exist. Current release acceptance is documented in
+[Release Validation](RELEASE_VALIDATION.md), [the support matrix](SUPPORT-MATRIX.md),
+and [the September promotion record](PUBLIC_BETA_PROMOTION_2026-09.md).
+Do not execute old workaround or launch instructions as a current runbook.
 
 ## Completed This Session
 
@@ -36,14 +43,14 @@ Scope: `/home/user/ods` (Strix Halo variant)
 - Why: This repo uses `docker-compose.base.yml` + GPU overlays, but some tests/scripts had stale fallbacks.
 - Evidence:
   - [`tests/integration-test.sh:92`](../tests/integration-test.sh)
-  - [`tests/test-bootstrap-mode.sh:27`](../tests/test-bootstrap-mode.sh)
+  - `tests/test-bootstrap-mode.sh:27` (retired 2026-10-04; compose validation runs in `.github/workflows/validate-compose.yml`)
   - [`scripts/upgrade-model.sh:202`](../scripts/upgrade-model.sh)
 - Owner: Core Maintainer
 - Effort: M (0.5-1.5 days)
 - Exit criteria: CI/test scripts pass against Strix compose or support both compose files.
 
 2. **Add and validate `.env.example` for reproducible installs** ✅ Completed (2026-03-02)
-- Why: Tests expect it; migration script references it; file is currently missing.
+- Why: Tests expect it; migration script references it; the file was missing at the original review.
 - Evidence:
   - [`tests/integration-test.sh:297`](../tests/integration-test.sh)
   - [`scripts/migrate-config.sh:116`](../scripts/migrate-config.sh)
@@ -58,13 +65,13 @@ Scope: `/home/user/ods` (Strix Halo variant)
 - Exit criteria: no broken local links in top-level docs.
 
 4. **Add license file in this publishable repo root** ✅ Completed (2026-03-02)
-- Why: README advertises Apache 2.0, but `/home/user/ods` has no `LICENSE`.
+- Why: the original checkout advertised Apache 2.0 before its license file was added. Current component terms are described in [Licensing](../LICENSING.md).
 - Owner: Maintainer/Legal
 - Effort: S (<1 hour)
 - Exit criteria: `LICENSE` present and matches stated license.
 
 5. **Run launch smoke tests on a machine with Docker available**
-- Why: current environment has no Docker CLI/daemon, so runtime readiness is unverified.
+- Why, at the original review: the work environment had no Docker CLI/daemon, so those observations did not verify runtime readiness.
 - Evidence:
   - `scripts/ods-preflight.sh` reports Docker not running.
   - `scripts/ods-test.sh --quick` fails early (`docker not installed`).
@@ -92,7 +99,7 @@ Scope: `/home/user/ods` (Strix Halo variant)
 - Why: tests are currently tuned for legacy `docker-compose.yml` layouts.
 - Evidence:
   - [`tests/integration-test.sh`](../tests/integration-test.sh)
-  - [`tests/test-bootstrap-mode.sh`](../tests/test-bootstrap-mode.sh)
+  - `tests/test-bootstrap-mode.sh` (retired 2026-10-04)
 - Owner: QA/Infra
 - Effort: M-L (1-2 days)
 

@@ -1,4 +1,8 @@
-# ODS Windows Installation Walkthrough
+# Legacy native Windows installation walkthrough
+
+> **Release channel:** the install commands on this page fetch development `main`, which is not signed. A signed-source path is staged in [Verified Install Preview](VERIFIED_INSTALL_PREVIEW.md); it is not active until the first eligible immutable release is published, and historical `v3.0.0` is not eligible.
+
+For new Pixel/Portal installations, use [Windows Quickstart](WINDOWS-QUICKSTART.md). The root `install.ps1` now guides Ubuntu/WSL2 setup. This page describes only the legacy native implementation and Windows runtime paths; it does not install Pixel in Ubuntu.
 
 Step-by-step guide for installing ODS on Windows 10/11 with WSL2,
 Docker Desktop, and NVIDIA or AMD GPU support.
@@ -53,8 +57,9 @@ For NVIDIA:
 **Note:** Windows drivers automatically provide GPU access to WSL2. No separate WSL driver needed.
 
 For AMD Strix Halo, install the current AMD Windows graphics/compute driver
-from AMD. The ODS installer selects the Windows host accelerated path
-and falls back when Lemonade is unavailable.
+from AMD. The ODS installer runs llama.cpp's `llama-server.exe` (Vulkan) on
+Windows; when it finds no usable Vulkan device, a new install runs the model on
+the CPU and says so.
 
 ---
 
@@ -89,7 +94,7 @@ Invoke-WebRequest "https://github.com/Osmantic/ODS/archive/refs/heads/main.zip" 
 Expand-Archive -LiteralPath $odsZip -DestinationPath $odsSrc -Force
 cd (Get-ChildItem -LiteralPath $odsSrc -Directory | Select-Object -First 1).FullName
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\install.ps1
+.\ods\installers\windows\install-windows.ps1
 ```
 
 The installer will:
@@ -113,7 +118,7 @@ NTFS/ReFS target path with enough space explicitly:
 
 ```powershell
 $installDir = "D:\Apps\ods"
-.\install.ps1 -InstallDir $installDir
+.\ods\installers\windows\install-windows.ps1 -InstallDir $installDir
 ```
 
 After installation, run management commands from the runtime directory:
@@ -143,7 +148,7 @@ the runtime is intentionally created inside your checkout:
 
 ```powershell
 $env:ODS_HOME = "C:\path\to\ODS\ods"
-.\install.ps1
+.\ods\installers\windows\install-windows.ps1
 ```
 
 **First run takes 10-30 minutes** depending on download speed. Bootstrap mode
@@ -154,20 +159,20 @@ background.
 
 ```powershell
 # Specific tier with voice
-.\install.ps1 -Tier 2 -Voice
+.\ods\installers\windows\install-windows.ps1 -Tier 2 -Voice
 
 # Full stack with everything
-.\install.ps1 -All
+.\ods\installers\windows\install-windows.ps1 -All
 
 # Simulate installer planning without making changes
-.\install.ps1 -DryRun
+.\ods\installers\windows\install-windows.ps1 -DryRun
 
 # Wait for the full model instead of using bootstrap fast-start
-.\install.ps1 -NoBootstrap
+.\ods\installers\windows\install-windows.ps1 -NoBootstrap
 
 # Install runtime files on a specific drive/path
 $installDir = "D:\Apps\ods"
-.\install.ps1 -InstallDir $installDir
+.\ods\installers\windows\install-windows.ps1 -InstallDir $installDir
 ```
 
 ---
@@ -286,7 +291,7 @@ cd $installDir
 .\ods.ps1 uninstall --force
 ```
 
-Use `--keep-data` or `--keep-models` if you want to preserve local state.
+Use `--keep-data` or `--keep-models` if you want to preserve local state. `--keep-data` keeps only the `data` folder inside the install directory; it still deletes `.env` (your settings and generated secrets) and `config\`. Copy `.env` somewhere safe first if you may reinstall over the kept data.
 
 If the runtime folder is partial and `.\ods.ps1` is missing, run the same cleanup from a source checkout:
 

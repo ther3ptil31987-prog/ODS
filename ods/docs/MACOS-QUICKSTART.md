@@ -1,8 +1,10 @@
 # ODS macOS Quickstart
 
+> **Release channel:** the install commands on this page fetch development `main`, which is not signed. A signed-source path is staged in [Verified Install Preview](VERIFIED_INSTALL_PREVIEW.md); it is not active until the first eligible immutable release is published, and historical `v3.0.0` is not eligible.
+
 > **Status: Supported**
 >
-> The macOS installer runs end-to-end on Apple Silicon. One command gives you a full local AI stack with Metal-accelerated inference.
+> The macOS installer runs end-to-end on Apple Silicon. A fresh install starts with Core chat, Portal, the LiteLLM gateway, and Metal-accelerated inference; optional applications are selected separately.
 
 ---
 
@@ -18,10 +20,19 @@
 ## Install
 
 ```bash
-git clone https://github.com/Osmantic/ODS.git
-cd ODS/ods
+git clone https://github.com/Osmantic/ODS.git ~/src/ODS
+cd ~/src/ODS/ods
 ./install.sh
 ```
+
+Clone outside your home folder's `ods` path: macOS disks are case-insensitive,
+so a clone at `~/ODS` is the same folder as the default install directory
+`~/ods`, and the installer refuses to install into its own checkout.
+
+The clone tracks `main`, as the hosted installer does. Back up existing
+configuration and data before updating. Existing native
+Pixel installations use the managed native update/migration path; the base
+installer intentionally stops instead of overwriting protected runtime state.
 
 The installer will:
 
@@ -29,8 +40,22 @@ The installer will:
 2. **Pick the right model** — selects optimal model size for your RAM
 3. **Download llama-server** — native macOS arm64 binary with Metal support
 4. **Download your model** — GGUF file sized for your hardware
-5. **Start Docker services** — chat UI, search, workflows, voice, and more
-6. **Install OpenCode** — browser-based AI coding IDE on port 3003
+5. **Start Core Docker services** — chat UI, Dashboard, and LiteLLM gateway; search, workflows, voice, and other extras are opt-in
+6. **Activate native Pixel** — use the public bundled source, with the gateway and managed helpers on macOS and ingress/sandbox services in Docker
+7. **Install OpenCode if selected** — browser-based AI coding IDE on port 3003
+
+OpenCode is omitted on a fresh Core Only or noninteractive install. Select
+Full Stack, pass `--opencode`, or pass `--all` to add it. An existing loaded ODS
+OpenCode LaunchAgent stays selected on a normal rerun. `--no-opencode` disables
+future login starts while keeping the binary, config, and current session.
+
+Fresh interactive Enter and unattended installs select Core. With native Portal,
+Pixel uses its keyless `parallel-free` search provider, so Core does not start
+Token Spy or SearXNG. LiteLLM remains available to the chat UI and Portal.
+Select Full Stack or pass `--recommended` to add the optional support bundle;
+Perplexica and other selected search consumers also bring in SearXNG. Existing
+installations keep their previous default posture, and the native Pixel guard
+requires the managed update path for an already installed Portal.
 
 **Estimated time:** 5–15 minutes depending on download speed.
 
@@ -40,7 +65,7 @@ The installer will:
 
 - **Chat UI:** http://localhost:3000
 - **Dashboard:** http://localhost:3001
-- **OpenCode (IDE):** http://localhost:3003
+- **OpenCode (IDE, when selected):** http://localhost:3003
 
 The normal loopback-only install opens the Chat UI directly without an account.
 A network-bound or ODS proxy install keeps authentication enabled and prompts
@@ -53,7 +78,8 @@ the first user to create the admin account.
 ```
 macOS Host
   ├── llama-server (native, Metal GPU acceleration)
-  ├── OpenCode web IDE (native, LaunchAgent)
+  ├── Pixel gateway + managed host helpers (native)
+  ├── OpenCode web IDE (optional native LaunchAgent)
   └── Docker Desktop
         ├── Open WebUI (port 3000)
         ├── Dashboard (port 3001)
@@ -62,8 +88,8 @@ macOS Host
         ├── Qdrant Vector DB (port 6333)
         ├── SearXNG Search (port 8888)
         ├── Perplexica Deep Research (port 3004)
-        ├── Hermes Agent + auth proxy (port 9120)
-        ├── OpenClaw Agents (port 7860, deprecated optional)
+        ├── Pixel edge, ingress, sandbox and workspace preview
+        ├── Hermes Agent + auth proxy (optional alternative)
         ├── TEI Embeddings (port 8090)
         ├── Whisper STT (port 9000)
         ├── Kokoro TTS (port 8880)
@@ -71,6 +97,12 @@ macOS Host
 ```
 
 llama-server runs natively for full Metal GPU utilization. Docker containers reach it via `host.docker.internal:8080`.
+
+Portal is enabled by default and disables Hermes while selected. A fresh install
+can opt out with `--no-pixel`; this is not a way to disable an existing native
+Portal installation. Portal needs neither a separate Lima VM nor access to a
+private GitHub repository. Its source and verified install bundle are included
+in ODS. See [PIXEL.md](PIXEL.md) for eligibility and authority boundaries.
 
 ---
 
@@ -128,9 +160,9 @@ Override: `./install.sh --tier 3`
 | Config | `~/ods/.env` |
 | Models | `~/ods/data/models/` |
 | llama-server binary | `~/ods/llama-server/` |
-| OpenCode | `~/.opencode/bin/opencode` |
-| OpenCode config | `~/.config/opencode/opencode.json` |
-| LaunchAgent (OpenCode) | `~/Library/LaunchAgents/com.ods.opencode-web.plist` |
+| OpenCode, when selected | `~/.opencode/bin/opencode` |
+| OpenCode config, when selected | `~/.config/opencode/opencode.json` |
+| OpenCode LaunchAgent, when selected | `~/Library/LaunchAgents/com.ods.opencode-web.plist` |
 | CLI tool | `~/ods/ods-macos.sh` |
 
 ---

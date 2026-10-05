@@ -2,9 +2,10 @@
 set -euo pipefail
 
 TOOL_VERSION="1"
-REDACTION_VERSION="1"
+REDACTION_VERSION="2"
 DEFAULT_LOG_TAIL=200
 MAX_LOG_CONTAINERS=25
+COMMAND_TIMEOUT="${ODS_SUPPORT_COMMAND_TIMEOUT:-60}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -25,6 +26,10 @@ Options:
   --json         Print machine-readable result JSON
   --no-logs      Skip Docker container log collection
   -h, --help     Show this help
+
+Environment:
+  ODS_SUPPORT_COMMAND_TIMEOUT  Per-command deadline in seconds (1-3600; default 60).
+                               Timed-out diagnostics retain partial output and exit 124.
 
 The generated archive is safe-by-default, but review it before posting to a
 public issue. Raw .env is never included; only config/env.redacted is written.
@@ -57,6 +62,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ ! "$COMMAND_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] || (( COMMAND_TIMEOUT > 3600 )); then
+    echo "ERROR: ODS_SUPPORT_COMMAND_TIMEOUT must be an integer from 1 to 3600" >&2
+    exit 2
+fi
 
 detect_python() {
     if command -v python3 >/dev/null 2>&1; then
@@ -109,6 +119,8 @@ mkdir -p \
     "$BUNDLE_DIR/manifest" \
     "$BUNDLE_DIR/system" \
     "$BUNDLE_DIR/validation"
+# Files are redacted after they are written; keep the bundle owner-only.
+chmod 700 "$BUNDLE_DIR"
 
 shell_quote() {
     printf "%q" "$1"
@@ -125,7 +137,7 @@ redact_file() {
     local file="$1"
     [[ -f "$file" ]] || return 0
 
-    "$PYTHON_CMD" - "$file" <<'PY'
+    "$PYTHON_CMD" - "$file" "$ROOT_DIR/.env" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -138,10 +150,57 @@ except OSError:
 
 secret_word = r"(?:KEY|TOKEN|SECRET|PASSWORD|PASS|SALT|AUTH|CREDENTIAL)"
 
+# Credential formats that are recognizable without a key name.
+token_formats = [
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY-----|.*\Z)",
+    r"\b(?:sk|pk)-(?:ant-|proj-|lf-)?[A-Za-z0-9_-]{20,}",
+    r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}",
+    r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}",
+    r"\bgithub_pat_[A-Za-z0-9_]{40,}",
+    r"\bglpat-[A-Za-z0-9_-]{20,}",
+    r"\bxox[abprs]-[A-Za-z0-9-]{10,}",
+    r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+    r"\bAIza[0-9A-Za-z_-]{35}",
+    r"\bhf_[A-Za-z0-9]{30,}",
+    r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+    r"\b(?:gsk|npm)_[A-Za-z0-9]{36,}",
+    r"\br8_[A-Za-z0-9]{30,}",
+    r"\b(?:pplx|xai)-[A-Za-z0-9]{40,}",
+    r"\b[0-9]{8,10}:AA[A-Za-z0-9_-]{33}",
+    r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}",
+    r"\bpypi-AgE[A-Za-z0-9_-]{20,}",
+    r"\bdop_v1_[a-f0-9]{64}",
+    r"\btskey-[a-z]+-[A-Za-z0-9-]{10,}",
+    r"\bBSA[A-Za-z0-9_-]{20,}",
+]
+for token_format in token_formats:
+    text = re.sub(token_format, "[REDACTED]", text, flags=re.S)
+
+# This installation's own secrets, wherever a log or command echoes them.
+env_path = Path(sys.argv[2])
+known_secrets = set()
+try:
+    env_lines = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+except OSError:
+    env_lines = []
+for line in env_lines:
+    key, separator, value = line.partition("=")
+    key = key.strip()
+    if key.startswith("export "):
+        key = key[7:].strip()
+    value = value.strip().strip("\"'")
+    if (separator and re.search(secret_word, key, re.I)
+            and len(value) >= 12 and not re.search(r"\s", value)):
+        known_secrets.add(value)
+for value in sorted(known_secrets, key=len, reverse=True):
+    text = text.replace(value, "[REDACTED]")
+
 patterns = [
     (re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)((?:authorization|x-api-key|api-key|apikey)\s*[:=]\s*)([\"']?)[^\"'\s,}]+"), r"\1\2[REDACTED]"),
-    (re.compile(r"(?i)(https?://)([^/\s:@]+):([^@\s/]+)@"), r"\1[REDACTED]@"),
+    # Database and broker connection strings carry credentials too (including
+    # schemes such as mongodb+srv), not only HTTP URLs.
+    (re.compile(r"(?i)([a-z][a-z0-9+.-]*://)([^/\s:@]*):([^@\s/]+)@"), r"\1[REDACTED]@"),
     (
         re.compile(rf"(?im)^([ \t]*(?:export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*{secret_word}[A-Za-z0-9_]*[ \t]*=[ \t]*).*$"),
         r"\1[REDACTED]",
@@ -159,6 +218,34 @@ path.write_text(text, encoding="utf-8")
 PY
 }
 
+# Python is already required, so this deadline also works without GNU timeout
+# on macOS. Each read-only probe owns a process group; kill its descendants too.
+run_bounded() {
+    "$PYTHON_CMD" - "$COMMAND_TIMEOUT" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+seconds = int(sys.argv[1])
+process = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, start_new_session=True)
+try:
+    code = process.wait(timeout=seconds)
+except subprocess.TimeoutExpired:
+    print(f"Diagnostic timed out after {seconds} seconds; partial output retained.", file=sys.stderr)
+    raise SystemExit(124)
+finally:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            # The command exited between the deadline and process-group cleanup.
+            pass
+        process.wait()
+raise SystemExit(code if code >= 0 else 128 - code)
+PY
+}
+
 collect_shell() {
     local rel_path="$1"
     local label="$2"
@@ -170,7 +257,7 @@ collect_shell() {
     set +e
     (
         cd "$ROOT_DIR" || exit 1
-        "$BASH_CMD" -lc "$command"
+        run_bounded "$BASH_CMD" -lc "$command"
     ) > "$abs_path" 2>&1
     exit_code=$?
     set -e
@@ -282,15 +369,11 @@ docker_cli_available() {
 
 docker_daemon_available() {
     docker_cli_available || return 1
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 10 "$DOCKER_BIN" info >/dev/null 2>&1
-    else
-        "$DOCKER_BIN" info >/dev/null 2>&1
-    fi
+    run_bounded "$DOCKER_BIN" info >/dev/null 2>&1
 }
 
 docker_compose_available() {
-    docker_cli_available && "$DOCKER_BIN" compose version >/dev/null 2>&1
+    docker_cli_available && run_bounded "$DOCKER_BIN" compose version >/dev/null 2>&1
 }
 
 safe_filename() {
@@ -384,7 +467,8 @@ collect_compose_validation() {
     local tier
     local gpu_count
     local ods_mode
-    local lemonade_external
+    local native_llm_url
+    local amd_backend
     local amd_runtime
     local amd_managed
     local flags_file="$BUNDLE_DIR/validation/compose-flags.txt"
@@ -396,7 +480,8 @@ collect_compose_validation() {
     tier="$(read_env_value TIER 1)"
     gpu_count="$(read_env_value GPU_COUNT 1)"
     ods_mode="$(read_env_value ODS_MODE local)"
-    lemonade_external="$(read_env_value LEMONADE_EXTERNAL false)"
+    native_llm_url="$(read_env_value NATIVE_LLM_BASE_URL "")"
+    amd_backend="$(read_env_value AMD_INFERENCE_BACKEND "")"
     amd_runtime="$(read_env_value AMD_INFERENCE_RUNTIME "")"
     amd_managed="$(read_env_value AMD_INFERENCE_MANAGED "")"
 
@@ -409,10 +494,9 @@ collect_compose_validation() {
     set +e
     flags="$(
         cd "$ROOT_DIR" && \
-        LEMONADE_EXTERNAL="$lemonade_external" \
-        AMD_INFERENCE_RUNTIME="$amd_runtime" \
-        AMD_INFERENCE_MANAGED="$amd_managed" \
-        "$BASH_CMD" scripts/resolve-compose-stack.sh \
+        NATIVE_LLM_BASE_URL="$native_llm_url" \
+        AMD_INFERENCE_BACKEND="$amd_backend" \
+        run_bounded "$BASH_CMD" scripts/resolve-compose-stack.sh \
             --script-dir "$ROOT_DIR" \
             --tier "$tier" \
             --gpu-backend "$gpu_backend" \
@@ -429,7 +513,8 @@ collect_compose_validation() {
         printf 'TIER=%s\n' "$tier"
         printf 'GPU_COUNT=%s\n' "$gpu_count"
         printf 'ODS_MODE=%s\n' "$ods_mode"
-        printf 'LEMONADE_EXTERNAL=%s\n' "$lemonade_external"
+        printf 'NATIVE_LLM_BASE_URL=%s\n' "$native_llm_url"
+        printf 'AMD_INFERENCE_BACKEND=%s\n' "$amd_backend"
         printf 'AMD_INFERENCE_RUNTIME=%s\n' "$amd_runtime"
         printf 'AMD_INFERENCE_MANAGED=%s\n' "$amd_managed"
         printf 'COMPOSE_FLAGS=%s\n' "$flags"
@@ -489,7 +574,7 @@ collect_docker() {
     local names_file="$BUNDLE_DIR/docker/container-names.txt"
     local names_exit
     set +e
-    "$DOCKER_BIN" ps --format '{{.Names}}' > "$names_file" 2>&1
+    run_bounded "$DOCKER_BIN" ps --format '{{.Names}}' > "$names_file" 2>&1
     names_exit=$?
     set -e
     redact_file "$names_file"
@@ -501,7 +586,7 @@ collect_docker() {
     while IFS= read -r container; do
         [[ -n "$container" ]] || continue
         case "$container" in
-            ods-*|*ods*)
+            ods-*)
                 ;;
             *)
                 continue
@@ -707,7 +792,7 @@ config_hash_targets = [
     "config/ports.json",
     "config/golden-paths.json",
     "config/generated-config-contracts.json",
-    "config/litellm/lemonade.yaml",
+    "config/litellm/local.yaml",
     "extensions/services/hermes/cli-config.yaml.template",
 ]
 
@@ -779,7 +864,8 @@ collect_docker
 write_evidence
 write_manifest
 
-tar -czf "$ARCHIVE_PATH" -C "$OUTPUT_DIR" "$BUNDLE_NAME"
+chmod -R go-rwx "$BUNDLE_DIR"
+(umask 077 && tar -czf "$ARCHIVE_PATH" -C "$OUTPUT_DIR" "$BUNDLE_NAME")
 
 if [[ "$JSON_OUTPUT" == "true" ]]; then
     write_summary_json

@@ -19,6 +19,7 @@ matches the work in front of them.
 | I want to... | Read this first | Then use |
 |--------------|-----------------|----------|
 | Install the default path | [../QUICKSTART.md](../QUICKSTART.md) | [INSTALLER_TRUST.md](INSTALLER_TRUST.md), [SUPPORT-MATRIX.md](SUPPORT-MATRIX.md), [POST-INSTALL-CHECKLIST.md](POST-INSTALL-CHECKLIST.md) |
+| Install or operate Pixel | [PIXEL.md](PIXEL.md) | [HERMES.md](HERMES.md), [SUPPORT-MATRIX.md](SUPPORT-MATRIX.md), [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md) |
 | Install on Windows | [WINDOWS-QUICKSTART.md](WINDOWS-QUICKSTART.md) | [WINDOWS-INSTALL-WALKTHROUGH.md](WINDOWS-INSTALL-WALKTHROUGH.md), [WINDOWS-WSL2-GPU-GUIDE.md](WINDOWS-WSL2-GPU-GUIDE.md) |
 | Install on Apple Silicon | [MACOS-QUICKSTART.md](MACOS-QUICKSTART.md) | [MODEL-MANAGEMENT.md](MODEL-MANAGEMENT.md), [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 | Debug a broken install | [ODS-DOCTOR.md](ODS-DOCTOR.md) | [INSTALL-TROUBLESHOOTING.md](INSTALL-TROUBLESHOOTING.md), [SUPPORT-BUNDLE.md](SUPPORT-BUNDLE.md) |
@@ -30,6 +31,16 @@ matches the work in front of them.
 | Review a PR | [../CONTRIBUTING.md](../CONTRIBUTING.md) | [HIGH_RISK_CHANGE_MAP.md](HIGH_RISK_CHANGE_MAP.md), [TESTING.md](TESTING.md), [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md), [VALIDATION-MATRIX.md](VALIDATION-MATRIX.md) |
 | Maintain a release or fork | [MAINTAINER_RUNBOOK.md](MAINTAINER_RUNBOOK.md) | [HIGH_RISK_CHANGE_MAP.md](HIGH_RISK_CHANGE_MAP.md), [INSTALLER_PHASE_CONTRACTS.md](INSTALLER_PHASE_CONTRACTS.md), [COMPOSE_RESOLVER_CONTRACTS.md](COMPOSE_RESOLVER_CONTRACTS.md), [BRANCH_HYGIENE.md](BRANCH_HYGIENE.md) |
 | Review automation guardrails | [AI_WORKFLOW_GUARDRAILS.md](AI_WORKFLOW_GUARDRAILS.md) | [../CONTRIBUTING.md](../CONTRIBUTING.md), [HIGH_RISK_CHANGE_MAP.md](HIGH_RISK_CHANGE_MAP.md) |
+
+## Licensing, attribution and public evidence
+
+- [September maintenance audit](MAINTENANCE-AUDIT-2026-09.md): changes, validation and remaining work outside the testing freeze.
+- [Third-party licensing review](THIRD-PARTY-LICENSING.md): component restrictions and open work.
+- [Recipe source register](RECIPE-SOURCE-REGISTER.md): sources and terms for the 34 recipes missing structured provenance.
+- [Model terms inventory](MODEL-TERMS-INVENTORY.md): 58 catalog entries and source evidence.
+- [Artwork provenance](ASSET-PROVENANCE.md): file hashes, sources and rights status.
+- [Contributor ledger](CONTRIBUTOR-LEDGER-2026-09.md): promoted-range attribution without inferred identities.
+- [Documentation hygiene](DOCUMENTATION-HYGIENE.md): link gate and pinned vendor exceptions.
 
 ## Choosing Validation
 
@@ -66,12 +77,17 @@ canonical source and treat older recipes as context.
 - The golden paths are Linux NVIDIA, Windows with Docker Desktop + WSL2 for
   NVIDIA/AMD, and Apple Silicon. Linux AMD Strix Halo is actively supported;
   Intel Arc is present but still experimental.
-- The default agent path is Hermes Agent plus `hermes-proxy`. OpenClaw remains
-  available for compatibility, but it is deprecated and no longer enabled by
-  default.
+- Pixel is the preferred agent on qualified Ubuntu 24.04/26.04 or Debian 12
+  PID1-systemd hosts without a separate acceptance step. Hermes plus
+  `hermes-proxy` remains the portable default and rollback path everywhere
+  else. The legacy OpenClaw extension was removed; see
+  [MIGRATION-OPENCLAW-TO-HERMES.md](MIGRATION-OPENCLAW-TO-HERMES.md).
+- AMD GPUs run llama.cpp's `llama-server` like every other backend; ODS no
+  longer uses Lemonade Server. See
+  [MIGRATION-LEMONADE-TO-LLAMACPP.md](MIGRATION-LEMONADE-TO-LLAMACPP.md).
 - Linux Docker installs expose llama-server on host `OLLAMA_PORT=11434` by
-  default while containers use `llama-server:8080`. macOS native Metal and
-  Windows native/Lemonade paths use host port `8080` unless overridden.
+  default while containers use `llama-server:8080`. macOS native Metal and the
+  Windows AMD `llama-server.exe` use host port `8080` unless overridden.
 - Windows installs should run from a normal user PowerShell, not Administrator.
   The default install directory is `$env:USERPROFILE\ods` unless
   `ODS_HOME` is set.
@@ -80,8 +96,8 @@ canonical source and treat older recipes as context.
   manifest defaults live with each service. The dashboard extension library
   catalog is generated into `config/extensions-catalog.json`.
 - Generated runtime config has several writers. If you change `.env`,
-  OpenCode, Perplexica, Hermes, or LiteLLM/Lemonade behavior, update the Linux,
-  macOS, Windows, bootstrap-upgrade, and host-agent paths together.
+  OpenCode, Perplexica, Hermes, LiteLLM or model-router behavior, update the
+  Linux, macOS, Windows, bootstrap-upgrade, and host-agent paths together.
 
 ## Getting Started
 
@@ -114,12 +130,14 @@ canonical source and treat older recipes as context.
 | [ODS_CLI_DECOMPOSITION.md](ODS_CLI_DECOMPOSITION.md) | Maintainers / CLI contributors | Behavior-preserving plan for splitting the large Bash operator CLI without a risky rewrite |
 | [INTEGRATION-GUIDE.md](INTEGRATION-GUIDE.md) | Developers | Connect apps via OpenAI SDK, LangChain, n8n |
 | [BACKEND-CONTRACT.md](BACKEND-CONTRACT.md) | Developers | Backend runtime contract JSON schema |
-| [ENGINE-PROVIDER-MODES.md](ENGINE-PROVIDER-MODES.md) | Maintainers / backend reviewers | Provider mode contract for local, cloud, hybrid, and Lemonade-backed installs |
+| [ENGINE-PROVIDER-MODES.md](ENGINE-PROVIDER-MODES.md) | Maintainers / backend reviewers | Provider mode contract for local, cloud, hybrid, host-native and external-server installs |
 | [INSTALLER_PHASE_CONTRACTS.md](INSTALLER_PHASE_CONTRACTS.md) | Maintainers / installer reviewers | Phase ownership, inputs, outputs, idempotency, and validation expectations |
 | [COMPOSE_RESOLVER_CONTRACTS.md](COMPOSE_RESOLVER_CONTRACTS.md) | Maintainers / backend reviewers | Compose layer rules for services, hardware overlays, modes, dependencies, and ports |
 | [HERMES.md](HERMES.md) | Developers / operators | Default Hermes Agent packaging, security posture, and operations |
+| [PIXEL.md](PIXEL.md) | Developers / operators | Pixel eligibility, legal boundary, architecture, default routing, bounded ODS tools, operations, rollback, and qualification |
 | [OAUTH_PROVIDER_SETUP.md](OAUTH_PROVIDER_SETUP.md) | Operators / maintainers | OAuth provider registry, private credential bundles, and BYOC setup |
-| [OPENCLAW-INTEGRATION.md](OPENCLAW-INTEGRATION.md) | Developers | Deprecated OpenClaw setup and migration reference |
+| [MIGRATION-OPENCLAW-TO-HERMES.md](MIGRATION-OPENCLAW-TO-HERMES.md) | Operators | Removal notice for the legacy OpenClaw extension: what stays on disk and how to clean it up |
+| [MIGRATION-LEMONADE-TO-LLAMACPP.md](MIGRATION-LEMONADE-TO-LLAMACPP.md) | Operators | AMD GPUs now run on llama.cpp: what an upgrade from Lemonade does, retired settings and options, Vulkan or ROCm, and cleanup |
 
 ## Hardware & Configuration
 
@@ -176,7 +194,8 @@ canonical source and treat older recipes as context.
 | [KNOWN-GOOD-VERSIONS.md](KNOWN-GOOD-VERSIONS.md) | Operators | Tested image/version combos |
 | [PLATFORM-TRUTH-TABLE.md](PLATFORM-TRUTH-TABLE.md) | Developers | Platform feature matrix |
 | [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md) | Operators / release reviewers | User Green gates and when operational changes require release-grade fleet validation |
-| [RELEASE_NOTES_2.6.0.md](RELEASE_NOTES_2.6.0.md) | Operators / release reviewers | 2.6.0 release notes, validation receipt, and known validation boundaries |
+| [RELEASE_NOTES_3.0.0.md](RELEASE_NOTES_3.0.0.md) | Operators / release reviewers | Published V3 source identity and qualification boundaries |
+| [RELEASE_NOTES_2.6.0.md](RELEASE_NOTES_2.6.0.md) | Operators / release reviewers | Historical 2.6 release notes, validation receipt, and known validation boundaries |
 | [VALIDATION-MATRIX.md](VALIDATION-MATRIX.md) | Operators / release reviewers | Sanitized CI, distro lab, and real-hardware fleet release-readiness evidence |
 | [HIGH_RISK_CHANGE_MAP.md](HIGH_RISK_CHANGE_MAP.md) | Contributors / maintainers | Risk levels and required validation by changed surface |
 
@@ -186,10 +205,9 @@ canonical source and treat older recipes as context.
 |-----|----------|-------------|
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | Contributors | How to contribute |
 | [MAINTAINER_RUNBOOK.md](MAINTAINER_RUNBOOK.md) | Maintainers / fork operators | Release, rollback, validation, and operator continuity runbook |
-| [AI_WORKFLOW_GUARDRAILS.md](AI_WORKFLOW_GUARDRAILS.md) | Maintainers / reviewers | Safety model for AI-assisted GitHub workflows, protected paths, and human review boundaries |
+| [AI_WORKFLOW_GUARDRAILS.md](AI_WORKFLOW_GUARDRAILS.md) | Contributors / maintainers | Policy for AI-assisted PRs, protected paths, and the requirements for reintroducing AI automation (retired 2026-10-03) |
 | [BRANCH_HYGIENE.md](BRANCH_HYGIENE.md) | Maintainers | Branch naming, stale branch dry-run audits, and cleanup policy |
 | [../SECURITY.md](../SECURITY.md) | Everyone | Security guide and disclosure |
 | [../../SECURITY_AUDIT.md](../../SECURITY_AUDIT.md) | Maintainers / reviewers | Historical security audit with current remediation status and receipts |
 | [../CHANGELOG.md](../CHANGELOG.md) | Everyone | Version history |
-| [COMPOSABILITY-EXECUTION-BOARD.md](COMPOSABILITY-EXECUTION-BOARD.md) | Maintainers | Internal project tracking |
 | [OSS-LAUNCH-CHECKLIST.md](OSS-LAUNCH-CHECKLIST.md) | Maintainers | Open-source launch tasks |

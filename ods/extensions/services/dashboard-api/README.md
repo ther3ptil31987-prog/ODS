@@ -35,7 +35,6 @@ Environment variables (set in `.env`):
 | `LLM_MODEL` | `qwen3:30b-a3b` | Active model name shown in dashboard |
 | `KOKORO_URL` | `http://tts:8880` | Kokoro TTS URL |
 | `N8N_URL` | `http://n8n:5678` | n8n workflow URL |
-| `OPENCLAW_TOKEN` | *(empty)* | OpenClaw agent auth token |
 
 ## API Endpoints
 
@@ -67,7 +66,6 @@ Environment variables (set in `.env`):
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/api/service-tokens` | Yes | Service auth tokens (e.g. OpenClaw) |
 | `GET` | `/api/external-links` | Yes | Sidebar links from service manifests |
 | `GET` | `/api/storage` | Yes | Storage breakdown (models, vector DB, total) |
 
@@ -134,7 +132,7 @@ Environment variables (set in `.env`):
 | `POST` | `/api/extensions/{service_id}/install` | Yes | Install an extension from the extensions library into user-extensions |
 | `POST` | `/api/extensions/{service_id}/enable` | Yes | Enable a disabled extension (renames `compose.yaml.disabled` to `compose.yaml`, starts container via host agent) |
 | `POST` | `/api/extensions/{service_id}/disable` | Yes | Disable an enabled extension (stops container via host agent, renames `compose.yaml` to `compose.yaml.disabled`) |
-| `DELETE` | `/api/extensions/{service_id}` | Yes | Uninstall a disabled extension (removes its directory from user-extensions) |
+| `DELETE` | `/api/extensions/{service_id}` | Yes | Uninstall a disabled extension (removes its directory from user-extensions). An extension in the `error` state is stopped via the host agent and disabled first; other enabled extensions must be disabled explicitly. Service data is kept |
 | `POST` | `/api/extensions/{service_id}/logs` | Yes | Fetch container logs via the host agent (last 100 lines) |
 
 Core services cannot be installed, enabled, disabled, or uninstalled via these endpoints (returns 403). The catalog endpoint also reports whether the [host agent](../../../docs/HOST-AGENT-API.md) is available (`agent_available` field).

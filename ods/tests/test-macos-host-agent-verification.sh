@@ -72,8 +72,10 @@ grep -qF 'container_state="$(docker inspect' <<<"$verify_block" \
     || fail "dashboard host-agent verification must first require a running dashboard-api container"
 grep -qF '"ODS_AGENT_KEY"' <<<"$verify_block" \
     || fail "dashboard container readiness must read ODS_AGENT_KEY"
-grep -qF -- '-H "Authorization: Bearer ${' <<<"$verify_block" \
-    || fail "dashboard container readiness must authenticate with ODS_AGENT_KEY"
+grep -qF "printf 'Authorization: Bearer %s\\n' \"\$api_key\"" <<<"$verify_block" \
+    && grep -qF 'docker exec -i ods-dashboard-api' <<<"$verify_block" \
+    && grep -qF -- '-H @-' <<<"$verify_block" \
+    || fail "dashboard container readiness must send ODS_AGENT_KEY on stdin, never in argv"
 grep -qF '/v1/model/status"' <<<"$verify_block" \
     || fail "dashboard container readiness must call the authenticated host-agent status endpoint"
 pass "dashboard container verifies authenticated host-agent reachability"

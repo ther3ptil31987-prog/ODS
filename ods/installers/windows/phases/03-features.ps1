@@ -7,11 +7,11 @@
 #
 # Reads:
 #   $voiceFlag, $workflowsFlag, $ragFlag, $recommendedFlag, $hermesFlag,
-#   $openClawFlag, $allFlag
+#   $allFlag
 #   $noRecommendedFlag, $comfyuiFlag, $noHermesFlag, $noComfyuiFlag
 #   $nonInteractive  -- suppress menus (use flag defaults)
 #   $dryRun          -- skip prompts, log only
-#   $selectedTier    -- from phase 02, for tier-appropriate OpenClaw config
+#   $selectedTier    -- from phase 02, for tier-specific safety gates
 #   $gpuInfo         -- from phase 02, used for backend-specific safety gates
 #   $cloudMode       -- true when external/cloud LLM mode is selected
 #
@@ -21,9 +21,7 @@
 #   $enableRag        -- bool: enable Qdrant + embeddings (RAG)
 #   $enableRecommended -- bool: enable recommended web/API support services
 #   $enableHermes     -- bool: enable Hermes agent framework
-#   $enableOpenClaw   -- bool: enable deprecated OpenClaw agent framework
 #   $enableComfyui    -- bool: enable ComfyUI image generation
-#   $openClawConfig   -- string: tier-appropriate OpenClaw config filename
 #
 # Modder notes:
 #   Add new optional features to the Custom menu here.
@@ -41,7 +39,6 @@ $enableRecommended   = (-not $noRecommendedFlag) -and ($recommendedFlag -or $all
 if ($nonInteractive -and -not $noRecommendedFlag) { $enableRecommended = $true }
 $enableHermes        = (-not $noHermesFlag) -and ($hermesFlag -or $allFlag -or (-not $nonInteractive))
 if ($nonInteractive -and -not $noHermesFlag) { $enableHermes = $true }
-$enableOpenClaw      = $openClawFlag
 $enableComfyui       = -not $noComfyuiFlag
 $enableDeepResearch  = $true
 $enablePrivacyShield = $true
@@ -72,7 +69,6 @@ if (-not $nonInteractive -and -not $allFlag -and -not $dryRun) {
             $enableRag       = $false
             $enableRecommended = $false
             $enableHermes    = $false
-            $enableOpenClaw  = $false
             $enableComfyui   = $false
             $enableDeepResearch = $false
             $enablePrivacyShield = $false
@@ -85,7 +81,6 @@ if (-not $nonInteractive -and -not $allFlag -and -not $dryRun) {
             $enableRag       = (Read-Host "  Enable RAG (Qdrant vector DB + embeddings)? [y/N]") -match "^[yY]"
             $enableRecommended = (Read-Host "  Enable recommended web/API support (LiteLLM + SearXNG + Token Spy)? [Y/n]") -notmatch "^[nN]"
             $enableHermes    = (Read-Host "  Enable Hermes Agent (default AI agent)? [Y/n]") -notmatch "^[nN]"
-            $enableOpenClaw  = (Read-Host "  Enable OpenClaw (DEPRECATED; Hermes replaces it)? [y/N]") -match "^[yY]"
             $enableComfyui   = (Read-Host "  Enable image generation (ComfyUI + SDXL Lightning, ~6.5GB)? [y/N]") -match "^[yY]"
             $enableDeepResearch = (Read-Host "  Enable Perplexica deep research? [Y/n]") -notmatch "^[nN]"
             $enablePrivacyShield = (Read-Host "  Enable Privacy Shield PII protection? [Y/n]") -notmatch "^[nN]"
@@ -104,7 +99,6 @@ if (-not $nonInteractive -and -not $allFlag -and -not $dryRun) {
             $enableRag       = $true
             $enableRecommended = $true
             $enableHermes    = $true
-            $enableOpenClaw  = $false
             $enableComfyui   = $true
             $enableDeepResearch = $true
             $enablePrivacyShield = $true
@@ -149,14 +143,50 @@ if ($enableComfyui -and $gpuInfo.Backend -eq "amd" -and -not $cloudMode) {
     Write-AI "  Image generation can be enabled later when a Windows-native ComfyUI backend is available."
 }
 
+# Hermes needs 64K context. The raise grows the KV cache, so it is re-checked
+# against the same hardware envelope phase 02 selected with (mirrors
+# installers/phases/03-features.sh): raise when the pick fits at 64K,
+# otherwise re-select a model that does, otherwise keep the largest context
+# that fits and say ODS Talk is unavailable (the Dashboard shows why).
+$hermesContextBelowFloor = $false
 if ($enableHermes -and -not $cloudMode) {
     $hermesContextSize = 65536
     if ([int]$tierConfig.MaxContext -lt $hermesContextSize) {
-        Write-AIWarn "Hermes enabled: increasing llama context from $($tierConfig.MaxContext) to $hermesContextSize (64K floor)."
-        if ($tierConfig.ContainsKey("RecommendationReason") -and $tierConfig.RecommendationReason) {
-            $tierConfig.RecommendationReason = "$($tierConfig.RecommendationReason) Hermes requires at least 64K context, so runtime context was raised to $hermesContextSize."
+        $hermesFloorAction = "raise"
+        $hermesFit = Test-CatalogModelContextFit -TierConfig $tierConfig -GpuInfo $gpuInfo `
+            -SystemRamGB $systemRamGB -SourceRoot $sourceRoot -ContextLength $hermesContextSize
+        if ($hermesFit -eq $false) {
+            $hermesPrevious = "$($tierConfig.LlmModel) at $($tierConfig.MaxContext)"
+            try {
+                $hermesReselected = Resolve-CatalogModelRecommendation `
+                    -TierConfig (Resolve-TierConfig -Tier $selectedTier) `
+                    -Tier $selectedTier `
+                    -GpuInfo $gpuInfo `
+                    -SystemRamGB $systemRamGB `
+                    -SourceRoot $sourceRoot `
+                    -MinContext $hermesContextSize `
+                    -RequireMinContext
+                $tierConfig = $hermesReselected
+                $hermesFloorAction = "reselected"
+                Write-AIWarn "Hermes needs 64K context: $hermesPrevious cannot serve 64K here, so $($tierConfig.LlmModel) was selected at $($tierConfig.MaxContext)."
+            } catch {
+                $hermesFloorAction = "cap"
+            }
         }
-        $tierConfig.MaxContext = $hermesContextSize
+        if ($hermesFloorAction -eq "raise") {
+            Write-AIWarn "Hermes enabled: increasing llama context from $($tierConfig.MaxContext) to $hermesContextSize (64K floor)."
+            if ($tierConfig.ContainsKey("RecommendationReason") -and $tierConfig.RecommendationReason) {
+                $tierConfig.RecommendationReason = "$($tierConfig.RecommendationReason) Hermes requires at least 64K context, so runtime context was raised to $hermesContextSize."
+            }
+            $tierConfig.MaxContext = $hermesContextSize
+        } elseif ($hermesFloorAction -eq "cap") {
+            $hermesContextBelowFloor = $true
+            Write-AIWarn "Hermes needs at least 64K context, but $($tierConfig.LlmModel) runs at $($tierConfig.MaxContext) here (64K does not fit or exceeds its native context)."
+            Write-AIWarn "ODS Talk stays unavailable (the Dashboard says why) until you choose a model that fits 64K in Models."
+            if ($tierConfig.ContainsKey("RecommendationReason") -and $tierConfig.RecommendationReason) {
+                $tierConfig.RecommendationReason = "$($tierConfig.RecommendationReason) Hermes requires 64K context, which does not fit here; ODS Talk is unavailable with this model."
+            }
+        }
     }
 }
 
@@ -168,26 +198,7 @@ Write-InfoBox "  Workflows (n8n):"          $(if ($enableWorkflows) { "enabled" 
 Write-InfoBox "  RAG (Qdrant + embeddings):" $(if ($enableRag)      { "enabled" } else { "disabled" })
 Write-InfoBox "  Recommended web/API:"       $(if ($enableRecommended) { "enabled" } else { "disabled" })
 Write-InfoBox "  Agents (Hermes):"           $(if ($enableHermes)   { "enabled" } else { "disabled" })
-Write-InfoBox "  Legacy OpenClaw:"           $(if ($enableOpenClaw) { "enabled (DEPRECATED)" } else { "disabled" })
 Write-InfoBox "  Image gen (ComfyUI):"        $(if ($enableComfyui)  { "enabled" } else { "disabled" })
 Write-InfoBox "  Deep research:"              $(if ($enableDeepResearch) { "enabled" } else { "disabled" })
 Write-InfoBox "  Privacy Shield:"             $(if ($enablePrivacyShield) { "enabled" } else { "disabled" })
 Write-InfoBox "  Langfuse (observability):"   $(if ($enableLangfuse) { "enabled" } else { "disabled" })
-
-# ── Tier-appropriate OpenClaw config selection ────────────────────────────────
-# Mirrors bash phase 03 logic (config/openclaw/<profile>.json).
-$openClawConfig = ""
-if ($enableOpenClaw) {
-    $openClawConfig = switch ($selectedTier) {
-        "NV_ULTRA"   { "pro.json" }
-        "SH_LARGE"   { "openclaw-strix-halo.json" }
-        "SH_COMPACT" { "openclaw-strix-halo.json" }
-        "4"          { "pro.json" }
-        "3"          { "openclaw.json" }
-        "2"          { "openclaw.json" }
-        "1"          { "openclaw.json" }
-        "CLOUD"      { "openclaw.json" }
-        default      { "openclaw.json" }
-    }
-    Write-InfoBox "  OpenClaw config:" "$openClawConfig (matched to Tier $selectedTier)"
-}

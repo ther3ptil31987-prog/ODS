@@ -1,12 +1,34 @@
 #!/bin/bash
 # Detect or validate an explicitly selected host Ollama / LM Studio runtime.
 
+# Isolated phase reuse (tests) gets the route predicate installers/lib/
+# native-llm.sh gives install-core: a host-native llama-server is in use.
+declare -F ods_native_llm_requested >/dev/null 2>&1 \
+    || ods_native_llm_requested() { [[ -n "${NATIVE_LLM_BASE_URL:-}" ]]; }
+
 ods_progress 15 "detection" "Checking external LLM services"
 
 _external_disable="${EXTERNAL_LLM_DISABLE:-false}"
 _external_url="${EXTERNAL_LLM_URL:-}"
 _external_provider="${EXTERNAL_LLM_PROVIDER:-}"
 _external_model="${EXTERNAL_LLM_MODEL:-}"
+_previous_external_url=""
+[[ -f "${INSTALL_DIR:-}/.env" ]] && _previous_external_url="$(external_llm_env_value "$INSTALL_DIR/.env" EXTERNAL_LLM_URL || true)"
+EXTERNAL_LLM_API_KEY_RESET=false
+[[ "${EXTERNAL_LLM_API_KEY_DISABLE:-false}" != "true" ]] || EXTERNAL_LLM_API_KEY_RESET=true
+if [[ -n "$_external_url" && "$(external_llm_strip_url "$_external_url")" != "$(external_llm_strip_url "$_previous_external_url")" ]]; then
+    # A new endpoint must never inherit a credential from the old endpoint.
+    EXTERNAL_LLM_API_KEY_RESET=true
+fi
+if [[ -z "${EXTERNAL_LLM_API_KEY_FILE:-}" && "$EXTERNAL_LLM_API_KEY_RESET" != "true" && -s "${INSTALL_DIR:-}/config/litellm/external-upstream.key" ]]; then
+    EXTERNAL_LLM_API_KEY_FILE="$INSTALL_DIR/config/litellm/external-upstream.key"
+fi
+unset _previous_external_url
+if [[ "$_external_disable" != "true" && -n "${EXTERNAL_LLM_API_KEY_FILE:-}" ]] &&
+   ! external_llm_read_api_key "$EXTERNAL_LLM_API_KEY_FILE" >/dev/null; then
+    ai_bad "External LLM key file failed private-file validation."
+    return 1
+fi
 
 if [[ "$_external_disable" != "true" && -z "$_external_url" && -f "${INSTALL_DIR:-}/.env" ]]; then
     _external_url="$(external_llm_env_value "$INSTALL_DIR/.env" EXTERNAL_LLM_URL || true)"
@@ -30,7 +52,7 @@ if [[ "$_external_disable" == "true" ]]; then
     return 0
 fi
 
-if [[ -z "$_external_url" && "${ODS_MODE:-local}" == "local" && "${LEMONADE_EXTERNAL:-false}" != "true" ]]; then
+if [[ -z "$_external_url" && "${ODS_MODE:-local}" == "local" ]] && ! ods_native_llm_requested; then
     _detected_provider=""
     _detected_url=""
     _detected_model=""
@@ -69,6 +91,10 @@ if [[ -z "$_external_url" && "${ODS_MODE:-local}" == "local" && "${LEMONADE_EXTE
 fi
 
 if [[ -z "$_external_url" ]]; then
+    if [[ -n "${EXTERNAL_LLM_API_KEY_FILE:-}" && "${_external_disable}" != "true" ]]; then
+        ai_bad "An external LLM key file requires an external model endpoint."
+        return 1
+    fi
     EXTERNAL_LLM_URL=""
     EXTERNAL_LLM_CONTAINER_URL=""
     EXTERNAL_LLM_PROVIDER=""
@@ -84,8 +110,8 @@ if [[ "${ODS_MODE:-local}" != "local" ]]; then
     ai "Use --no-external-llm before selecting cloud or hybrid mode."
     return 1
 fi
-if [[ "${LEMONADE_EXTERNAL:-false}" == "true" ]]; then
-    ai_bad "External Ollama / LM Studio reuse cannot be combined with external Lemonade."
+if ods_native_llm_requested; then
+    ai_bad "External Ollama / LM Studio reuse cannot be combined with the host-native llama-server (--native-llm-url)."
     ai "Select one host-managed inference backend, or use --no-external-llm."
     return 1
 fi
@@ -100,10 +126,10 @@ if [[ -z "$_external_provider" || "$_external_provider" == "auto" ]]; then
     _external_provider="$(external_llm_detect_provider "$_external_url" || true)"
 fi
 case "$_external_provider" in
-    ollama|lmstudio) ;;
+    ollama|lmstudio|openai-compatible) ;;
     *)
         ai_bad "Could not identify the external LLM provider at ${_external_url}"
-        ai "Use --external-llm-provider ollama|lmstudio and verify the service is running."
+        ai "Use --external-llm-provider ollama|lmstudio|openai-compatible and verify the service is running."
         return 1
         ;;
 esac

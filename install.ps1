@@ -1,7 +1,8 @@
 # ODS Root Installer (Windows)
-# Delegates to ods/installers/windows/install-windows.ps1
+# Recommended Portal installation: Ubuntu/WSL2 with Pixel, never a native/Hermes fallback.
 
 param(
+    [string]$Distro = "",  # empty: reuse the single existing Ubuntu, else Ubuntu-24.04
     [switch]$DryRun,
     [switch]$Force,
     [switch]$NonInteractive,
@@ -13,6 +14,8 @@ param(
     [switch]$NoRecommended,
     [switch]$Hermes,
     [switch]$NoHermes,
+    # Ignored: the legacy OpenClaw extension was removed. Still accepted so
+    # existing commands keep working; the Portal setup prints a notice.
     [switch]$OpenClaw,
     [switch]$All,
     [switch]$Cloud,
@@ -23,17 +26,15 @@ param(
     [switch]$NoBootstrap,
     [switch]$Lan,
     [string]$InstallDir = "",
-    [string]$SummaryJsonPath = ""
+    [string]$SummaryJsonPath = "",
+    [string]$StateRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-Write-Host "ODS Installer" -ForegroundColor Cyan
-Write-Host ""
-
 # Delegate to Windows installer
-$ODSInstaller = Join-Path (Join-Path (Join-Path $ScriptDir "ods") "installers") "windows" | Join-Path -ChildPath "install-windows.ps1"
+$ODSInstaller = Join-Path (Join-Path $ScriptDir "ods") "installers/windows-portal.ps1"
 if (-not (Test-Path $ODSInstaller)) {
     Write-Host "Error: Windows installer not found" -ForegroundColor Red
     Write-Host "Expected: $ODSInstaller" -ForegroundColor Red

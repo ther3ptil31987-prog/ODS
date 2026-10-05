@@ -14,7 +14,11 @@ The Dashboard API runs inside a Docker container and cannot directly run `docker
 | macOS | Started by the installer (`installers/macos/install-macos.sh`) |
 | Windows | Started by the installer (`installers/windows/phases/07-devtools.ps1`, managed via `ods.ps1`) |
 
-The agent is started during installation. macOS and Windows bind to `127.0.0.1` by default. Linux auto-detects the `ods-network` gateway so containers can reach the agent, falls back to the default Docker bridge gateway for partial/older installs, and then falls back to `127.0.0.1`. It does not bind to `0.0.0.0` unless `ODS_AGENT_BIND` is explicitly set.
+The agent is started during installation. Its bind address depends on the platform:
+
+- **macOS** binds to `127.0.0.1` unless `ODS_AGENT_BIND` is set.
+- **Native Windows:** the installer writes `ODS_AGENT_BIND=0.0.0.0` on a new install and keeps a value already set in `.env`, so the Dashboard API container can reach the agent through Docker Desktop's host gateway (`host.docker.internal`). The agent still requires its bearer token on every `/v1/*` request.
+- **Linux** auto-detects the `ods-network` gateway so containers can reach the agent, falls back to the default Docker bridge gateway for partial/older installs, and then falls back to `127.0.0.1`. It does not bind to `0.0.0.0` unless `ODS_AGENT_BIND` is explicitly set.
 
 ## Configuration
 
@@ -23,11 +27,13 @@ The agent reads its configuration from the `.env` file in the ODS install direct
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ODS_AGENT_KEY` | *(none)* | API key for authenticating requests. Falls back to `DASHBOARD_API_KEY` if unset. |
-| `ODS_AGENT_BIND` | Platform-specific | Bind address. macOS/Windows default to `127.0.0.1`; Linux uses the `ods-network` gateway when detected, then the Docker bridge gateway, otherwise `127.0.0.1`. |
+| `ODS_AGENT_BIND` | Platform-specific | Bind address. macOS defaults to `127.0.0.1`; the native Windows installer writes `0.0.0.0`; Linux uses the `ods-network` gateway when detected, then the Docker bridge gateway, otherwise `127.0.0.1`. |
 | `ODS_AGENT_PORT` | `7710` | Port the agent listens on. |
 | `GPU_BACKEND` | `nvidia` | Passed to `resolve-compose-stack.sh` when building compose flags. |
-| `AMD_INFERENCE_PORT` | `8080` | Validated loopback port used for Windows host-native Lemonade telemetry. |
-| `LEMONADE_API_KEY` | *(none)* | Optional bearer token sent only to the configured loopback Lemonade endpoint. |
+| `AMD_INFERENCE_PORT` | `8080` | Port of a Windows-owned `llama-server.exe` (AMD). An agent on native Windows reads it on `127.0.0.1`. |
+| `ODS_HOST_LLM_TRANSPORT` | `direct` | `model-router` makes an agent in WSL reach the Windows `llama-server.exe` through this installation's model-router container; `direct` probes from the agent itself. |
+| `NATIVE_LLM_CONTAINER_BASE_URL` | `http://host.docker.internal:<AMD_INFERENCE_PORT>` | Origin of the Windows `llama-server.exe` as containers reach it, used with the `model-router` transport. |
+| `LLAMA_SERVER_API_KEY` | *(none)* | API key of a Windows-owned `llama-server.exe`. The agent sends it as a bearer token, never on a command line. |
 | `TIER` | `1` | Hardware tier, passed to compose stack resolution. |
 | `ODS_DATA_DIR` | `~/.ods` | Data directory root. |
 | `ODS_USER_EXTENSIONS_DIR` | `$ODS_DATA_DIR/user-extensions` | Where user-installed extensions live. |
@@ -112,10 +118,13 @@ Returns 503 when the platform collector or required counters are unavailable.
 
 ### `GET /v1/llm/status`
 
-Bridge health and last-request statistics from host-native Lemonade over the
-validated loopback port. ODS accepts the compatibility `/api/v1` routes and
-the current `/v1` routes during runtime upgrades. Raw runtime payloads and
-local checkpoint paths are not returned.
+Bridge health, model, context and llama.cpp counters from a host-native
+`llama-server.exe` on Windows, which the Dashboard API container cannot read
+itself: llama.cpp requires the server's API key for `/props` and `/metrics`,
+and a WSL container cannot reach Windows loopback. An agent on native Windows
+reads the server on `127.0.0.1`; an agent in WSL reads it through this
+installation's model-router container. Raw runtime payloads and local model
+paths are not returned.
 
 **Authentication:** Required
 
@@ -125,30 +134,42 @@ local checkpoint paths are not returned.
   "schema_version": "ods.host-llm-status.v1",
   "health": {
     "status": "ok",
-    "version": "10.0.0",
-    "model_loaded": "extra.Model.gguf"
+    "version": "b9014-1a2b3c4",
+    "model_loaded": "Model.gguf",
+    "context_length": 65536,
+    "vision": false
   },
-  "stats": {
-    "time_to_first_token": 0.2,
-    "tokens_per_second": 42.5,
-    "input_tokens": 32,
-    "output_tokens": 64,
-    "prompt_tokens": 32
+  "stats": null,
+  "metrics": {
+    "prompt_tokens_total": 1024,
+    "prompt_seconds_total": 1.6,
+    "tokens_predicted_total": 512,
+    "tokens_predicted_seconds_total": 12.0,
+    "requests_processing": 0
   },
   "source": "windows-loopback",
   "sampled_at": "2026-07-20T22:00:00+00:00"
 }
 ```
 
-The statistics object describes Lemonade's most recently completed request; it
-is not a cumulative counter. It is `null` when health is available but optional
-request statistics are not. Runtime responses are bounded to 1 MiB. Returns 503
-when host inference health is unavailable.
+`health.status` is `ok`, `loading` or `error`. `version` is llama.cpp's build
+information, `model_loaded` the served GGUF file name, `context_length` the
+loaded context and `vision` whether a vision projector is loaded. `metrics`
+holds llama.cpp's cumulative counters from `/metrics`, or `null` when they are
+unavailable. `stats` is always `null`. `source` is `windows-loopback` or
+`wsl-model-router`. Results are cached for one second. Returns 501 when this
+installation's model does not run on a host-native server, and 503 when host
+inference health is unavailable.
 
 ### `GET /v1/service/health`
 
 Return a read-only Docker lifecycle and declared healthcheck snapshot for ODS
-containers. Compose service labels are preferred over container-name parsing.
+containers. Both this endpoint and `GET /v1/service/stats` include explicitly
+declared Docker container names from installed extension manifests, even when
+the name does not start with `ods-`. User extension definitions take precedence
+over built-ins. Declared names map to their extension service ID; other `ods-`
+containers retain Compose-label or name-based identification. Unrelated names
+and custom names from non-Docker definitions are excluded.
 
 **Authentication:** Required
 
@@ -243,6 +264,47 @@ Start an extension container. Runs `docker compose up -d <service_id>` using the
 | 500 | Docker Compose operation failed |
 | 503 | Docker Compose operation timed out (120s) |
 
+### `POST /v1/extension/prepare-images`
+
+Download the images that enabling bundled services (or adding Open WebUI) will use, before anything is selected. A first download can take far longer on a slow link than an enable request may stay open, so the Dashboard calls this first and follows the download through the extension's progress record.
+
+Compose resolves the images from the services' shipped files and pinned digests. Bundled services that are not selected yet resolve through `resolve-compose-stack.sh --assume-enabled`, and Open WebUI through its `ENABLE_OPEN_WEBUI` selector. Nothing is selected and `.env` is not changed.
+
+**Authentication:** Required
+
+**Request body:**
+```json
+{
+  "service_ids": ["searxng", "hermes", "hermes-proxy"],
+  "progress_id": "hermes"
+}
+```
+
+**Validation rules:**
+- `service_ids` lists 1-16 distinct ids matching `^[a-z0-9][a-z0-9_-]*$`; `progress_id` is one of them
+- Each id is a bundled extension with a Compose file, or `open-webui`. Library recipes download their images in their own install.
+- Every listed service must be free: one operation per service (409 otherwise)
+
+**Response (200)** when every image is already on the host:
+```json
+{"status": "ready", "service_ids": ["searxng", "hermes", "hermes-proxy"]}
+```
+
+**Response (202)** while the missing images download in the background:
+```json
+{"status": "accepted", "service_ids": ["searxng", "hermes", "hermes-proxy"], "pulling": ["hermes"]}
+```
+
+The progress record under `progress_id` shows `pulling`, with an elapsed time and completed layer count in `phase_label`, then `prepared` or `error`. The download stops only when Docker reports nothing for `ODS_IMAGE_PULL_STALL_SECONDS` (default 900) or after `ODS_IMAGE_PULL_MAX_SECONDS` (default 21600), not after a fixed request timeout. The Library install path downloads its images the same way.
+
+**Error responses:**
+| Code | Condition |
+|------|-----------|
+| 400 | Invalid ids, or a service that is not bundled |
+| 401/403 | Missing or invalid API key |
+| 409 | An operation is already in progress for one of the services |
+| 503 | The Compose configuration for these services could not be resolved |
+
 ### `POST /v1/extension/stop`
 
 Stop an extension container. Runs `docker compose stop <service_id>`.
@@ -254,6 +316,11 @@ Stop an extension container. Runs `docker compose stop <service_id>`.
 ### `POST /v1/extension/logs`
 
 Fetch recent container logs. Uses `docker logs --tail N ods-<service_id>` directly (bypasses compose for speed).
+
+Both this endpoint and `POST /v1/service/logs` capture stdout and stderr through
+one pipe in the order emitted by `docker logs`. The response retains the latest
+50,000 characters of that combined output, so stderr diagnostics remain visible
+when the container also writes normal output to stdout.
 
 **Authentication:** Required
 

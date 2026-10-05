@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import sys
 import tempfile
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "bin"))
 
 from remote_provider.egress import (  # noqa: E402
+    DEFAULT_MAX_BODY_BYTES,
     EgressError,
     prepare_upstream_request,
     provider_secret_status,
@@ -121,10 +123,60 @@ def test_compose_service_is_internal_only_and_hardened() -> None:
     assert_true("expose:" in block and '"8091"' in block, "service must expose only the internal port")
     assert_true("ports:" not in block, "service must not bind a host port")
     assert_true("cap_drop:" in block and "- ALL" in block, "service must drop capabilities")
+    assert_true(
+        '"${REMOTE_PROVIDER_DATA_GID:-1000}"' in block,
+        "service must receive the host data group for mode-0640 secret reads",
+    )
     assert_true("read_only: true" in block, "service filesystem must be read-only")
+    assert_true(
+        "${ODS_DATA_DIR:-./data}/remote-provider:/state/remote-provider:ro" in block,
+        "service must mount only remote-provider state, not unrelated ODS data",
+    )
     assert_true("/remote-provider/secrets/provider-api-key" in block, "service must use a secret file path")
     assert_true("http://remote-provider-ssh-tunnel:18090/health" in block, "service must check internal SSH tunnel health")
     assert_true("REMOTE_LLM_API_KEY" not in block, "service must not source provider API keys from public env")
+    assert_true(
+        "    networks:\n      - remote-provider\n      - remote-provider-outbound\n" in block,
+        "egress must join only the remote-provider networks",
+    )
+    assert_true("      - default\n" not in block, "egress must not join ods-network")
+    assert_true(
+        "ODS_REMOTE_PROVIDER_CALLER_KEY=${LITELLM_KEY:-}" in block,
+        "egress must admit callers by the LiteLLM gateway key",
+    )
+
+
+def test_remote_provider_networks_admit_only_the_gateway_and_dashboard_api() -> None:
+    """GHSA-4rpc: containers on ods-network must not reach the egress or its tunnel."""
+    compose = read(BASE_COMPOSE)
+    top_level = compose.split("\nnetworks:\n", 1)[1]
+    assert_true(
+        "  remote-provider:\n    name: ods-remote-provider\n    internal: true\n" in top_level,
+        "the shared remote-provider network must be internal so it never becomes a default route",
+    )
+    assert_true(
+        "  remote-provider-outbound:\n    name: ods-remote-provider-outbound\n" in top_level,
+        "the egress needs its own outbound network",
+    )
+    dashboard_api = compose.split("  dashboard-api:", 1)[1].split("\n  # ", 1)[0]
+    assert_true(
+        "    networks:\n      - default\n      - remote-provider\n" in dashboard_api,
+        "dashboard-api must keep ods-network and join the internal remote-provider network",
+    )
+    litellm = read(ROOT / "extensions" / "services" / "litellm" / "compose.yaml")
+    assert_true(
+        "    networks:\n      - default\n      - remote-provider\n" in litellm,
+        "LiteLLM must keep ods-network and join the internal remote-provider network",
+    )
+    joins = re.compile(r"^[ \t]+(?:- )?remote-provider(?:-outbound)?:?[ \t]*$", re.M)
+    assert_true(
+        len(joins.findall(compose.split("\nnetworks:\n", 1)[0])) == 5,
+        "only dashboard-api, the egress and the SSH tunnel may join remote-provider networks in base compose",
+    )
+    for path in sorted((ROOT / "extensions" / "services").glob("*/compose*")):
+        if path.parent.name == "litellm" and path.name == "compose.yaml":
+            continue
+        assert_true(not joins.search(read(path)), f"{path.parent.name}/{path.name} must not join a remote-provider network")
 
 
 def test_manifest_and_network_policy_mark_no_lan_exposure() -> None:
@@ -166,6 +218,18 @@ def test_route_state_prepares_direct_provider_request_without_client_auth() -> N
     assert_true(upstream.headers["authorization"] == "Bearer unit-test-provider-token", "provider auth must be injected")
     assert_true("client-token" not in json.dumps(upstream.headers), "client auth must not be forwarded")
     assert_true("connection" not in {key.lower() for key in upstream.headers}, "hop-by-hop headers must be stripped")
+
+
+def test_image_envelope_keeps_content_and_explicit_size_limits() -> None:
+    messages = [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {
+        'url': 'data:image/png;base64,' + 'a' * (5 * 1024 * 1024)}}]}]
+    body = json.dumps({'model': 'ods/current', 'messages': messages}).encode()
+    args = dict(method='POST', path='/v1/chat/completions', headers={},
+                route=route_from_state(route_state()), provider_secret='test-only')
+    forwarded = prepare_upstream_request(body=body, **args)
+    assert_true(json.loads(forwarded.content)['messages'] == messages, 'Image content changed')
+    assert_egress_error(lambda: prepare_upstream_request(body=body, max_body_bytes=1024, **args), 'payload_too_large')
+    assert_egress_error(lambda: prepare_upstream_request(body=b'x' * (DEFAULT_MAX_BODY_BYTES + 1), **args), 'payload_too_large')
 
 
 def test_direct_resolution_allows_only_global_provider_addresses() -> None:
@@ -367,6 +431,9 @@ def test_service_source_avoids_public_env_secret_names() -> None:
     assert_true("probe_route_response" in text, "probe endpoint must use the shared egress probe helper")
     assert_true("ssh_tunnel_not_ready" in text, "app must fail closed when the SSH tunnel is down")
     assert_true("trust_env=False" in text, "egress requests must not delegate pinned connections or private headers to environment proxies")
+    assert_true("ODS_REMOTE_PROVIDER_CALLER_KEY" in text, "app must read the caller key")
+    assert_true('@app.middleware("http")' in text, "caller auth must run before every route")
+    assert_true("hmac.compare_digest" in text, "caller key must be compared in constant time")
     assert_true(POLICY.exists(), "policy document must exist for mounted service config")
 
 
@@ -455,9 +522,11 @@ def test_pinned_request_preserves_non_default_port_and_separates_tls_origins() -
 def main() -> int:
     tests = [
         test_compose_service_is_internal_only_and_hardened,
+        test_remote_provider_networks_admit_only_the_gateway_and_dashboard_api,
         test_manifest_and_network_policy_mark_no_lan_exposure,
         test_image_copies_shared_policy_package,
         test_route_state_prepares_direct_provider_request_without_client_auth,
+        test_image_envelope_keeps_content_and_explicit_size_limits,
         test_direct_resolution_allows_only_global_provider_addresses,
         test_direct_resolution_rejects_unsafe_dns_answers,
         test_ssh_route_uses_internal_tunnel_without_direct_dns,

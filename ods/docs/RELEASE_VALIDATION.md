@@ -44,6 +44,7 @@ candidate run.
 | Install Green | Enabled real-hardware hosts can fresh-install from the public bootstrap path. |
 | Product Green | Core services, cloud-mode contracts, dashboard flows, Hermes auth/chat, and UI checks pass after install. |
 | Capability Green | Full-model capability probes pass after large model downloads and swaps complete. |
+| Pixel / Portal regression acceptance | The exact installed profile passes coding/repair, grounded research, input-dependent work, framework builds, interactive artifacts, failure honesty, lane continuity and managed-extension journeys, including restart/update identity checks. See the [acceptance protocol](pixel/PORTAL-REGRESSION-ACCEPTANCE.md). |
 | Model Switchboard Green | Model-management release coverage proves the six-model matrix, app probes, visible agent gates, and coverage ledger for each reachable host. |
 | Lifecycle Green | Idempotent reinstall, `ods restart`, and `ods doctor` recover cleanly after state changes. |
 | User Green | The combined release gate is clean, with failures, skips, and deferrals resolved or documented. |
@@ -57,12 +58,16 @@ The release harness normally combines these layers:
 | CI | Fast syntax, contract, dashboard, shell, Python, and PowerShell checks | Catches cheap regressions before hardware time is spent. |
 | Zero-prereq bootstrap | Clean Ubuntu, Debian, Fedora, Rocky, Arch, and openSUSE containers | Proves the public `curl` path does not assume a developer workstation. |
 | Distro lab | 10 Linux container lanes plus systemd-capable Incus VM lanes | Exercises package-manager, systemd, Docker daemon, and Compose behavior across distro families. |
-| Real hardware fleet | Linux NVIDIA, Linux AMD/ROCm-Lemonade, ARM Linux NVIDIA, and Apple Silicon hardware classes | Proves accelerator/runtime behavior and the installed product on actual machines. |
+| Real hardware fleet | Linux NVIDIA, Linux AMD (llama.cpp), ARM Linux NVIDIA, and Apple Silicon hardware classes | Proves accelerator/runtime behavior and the installed product on actual machines. |
 
 The latest release-grade fleet run for the current candidate should be cited in
 release notes with its commit, date, enabled hardware classes, and any skipped
 or deferred surfaces. Public docs should summarize the sanitized evidence
 rather than linking raw private run artifacts.
+
+For Pixel changes, a successful preview or source-only test run does not qualify
+the broader assistant. Record missing installed identity or required journey
+evidence as unknown/untested; it cannot be counted as a passing Pixel profile.
 
 ## What We Check
 

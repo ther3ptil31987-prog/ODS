@@ -42,7 +42,7 @@ sudo systemctl restart docker
 
 **Error:** installer reports missing `/dev/kfd`, `/dev/dri`, or `/dev/dri/renderD*`, or AMD services never become healthy inside an LXD container.
 
-**Cause:** LXD/LXC containers can expose enough host CPU/sysfs information for ODS to recognize AMD/Strix Halo hardware while still hiding the actual GPU device nodes that Docker must mount into ROCm containers.
+**Cause:** LXD/LXC containers can expose enough host CPU/sysfs information for ODS to recognize AMD/Strix Halo hardware while still hiding the actual GPU device nodes that Docker must mount into the AMD containers: `/dev/dri` for the default Vulkan llama.cpp image, and `/dev/kfd` as well for the ROCm image and ComfyUI.
 
 **Fix for GPU acceleration:** pass the GPU devices from the LXD host into the container, then re-run the installer.
 

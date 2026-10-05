@@ -79,6 +79,33 @@ assert_grep "installers/windows/phases/03-features.ps1" 'hermesContextSize[[:spa
     "Windows Hermes target context floor is 64K"
 
 echo ""
+echo "Selection plans the Hermes floor and the raise is re-checked:"
+assert_grep "installers/lib/model-selector.sh" '^ODS_HERMES_MIN_CONTEXT=65536$' \
+    "Linux selector floor is 64K"
+assert_grep "installers/phases/02-detection.sh" '--min-context "\$ODS_HERMES_MIN_CONTEXT"' \
+    "Linux phase 02 selects at the 64K floor"
+assert_grep "installers/macos/install-macos.sh" '--min-context "\$HERMES_CONTEXT_SIZE"' \
+    "macOS selects at the 64K floor"
+assert_grep "installers/windows/phases/02-detection.ps1" '-MinContext \$script:HERMES_MIN_CONTEXT' \
+    "Windows selects at the 64K floor"
+assert_grep "installers/phases/03-features.sh" 'ods_catalog_fit_check' \
+    "Linux re-checks fit before raising to 64K"
+assert_grep "installers/phases/03-features.sh" '--require-min-context' \
+    "Linux re-selects a model that fits at 64K"
+assert_grep "installers/macos/install-macos.sh" '--check-fit' \
+    "macOS re-checks fit before raising to 64K"
+assert_grep "installers/windows/phases/03-features.ps1" 'Test-CatalogModelContextFit' \
+    "Windows re-checks fit before raising to 64K"
+assert_grep "installers/windows/phases/03-features.ps1" '-RequireMinContext' \
+    "Windows re-selects a model that fits at 64K"
+assert_grep "installers/phases/03-features.sh" 'INSTALLER_RECOMMENDED_CONTEXT="\$MAX_CONTEXT"' \
+    "Linux records the served context as MODEL_RECOMMENDED_CONTEXT"
+assert_grep "installers/macos/lib/env-generator.sh" '^MODEL_RECOMMENDED_CONTEXT=\$\{MAX_CONTEXT\}$' \
+    "macOS records the served context as MODEL_RECOMMENDED_CONTEXT"
+assert_grep "installers/windows/lib/env-generator.ps1" '^MODEL_RECOMMENDED_CONTEXT=\$\(\$TierConfig.MaxContext\)' \
+    "Windows records the served context as MODEL_RECOMMENDED_CONTEXT"
+
+echo ""
 echo ".env context parity:"
 assert_grep "installers/phases/06-directories.sh" '^MAX_CONTEXT=\$\{MAX_CONTEXT\}$' \
     "Linux .env generator writes MAX_CONTEXT"
@@ -126,8 +153,8 @@ assert_grep "installers/phases/11-services.sh" '_hermes_switchboard_mode=.*ODS_M
     "Linux Hermes patcher reads switchboard mode"
 assert_grep "installers/phases/11-services.sh" '_hermes_model="ods/current"' \
     "Linux Hermes patcher uses the stable switchboard model alias"
-assert_grep "installers/phases/11-services.sh" '_hermes_base_url=.*http://litellm:4000/v1' \
-    "Linux Hermes patcher routes switchboard mode through LiteLLM"
+assert_grep "installers/phases/11-services.sh" '_hermes_base_url=.*http://model-router:9099/v1' \
+    "Linux Hermes patcher routes local switchboard mode through model-router"
 assert_grep "installers/phases/11-services.sh" '_hermes_model_yaml=.*_phase11_yaml_double_quoted_scalar_content' \
     "Linux Hermes verification serializes the selected model as YAML"
 assert_grep "installers/phases/11-services.sh" 'grep -Fqx "  default: \\"\$_hermes_model_yaml\\""' \
@@ -178,16 +205,84 @@ HERMES_FALLBACK_EOF
 ) || fail "Linux Hermes fallback patcher did not preserve metacharacters or reject unsafe structure"
 pass "Linux Hermes fallback patcher treats sed metacharacters as data"
 
+# A held Pixel source update (phase 06) finishes only over the exact source
+# bytes it published, and the Hermes template is one of them. Phase 11 must
+# write the Hermes route after ods_pixel_install_default_agent finished that
+# update, and still before Compose starts Hermes.
+apply_template_block="$(function_block _phase11_apply_hermes_template)"
+hermes_setup_block="$(awk '
+    /^    if \[\[ "\$\{ENABLE_HERMES:-false\}" == "true" \]\]; then$/ { in_block=1 }
+    in_block { print }
+    in_block && /^    fi$/ { exit }
+' installers/phases/11-services.sh)"
+[[ -n "$apply_template_block" ]] || fail "could not extract the Linux Hermes template writer"
+[[ -n "$hermes_setup_block" ]] || fail "could not extract the Linux Hermes setup block"
+(
+    held_tmp="$(mktemp -d "${TMPDIR:-/tmp}/ods-hermes-held.XXXXXX")"
+    trap 'rm -rf -- "$held_tmp"' EXIT
+    INSTALL_DIR="$held_tmp/install"
+    LOG_FILE="$held_tmp/install.log"
+    held_template="$INSTALL_DIR/extensions/services/hermes/cli-config.yaml.template"
+    mkdir -p "$(dirname "$held_template")"
+    printf '%s\n' 'model:' '  default: "qwen3.5-9b"' '  context_length: 131072' >"$held_template"
+    cp "$held_template" "$held_tmp/published"
+    ods_detect_python_cmd() { return 1; }
+    _phase11_external_llm() { return 1; }
+    _phase11_external_lemonade() { return 1; }
+    log() { :; }
+    warn() { :; }
+    ai_ok() { :; }
+    eval "$fallback_yaml_block"
+    eval "$fallback_patch_block"
+    eval "$apply_template_block"
+    ENABLE_HERMES=true
+    MAX_CONTEXT=65536
+    ODS_MODEL_SWITCHBOARD=enabled
+
+    ODS_PIXEL_SOURCE_TRANSACTION="$(printf '%064d' 0)"
+    _phase11_hermes_template_route=()
+    eval "$hermes_setup_block"
+    cmp -s "$held_template" "$held_tmp/published" || { echo "held update: template was rewritten" >&2; exit 1; }
+    (( ${#_phase11_hermes_template_route[@]} > 0 )) || { echo "held update: no route kept for later" >&2; exit 1; }
+    unset ODS_PIXEL_SOURCE_TRANSACTION
+    _phase11_apply_hermes_template "${_phase11_hermes_template_route[@]}"
+    grep -Fqx '  default: "ods/current"' "$held_template" || { echo "finished update: route not written" >&2; exit 1; }
+    grep -Fqx '  context_length: 65536' "$held_template" || { echo "finished update: context not written" >&2; exit 1; }
+
+    cp "$held_tmp/published" "$held_template"
+    _phase11_hermes_template_route=()
+    eval "$hermes_setup_block"
+    grep -Fqx '  default: "ods/current"' "$held_template" || { echo "no update held: route not written" >&2; exit 1; }
+    (( ${#_phase11_hermes_template_route[@]} == 0 )) || { echo "no update held: route also kept for later" >&2; exit 1; }
+) || fail "Linux Hermes template changed inside a held Pixel source update, or its route was lost"
+pass "Linux Hermes template keeps a held Pixel source update's bytes and gets its route afterwards"
+hermes_route_order="$(awk '
+    /if ! ods_pixel_install_default_agent; then/ && !pixel { pixel=NR }
+    /_phase11_apply_hermes_template "\$\{_phase11_hermes_template_route\[@\]\}"/ { apply=NR }
+    /"\$\{COMPOSE_FLAGS_ARR\[@\]\}" up -d --remove-orphans/ && !launch { launch=NR }
+    END { print pixel+0, apply+0, launch+0 }
+' installers/phases/11-services.sh)"
+read -r pixel_line apply_line launch_line <<<"$hermes_route_order"
+if (( pixel_line > 0 && pixel_line < apply_line && apply_line < launch_line )); then
+    pass "Linux phase 11 writes a waiting Hermes route after the Pixel update finishes and before Compose starts"
+else
+    fail "Linux phase 11 waiting Hermes route is not between ods_pixel_install_default_agent and Compose up ($hermes_route_order)"
+fi
+
 assert_grep "installers/macos/install-macos.sh" '--context-length "\$MAX_CONTEXT"' \
     "macOS Hermes patcher receives context length"
 assert_grep "installers/macos/ods-macos.sh" 'ENV_CTX_SIZE:-65536' \
     "macOS native llama restart defaults to 64K context"
-assert_grep "installers/phases/07-devtools.sh" '"context": \$\{MAX_CONTEXT:-65536\}' \
+assert_grep "installers/phases/07-devtools.sh" '_opencode_context="\$\{MAX_CONTEXT:-65536\}"' \
     "Linux OpenCode config defaults to 64K context"
 assert_grep "installers/phases/07-devtools.sh" 'ODS_MODEL_SWITCHBOARD' \
     "Linux OpenCode config reads switchboard mode"
 assert_grep "installers/phases/07-devtools.sh" '_opencode_model_id="ods/current"' \
     "Linux OpenCode config uses stable switchboard alias"
+assert_grep "installers/phases/07-devtools.sh" '_opencode_model_id="\$EXTERNAL_LLM_MODEL"' \
+    "Linux OpenCode config uses the exact generic external model"
+assert_grep "installers/phases/07-devtools.sh" '_opencode_url="http://127\.0\.0\.1:\$\{LITELLM_PORT:-4000\}/v1"' \
+    "Linux OpenCode generic external config routes through LiteLLM"
 assert_grep "installers/phases/07-devtools.sh" 'OpenCode config updated \(model, API key, and URL refreshed\)' \
     "Linux OpenCode reinstall migrates stale model route"
 assert_grep "installers/macos/install-macos.sh" '_opencode_switchboard_mode=.*ODS_MODEL_SWITCHBOARD' \
@@ -198,7 +293,7 @@ assert_grep "installers/macos/lib/env-generator.sh" 'ODS_MODEL_SWITCHBOARD=\$\{s
     "macOS .env generation persists switchboard mode"
 assert_grep "installers/macos/lib/env-generator.sh" 'OPEN_WEBUI_LLM_BASE_URL=\$\{open_webui_llm_base_url\}' \
     "macOS .env generation carries the Open WebUI switchboard route"
-assert_grep "installers/macos/docker-compose.macos.yml" 'OPENAI_API_BASE_URL: "\$\{OPEN_WEBUI_LLM_BASE_URL:-http://\$\{ODS_MACOS_HOST_GATEWAY:-host\.docker\.internal\}:8080/v1\}"' \
+assert_grep "installers/macos/docker-compose.macos.yml" 'OPENAI_API_BASE_URL: "\$\{OPEN_WEBUI_LLM_BASE_URL:-http://\$\{ODS_MACOS_HOST_GATEWAY:-host\.docker\.internal\}:\$\{OLLAMA_PORT:-8080\}/v1\}"' \
     "macOS Open WebUI compose route honors switchboard override"
 assert_grep "installers/macos/docker-compose.macos.yml" 'OPENAI_API_KEY: "\$\{OPEN_WEBUI_LLM_API_KEY:-\}"' \
     "macOS Open WebUI compose route carries switchboard API key"

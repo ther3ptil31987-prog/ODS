@@ -112,7 +112,6 @@ function Get-WindowsLocalLlmEndpoint {
         [hashtable]$EnvMap = $null,
         [string]$GpuBackend = "",
         [string]$NativeBackend = "",
-        [switch]$UseLemonade,
         [switch]$CloudMode
     )
 
@@ -156,7 +155,7 @@ function Get-WindowsLocalLlmEndpoint {
     }
 
     $defaultNativePort = "8080"
-    $configuredConstant = Get-Variable -Name LEMONADE_PORT -Scope Script -ErrorAction SilentlyContinue
+    $configuredConstant = Get-Variable -Name NATIVE_LLM_PORT -Scope Script -ErrorAction SilentlyContinue
     if ($configuredConstant -and [string]$configuredConstant.Value -match '^\d+$') {
         $defaultNativePort = [string]$configuredConstant.Value
     }
@@ -170,21 +169,9 @@ function Get-WindowsLocalLlmEndpoint {
         $nativePort = [string]$parsedNativePort
     }
 
-    if ($UseLemonade -or $resolvedNativeBackend -eq "lemonade" -or $llmBackend -eq "lemonade") {
-        return @{
-            Name = "LLM (Lemonade)"
-            Backend = "lemonade"
-            Port = $nativePort
-            ApiBasePath = "/api/v1"
-            HealthUrl = "http://127.0.0.1:${nativePort}/api/v1/health"
-            BaseUrl = "http://localhost:${nativePort}/api/v1"
-            ChatCompletionsUrl = "http://localhost:${nativePort}/api/v1/chat/completions"
-        }
-    }
-
     $usesNativeHostLlamaServer = (-not $CloudMode -and (
         $resolvedGpuBackend -eq "amd" -or
-        $amdInferenceRuntimeMode -eq "windows-llama-server-fallback" -or
+        $amdInferenceRuntimeMode -in @("windows-native-llama-server", "windows-llama-server-fallback") -or
         ($resolvedNativeBackend -eq "llama-server" -and
             $amdInferenceRuntime -eq "llama-server" -and
             $amdInferenceLocation -eq "host")
@@ -199,6 +186,8 @@ function Get-WindowsLocalLlmEndpoint {
             HealthUrl = "http://localhost:${nativePort}/health"
             BaseUrl = "http://localhost:${nativePort}/v1"
             ChatCompletionsUrl = "http://localhost:${nativePort}/v1/chat/completions"
+            # Sent as a header only; /health and /v1/models stay public.
+            ApiKey = (Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("LLAMA_SERVER_API_KEY") -Default "")
         }
     }
 
@@ -219,17 +208,28 @@ function Get-WindowsLocalLlmEndpoint {
     }
 }
 
+function Test-ODSCompletionContent {
+    param([string]$Json)
+    try {
+        $payload = $Json | ConvertFrom-Json -ErrorAction Stop
+        if ($null -ne $payload.error -or @($payload.choices).Count -eq 0) { return $false }
+        $content = $payload.choices[0].message.content
+        return ($content -is [string] -and -not [string]::IsNullOrWhiteSpace($content))
+    } catch { return $false }
+}
+
 function Test-WindowsLlmModelReadiness {
     <#
     .SYNOPSIS
         Prove the local LLM can actually serve, not just that its process is alive.
     .DESCRIPTION
-        A healthy Lemonade/llama-server process is NOT proof the model works: if the
+        A healthy llama-server process is NOT proof the model works: if the
         GGUF backing file was never placed on disk, /v1/models still lists the model
         but every chat/completions returns 500. This gate proves two things before an
         install may report healthy:
           1. the GGUF backing file exists at the path the backend loads from, and
           2. a minimal completion actually succeeds (the real user path).
+        The native Windows llama-server requires the endpoint's API key.
         Returns a result hashtable; the caller decides fatality.
     .OUTPUTS
         @{ Ok; FileExists; ModelFile; ModelId; CompletionOk; Detail }
@@ -238,7 +238,6 @@ function Test-WindowsLlmModelReadiness {
         [Parameter(Mandatory = $true)] [hashtable]$Endpoint,
         [Parameter(Mandatory = $true)] [string]$InstallDir,
         [string]$GgufFile = "",
-        [string]$LemonadeModel = "",
         [int]$TimeoutSec = 120
     )
 
@@ -254,46 +253,8 @@ function Test-WindowsLlmModelReadiness {
         $result.FileExists = $true
     }
 
-    # 2. Resolve the served model id. Modern Lemonade derives IDs from its live
-    #    model catalog, while legacy releases use extra.<GGUF_FILE>. Key this off
-    #    the resolved endpoint, not the broader AMD GPU family, so a valid Vulkan
-    #    fallback install does not false-fail.
+    # 2. llama-server serves the GGUF file name as the model id (--alias).
     $modelId = $GgufFile
-    $isLemonadeEndpoint = $false
-    if ($Endpoint.ContainsKey("Backend")) {
-        $isLemonadeEndpoint = ([string]$Endpoint.Backend).ToLowerInvariant() -eq "lemonade"
-    } elseif ($Endpoint.ContainsKey("ApiBasePath")) {
-        $isLemonadeEndpoint = ([string]$Endpoint.ApiBasePath) -eq "/api/v1"
-    }
-    if (-not [string]::IsNullOrWhiteSpace($GgufFile) -and $isLemonadeEndpoint) {
-        $modelId = $LemonadeModel
-        if ([string]::IsNullOrWhiteSpace($modelId)) {
-            $envMap = Get-WindowsODSEnvMap -InstallDir $InstallDir
-            $modelId = Get-WindowsODSEnvValue `
-                -EnvMap $envMap -Keys @("LEMONADE_MODEL") `
-                -Default "extra.$GgufFile"
-        }
-
-        $resolver = Get-Command Resolve-ODSLemonadeModelId -ErrorAction SilentlyContinue
-        if ($resolver) {
-            $lemonadePort = 0
-            if ($Endpoint.ContainsKey("Port")) {
-                [void][int]::TryParse([string]$Endpoint.Port, [ref]$lemonadePort)
-            }
-            if ($lemonadePort -lt 1 -and $Endpoint.ContainsKey("ChatCompletionsUrl")) {
-                try { $lemonadePort = ([Uri]$Endpoint.ChatCompletionsUrl).Port } catch { }
-            }
-            if ($lemonadePort -gt 0) {
-                try {
-                    $liveModelId = Resolve-ODSLemonadeModelId `
-                        -Port $lemonadePort -GgufFile $GgufFile
-                    if (-not [string]::IsNullOrWhiteSpace($liveModelId)) {
-                        $modelId = $liveModelId
-                    }
-                } catch { }
-            }
-        }
-    }
     if ([string]::IsNullOrWhiteSpace($modelId)) { $modelId = "default" }
     $result.ModelId = $modelId
 
@@ -302,20 +263,25 @@ function Test-WindowsLlmModelReadiness {
     $body = @{
         model       = $modelId
         messages    = @(@{ role = "user"; content = "hi" })
-        max_tokens  = 1
+        max_tokens  = 64
         temperature = 0
         stream      = $false
+        chat_template_kwargs = @{ enable_thinking = $false }
     } | ConvertTo-Json -Compress -Depth 5
 
+    $headers = @{}
+    if ($Endpoint.ContainsKey("ApiKey") -and -not [string]::IsNullOrWhiteSpace([string]$Endpoint.ApiKey)) {
+        $headers.Authorization = "Bearer " + [string]$Endpoint.ApiKey
+    }
     try {
         $resp = Invoke-WebRequest -Method POST -Uri $Endpoint.ChatCompletionsUrl `
-            -ContentType "application/json" -Body $body -TimeoutSec $TimeoutSec `
+            -Headers $headers -ContentType "application/json" -Body $body -TimeoutSec $TimeoutSec `
             -UseBasicParsing -ErrorAction Stop
         if ([int]$resp.StatusCode -ge 200 -and [int]$resp.StatusCode -lt 300) {
-            $result.CompletionOk = $true
+            $result.CompletionOk = Test-ODSCompletionContent -Json $resp.Content
         }
-    } catch [System.Net.WebException] {
-        # Narrow I/O-boundary catch: map the failed completion to a meaningful status.
+    } catch {
+        # HTTP exception types differ between Windows PowerShell and PowerShell 7.
         $code = -1
         if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
         $result.Detail = "completion request failed (status=$code)"
@@ -331,4 +297,39 @@ function Test-WindowsLlmModelReadiness {
     }
 
     return $result
+}
+
+function Test-WindowsSwitchboardReadiness {
+    # Only the host agent publishes route proof. Exercise the same public alias
+    # used by consumers, not a backend health endpoint or a fabricated receipt.
+    param([hashtable]$EnvMap, [int]$Attempts = 6, [int]$IntervalSec = 5)
+    if ((Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("ODS_MODEL_SWITCHBOARD")) -ne "enabled") {
+        return @{ Ok = $true; Detail = "switchboard disabled" }
+    }
+    $agentKey = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("ODS_AGENT_KEY", "DASHBOARD_API_KEY")
+    $gatewayKey = Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("LITELLM_KEY")
+    if (-not $agentKey -or -not $gatewayKey) {
+        return @{ Ok = $false; Detail = "switchboard verification credentials are missing" }
+    }
+    $agentPort = [int](Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("ODS_AGENT_PORT") -Default "7710")
+    $gatewayPort = [int](Get-WindowsODSEnvValue -EnvMap $EnvMap -Keys @("LITELLM_PORT") -Default "4000")
+    $body = @{
+        model = "ods/current"; messages = @(@{ role = "user"; content = "Say OK" })
+        max_tokens = 64; temperature = 0; stream = $false
+        chat_template_kwargs = @{ enable_thinking = $false }
+    } | ConvertTo-Json -Compress -Depth 5
+    for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+        try {
+            $null = Invoke-WebRequest -Uri "http://127.0.0.1:$agentPort/v1/model/status" `
+                -Headers @{ Authorization = "Bearer $agentKey" } -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop
+            $response = Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:$gatewayPort/v1/chat/completions" `
+                -Headers @{ Authorization = "Bearer $gatewayKey" } -ContentType "application/json" `
+                -Body $body -TimeoutSec 30 -UseBasicParsing -ErrorAction Stop
+            if ([int]$response.StatusCode -eq 200 -and (Test-ODSCompletionContent -Json $response.Content)) {
+                return @{ Ok = $true; Detail = "ods/current returned a completion" }
+            }
+        } catch { } # Never reflect authenticated upstream bodies into install logs.
+        if ($attempt + 1 -lt $Attempts) { Start-Sleep -Seconds $IntervalSec }
+    }
+    return @{ Ok = $false; Detail = "ods/current did not return a verified completion; inspect model status and retry" }
 }

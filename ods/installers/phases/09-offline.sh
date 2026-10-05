@@ -5,7 +5,7 @@
 # Part of: installers/phases/
 # Purpose: Configure M1 offline/air-gapped operation
 #
-# Expects: OFFLINE_MODE, DRY_RUN, INSTALL_DIR, ENABLE_OPENCLAW, LOG_FILE,
+# Expects: OFFLINE_MODE, DRY_RUN, INSTALL_DIR, ENABLE_VOICE, LOG_FILE,
 #           chapter(), ai(), ai_ok(), ai_warn(), log()
 # Provides: Offline mode marker, M1 config files, embedded embeddings
 #
@@ -17,13 +17,13 @@ ods_progress 65 "offline" "Configuring offline mode"
 if [[ "$OFFLINE_MODE" == "true" ]] && $DRY_RUN; then
     log "[DRY RUN] Would configure offline/air-gapped mode (M1)"
     log "[DRY RUN] Would create offline mode marker, disable cloud features"
-    [[ "$ENABLE_OPENCLAW" == "true" ]] && log "[DRY RUN] Would create OpenClaw M1 config"
     log "[DRY RUN] Would pre-download GGUF embeddings for memory_search"
 elif [[ "$OFFLINE_MODE" == "true" ]] && ! $DRY_RUN; then
     chapter "CONFIGURING OFFLINE MODE (M1)"
 
-    # Create offline mode marker
-    touch "$INSTALL_DIR/.offline-mode"
+    # A previous successful install must not make a failed rerun look ready.
+    # Recreate the marker only after the required asset is validated below.
+    rm -f -- "$INSTALL_DIR/.offline-mode"
 
     # Disable any cloud-dependent features in .env
     _sed_i 's/^BRAVE_API_KEY=.*/BRAVE_API_KEY=/' "$INSTALL_DIR/.env" 2>/dev/null || true
@@ -47,45 +47,37 @@ WEB_SEARCH_ENABLED=false
 LOCAL_RAG_ENABLED=true
 OFFLINE_EOF
 
-    # Create OpenClaw M1 config if OpenClaw is enabled
-    if [[ "$ENABLE_OPENCLAW" == "true" ]]; then
-        mkdir -p "$INSTALL_DIR/config/openclaw"
-        cat > "$INSTALL_DIR/config/openclaw/openclaw-m1.yaml" << 'M1_EOF'
-# OpenClaw M1 Mode Configuration
-# Fully offline operation - no cloud dependencies
-
-memorySearch:
-  enabled: true
-  # Uses bundled GGUF embeddings (auto-downloaded during install)
-  # No external API calls
-
-# Disable web search (not available offline)
-# Use local RAG with Qdrant instead
-webSearch:
-  enabled: false
-
-# Local inference only
-inference:
-  provider: local
-  baseUrl: http://llama-server:8080/v1
-M1_EOF
-        ai_ok "OpenClaw M1 config created"
-    fi
-
-    # Pre-download GGUF embeddings for memory_search
+    # Pre-download GGUF embeddings for memory_search.  Offline mode is only
+    # valid when this required asset is present and structurally valid: a
+    # failed download must not leave an install that cannot work offline.
     ai "Pre-downloading GGUF embeddings for offline memory_search..."
     mkdir -p "$INSTALL_DIR/models/embeddings"
 
-    # Download embeddinggemma GGUF (small, ~300MB)
-    if command -v curl &> /dev/null; then
-        EMBED_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf"
-        if ! [[ -f "$INSTALL_DIR/models/embeddings/nomic-embed-text-v1.5.Q4_K_M.gguf" ]]; then
-            curl -L --max-time 3600 -o "$INSTALL_DIR/models/embeddings/nomic-embed-text-v1.5.Q4_K_M.gguf" "$EMBED_URL" 2>/dev/null || \
-                ai_warn "Could not pre-download embeddings. Memory search will download on first use."
-        else
-            log "Embeddings already downloaded"
+    EMBED_FILE="$INSTALL_DIR/models/embeddings/nomic-embed-text-v1.5.Q4_K_M.gguf"
+    EMBED_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf"
+    _embedding_valid() {
+        [[ -s "$1" ]] || return 1
+        [[ "$(head -c 4 "$1" 2>/dev/null)" == "GGUF" ]]
+    }
+    if _embedding_valid "$EMBED_FILE"; then
+        log "Embeddings already downloaded"
+    else
+        command -v curl >/dev/null 2>&1 || error "Offline mode requires curl to download the embedding asset."
+        _embed_tmp="${EMBED_FILE}.tmp.$$"
+        rm -f -- "$_embed_tmp"
+        if ! curl --fail --silent --show-error --location --retry 3 --max-time 3600 \
+            -o "$_embed_tmp" "$EMBED_URL"; then
+            rm -f -- "$_embed_tmp"
+            error "Could not download the required offline embedding asset."
         fi
+        if ! _embedding_valid "$_embed_tmp"; then
+            rm -f -- "$_embed_tmp"
+            error "Downloaded offline embedding asset is missing or not a GGUF file."
+        fi
+        mv -f -- "$_embed_tmp" "$EMBED_FILE" || error "Could not install the offline embedding asset."
     fi
+    # Do not advertise air-gapped readiness until all required assets pass.
+    touch "$INSTALL_DIR/.offline-mode"
 
     # Whisper STT model: Phase 12 pre-downloads it by POSTing to the running
     # Speaches API, but offline-mode users often disconnect BEFORE Phase 12

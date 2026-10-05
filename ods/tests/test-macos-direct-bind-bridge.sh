@@ -370,7 +370,13 @@ eval "$(extract_installer_function _verify_macos_dashboard_host_agent)"
     readiness_key="agent-readiness-secret"
     readiness_log="$TMP_DIR/readiness-ui.log"
     HOST_AGENT_BRIDGE_LOG="$TMP_DIR/host-agent-bridge.log"
-    probe_calls=0
+    # The probe runs on the receiving end of a pipe, in a subshell, so it
+    # records its calls and findings in files rather than variables.
+    probe_log="$TMP_DIR/readiness-probes.log"
+    probe_errors="$TMP_DIR/readiness-probe-errors.log"
+    : > "$probe_log"
+    : > "$probe_errors"
+    probe_calls() { wc -l < "$probe_log" | tr -d ' '; }
     : > "$readiness_log"
     read_env_value() {
         case "$2" in
@@ -390,11 +396,14 @@ eval "$(extract_installer_function _verify_macos_dashboard_host_agent)"
                 esac
                 ;;
             exec)
-                probe_calls=$((probe_calls + 1))
-                [[ "$*" == *"Authorization: Bearer ${readiness_key}"* ]] \
-                    || fail "authenticated readiness omitted the bearer key"
+                printf 'probe\n' >> "$probe_log"
+                # The key arrives on stdin; argv is readable by any local user.
+                [[ "$(cat)" == "Authorization: Bearer ${readiness_key}" && "$*" == *"-H @-"* ]] \
+                    || printf 'authenticated readiness omitted the bearer key\n' >> "$probe_errors"
+                [[ "$*" != *"${readiness_key}"* ]] \
+                    || printf 'authenticated readiness put the bearer key in argv\n' >> "$probe_errors"
                 [[ "$*" == *'/v1/model/status'* ]] \
-                    || fail "authenticated readiness used an unauthenticated endpoint"
+                    || printf 'authenticated readiness used an unauthenticated endpoint\n' >> "$probe_errors"
                 [[ "$readiness_mode" == "probe-ok" ]]
                 ;;
             *) return 2 ;;
@@ -409,26 +418,26 @@ eval "$(extract_installer_function _verify_macos_dashboard_host_agent)"
     if _verify_macos_dashboard_host_agent "$TMP_DIR/fake.env"; then
         fail "missing dashboard-api container passed authenticated readiness"
     fi
-    [[ "$probe_calls" -eq 0 ]] || fail "missing dashboard-api container was probed"
+    [[ "$(probe_calls)" -eq 0 ]] || fail "missing dashboard-api container was probed"
 
     readiness_mode="crashed"
     if _verify_macos_dashboard_host_agent "$TMP_DIR/fake.env"; then
         fail "crashed dashboard-api container passed authenticated readiness"
     fi
-    [[ "$probe_calls" -eq 0 ]] || fail "crashed dashboard-api container was probed"
+    [[ "$(probe_calls)" -eq 0 ]] || fail "crashed dashboard-api container was probed"
 
     readiness_mode="probe-fails"
     readiness_key=""
     if _verify_macos_dashboard_host_agent "$TMP_DIR/fake.env"; then
         fail "empty ODS_AGENT_KEY passed authenticated readiness"
     fi
-    [[ "$probe_calls" -eq 0 ]] || fail "empty ODS_AGENT_KEY reached the host-agent probe"
+    [[ "$(probe_calls)" -eq 0 ]] || fail "empty ODS_AGENT_KEY reached the host-agent probe"
 
     readiness_key="agent-readiness-secret"
     if _verify_macos_dashboard_host_agent "$TMP_DIR/fake.env"; then
         fail "failed authenticated host-agent probe passed readiness"
     fi
-    [[ "$probe_calls" -eq 20 ]] || fail "authenticated readiness did not exhaust its bounded retry budget"
+    [[ "$(probe_calls)" -eq 20 ]] || fail "authenticated readiness did not exhaust its bounded retry budget"
 
     readiness_mode="probe-ok"
     _verify_macos_dashboard_host_agent "$TMP_DIR/fake.env" \
@@ -436,6 +445,7 @@ eval "$(extract_installer_function _verify_macos_dashboard_host_agent)"
     if grep -Fq "$readiness_key" "$readiness_log"; then
         fail "authenticated readiness leaked ODS_AGENT_KEY into installer output"
     fi
+    [[ ! -s "$probe_errors" ]] || fail "$(sort -u "$probe_errors" | paste -sd ';' -)"
 )
 grep -Fq 'if ! _verify_macos_dashboard_host_agent "$INSTALL_DIR/.env"; then' "$INSTALLER" \
     || fail "installer does not require authenticated dashboard-api readiness"
@@ -507,8 +517,10 @@ pass "dashboard-api readiness fails closed and never logs the host-agent key"
         || fail "macOS cloud mode does not select the cloud compose overlay"
     grep -Fq '$CLOUD_MODE && _hermes_model="default"' "$INSTALLER" \
         || fail "cloud rerun does not replace the persisted Hermes model"
-    grep -Fq 'HEALTH_NAMES=("LiteLLM gateway" "Chat UI (Open WebUI)")' "$INSTALLER" \
+    grep -Fq 'HEALTH_NAMES=("LiteLLM gateway")' "$INSTALLER" \
         || fail "cloud verification still waits for native llama-server"
+    grep -Fq '$ENABLE_OPEN_WEBUI && HEALTH_NAMES+=("Chat UI (Open WebUI)")' "$INSTALLER" \
+        || fail "cloud verification cannot check selected Open WebUI"
     grep -Fq "pgrep -f '[/]llama-server'" "$INSTALLER" \
         || fail "cloud transition does not reap install-owned native llama processes"
     stop_line="$(grep -n 'Stopping the old direct native listener before recreating the loopback Colima bridge' "$INSTALLER" | cut -d: -f1)"
@@ -572,12 +584,14 @@ FAKE_PYTHON
         ENV_ODS_MACOS_HOST_GATEWAY="$TEST_GATEWAY"
         ENV_ODS_MODE="local"
         ENV_LLAMA_REASONING="off"
+        ENV_LLAMA_PARALLEL="${TEST_PARALLEL:-}"
         unset ENV_LLAMA_ARG_FLASH_ATTN ENV_LLAMA_ARG_CACHE_TYPE_K \
             ENV_LLAMA_ARG_CACHE_TYPE_V ENV_LLAMA_ARG_N_CPU_MOE \
             ENV_LLAMA_ARG_SPEC_TYPE ENV_LLAMA_ARG_SPEC_DRAFT_N_MAX
     }
     read_env_value() {
         case "$2" in
+            GGUF_FILE) printf 'test.gguf\n' ;;
             ODS_MODE) printf 'local\n' ;;
             BIND_ADDRESS) printf '%s\n' "$TEST_BIND" ;;
             ODS_MACOS_HOST_GATEWAY) printf '%s\n' "$TEST_GATEWAY" ;;
@@ -597,6 +611,18 @@ FAKE_PYTHON
     ai_err() { :; }
     sleep() { command sleep 0.05; }
     curl() { grep -q '^exec' "$EVENT_LOG"; }
+    # Isolate launchd here; its real helper is covered by test_macos_native_service.py.
+    bash() {
+        if [[ "$1" == "$INSTALL_DIR/installers/macos/lib/native-llama-service.sh" ]]; then
+            [[ "$2" == start ]] || return 2
+            local binary="$4" pid_file="$5"
+            shift 5
+            "$binary" "$@"
+            printf '%s\n' "$$" > "$pid_file"
+        else
+            command bash "$@"
+        fi
+    }
 
     run_start_case() {
         local bind_address="$1" gateway_address="$2" expected_route="$3" label="$4"
@@ -624,18 +650,22 @@ FAKE_PYTHON
                 || fail "$label: loopback bridge was not bootstrapped: ${events[1]}"
             [[ "${events[2]}" == launchctl\ \<kickstart\>* ]] \
                 || fail "$label: loopback bridge was not kickstarted: ${events[2]}"
-            [[ "${events[3]}" == exec\ \<--host\>\ \<"$bind_address"\>* ]] \
-                || fail "$label: native llama did not receive bind $bind_address: ${events[3]}"
+            [[ "${events[3]}" == exec\ \<--host\>\ \<127.0.0.1\>* ]] \
+                || fail "$label: UI preference exposed native inference: ${events[3]}"
             [[ "$LAST_BRIDGE_ENABLED" == "true" ]] \
                 || fail "$label: restored bridge state was not persisted"
         fi
+        [[ "${events[${#events[@]}-1]}" == *"<--parallel> <${TEST_PARALLEL:-1}>"* ]] \
+            || fail "$label: native llama parallelism was not preserved"
         pass "$label"
     }
 
-    run_start_case "0.0.0.0" "192.168.106.1" direct "IPv4 wildcard boots out bridge before native llama"
-    run_start_case "::" "192.168.106.1" direct "IPv6 wildcard boots out bridge before native llama"
-    run_start_case "192.168.106.1" "192.168.106.1" direct "gateway bind boots out bridge before native llama"
+    run_start_case "0.0.0.0" "192.168.106.1" bridge "IPv4 LAN preference keeps inference private and restores bridge"
+    run_start_case "::" "192.168.106.1" bridge "IPv6 LAN preference keeps inference private and restores bridge"
+    run_start_case "192.168.106.1" "192.168.106.1" bridge "gateway preference keeps inference private and restores bridge"
     run_start_case "127.0.0.1" "192.168.106.1" bridge "returning to loopback recreates bridge before native llama"
+    TEST_PARALLEL=2
+    run_start_case "0.0.0.0" "192.168.106.1" bridge "explicit native parallelism survives start"
 )
 
 echo "[OK] macOS direct-bind bridge contract holds"

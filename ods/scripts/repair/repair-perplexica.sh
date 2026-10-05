@@ -9,7 +9,7 @@ LLM_MODEL="${2:-qwen3-30b-a3b}"
 PERPLEXICA_MODEL="${PERPLEXICA_MODEL:-}"
 PERPLEXICA_LLM_BASE_URL="${PERPLEXICA_LLM_BASE_URL:-${LLM_API_URL:-http://llama-server:8080}}"
 PERPLEXICA_API_KEY="${PERPLEXICA_API_KEY:-${LITELLM_KEY:-${OPENAI_API_KEY:-no-key}}}"
-_perplexica_switchboard_mode="$(printf '%s' "${ODS_MODEL_SWITCHBOARD:-observe}" | tr '[:upper:]' '[:lower:]')"
+_perplexica_switchboard_mode="$(printf '%s' "${ODS_MODEL_SWITCHBOARD:-enabled}" | tr '[:upper:]' '[:lower:]')"
 if [[ "$_perplexica_switchboard_mode" == "enabled" ]]; then
     : "${PERPLEXICA_MODEL:=ods/current}"
     PERPLEXICA_LLM_BASE_URL="http://litellm:4000/v1"
@@ -21,18 +21,11 @@ case "$PERPLEXICA_LLM_BASE_URL" in
 esac
 
 if [[ -z "$PERPLEXICA_MODEL" ]]; then
-    if [[ -n "${GGUF_FILE:-}" ]]; then
+    if [[ -n "${EXTERNAL_LLM_URL:-}" && -n "${EXTERNAL_LLM_MODEL:-}" ]]; then
+        PERPLEXICA_MODEL="$EXTERNAL_LLM_MODEL"
+    elif [[ -n "${GGUF_FILE:-}" ]]; then
+        # llama-server serves the GGUF file name (--alias) on every runtime.
         PERPLEXICA_MODEL="$GGUF_FILE"
-        # An AMD local install runs Lemonade while LLM_BACKEND stays
-        # "llama-server", so the runtime and the backend have to be checked
-        # independently — same rule as scripts/bootstrap-upgrade.sh and the
-        # container-side extensions/services/perplexica/sync-model-config.js.
-        _perplexica_runtime="$(printf '%s' "${AMD_INFERENCE_RUNTIME:-}" | tr '[:upper:]' '[:lower:]')"
-        _perplexica_backend="$(printf '%s' "${LLM_BACKEND:-}" | tr '[:upper:]' '[:lower:]')"
-        if [[ "$_perplexica_runtime" == "lemonade" || "$_perplexica_backend" == "lemonade" ]]; then
-            PERPLEXICA_MODEL="${LEMONADE_MODEL:-}"
-            [[ -n "$PERPLEXICA_MODEL" ]] || PERPLEXICA_MODEL="extra.$GGUF_FILE"
-        fi
     else
         PERPLEXICA_MODEL="$LLM_MODEL"
     fi
@@ -40,8 +33,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PYTHON_CMD="python3"
-if [[ -f "$SCRIPT_DIR/lib/python-cmd.sh" ]]; then
-    . "$SCRIPT_DIR/lib/python-cmd.sh"
+if [[ -f "$SCRIPT_DIR/../lib/python-cmd.sh" ]]; then
+    . "$SCRIPT_DIR/../lib/python-cmd.sh"
     PYTHON_CMD="$(ods_detect_python_cmd)"
 elif command -v python >/dev/null 2>&1; then
     PYTHON_CMD="python"
@@ -64,7 +57,8 @@ import sys, os, json, urllib.request
 
 config = json.load(sys.stdin)["values"]
 providers = config.get("modelProviders", [])
-openai_prov = next((p for p in providers if p["type"] == "openai"), None)
+openai_index = next((i for i, p in enumerate(providers) if p["type"] == "openai"), None)
+openai_prov = providers[openai_index] if openai_index is not None else None
 transformers_prov = next((p for p in providers if p["type"] == "transformers"), None)
 
 if not openai_prov:
@@ -96,7 +90,9 @@ openai_prov["config"] = {
     "baseURL": base_url,
 }
 openai_prov["chatModels"] = [{"key": model, "name": model}]
-post("modelProviders", providers)
+# GET includes Vane-built-in models. Write only route fields for this provider.
+post(f"modelProviders.{openai_index}.chatModels", openai_prov["chatModels"])
+post(f"modelProviders.{openai_index}.config", openai_prov["config"])
 
 # Set default providers and models
 post("preferences", {

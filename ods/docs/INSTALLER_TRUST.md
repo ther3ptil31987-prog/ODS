@@ -8,9 +8,32 @@ intentionally expose services to your LAN.
 
 ## Install Paths
 
-### Public Linux/macOS Bootstrap
+### Verified stable source (release gate)
 
-The canonical one-liner is:
+The [verified installer preview](VERIFIED_INSTALL_PREVIEW.md) is separate from
+the current public quickstart until qualification passes. It verifies an
+immutable stable release archive before extraction or execution, checking the
+annotated tag and its verified signature, then uses GitHub CLI to constrain the attestation to `Osmantic/ODS`,
+the release workflow, the exact tag and full commit on a GitHub-hosted runner.
+The inspectable command bodies are also in `installers/verified-release.sh`
+and `installers/verified-release.ps1`; tests keep them identical to the preview.
+Public HTTP downloads and local bundle verification do not require GitHub login.
+
+**Rollout gate:** the historical `v3.0.0` release has neither those assets nor
+GitHub's immutable-release flag. The verified installer refuses it without
+touching an existing ODS installation. The first eligible release must be
+produced, tested by the implementation team and explicitly authorized for
+publication before advertising this channel as usable.
+See [Signed Source Releases](SIGNED_SOURCE_RELEASES.md).
+
+The main README retains the existing development-main commands, with their
+unsigned-source limitation stated explicitly. Runtime security fixes can be
+reviewed and merged before this channel changes; SEC-005's default-channel
+requirement remains open until real release qualification and activation.
+
+### Current Linux/macOS Bootstrap (development main)
+
+The hosted development one-liner, used by the README quickstart, is:
 
 ```bash
 curl -fsSL https://install.osmantic.com/ods.sh | bash
@@ -66,12 +89,17 @@ curl -fsSL https://install.osmantic.com/ods.sh | ODS_REF=main bash
 ```
 
 `ODS_REF` can select only refs that contain the current `ods/` product-tree
-layout used by the sparse checkout. The current stable tag, `v2.6.0`, is
-compatible with that layout:
+layout used by the sparse checkout. To pin an audited commit:
 
 ```bash
-curl -fsSL https://install.osmantic.com/ods.sh | ODS_REF=v2.6.0 bash
+curl -fsSL https://install.osmantic.com/ods.sh | ODS_REF=AUDITED_COMMIT_SHA bash
 ```
+
+Do not pin `v3.0.0` for an installation: it is affected by
+[GHSA-vqpg-pvjj-4cmq](https://github.com/Osmantic/ODS/security/advisories/GHSA-vqpg-pvjj-4cmq)
+(critical) and does not contain the fix (`84f4a8a10`). Check the
+[security advisories](https://github.com/Osmantic/ODS/security/advisories)
+before pinning any ref; see [V3 release notes](RELEASE_NOTES_3.0.0.md).
 
 Older tags that predate the current layout must be installed through the
 manual source path below.
@@ -99,16 +127,8 @@ ports and data paths.
 
 ### Manual Source Install
 
-For the stable release tag, clone the known ref and run the installer from the
-checked-out source:
-
-```bash
-git clone --depth 1 --branch v2.6.0 https://github.com/Osmantic/ODS.git
-cd ODS
-./install.sh
-```
-
-For an exact audited commit, use a full clone so Git can resolve the commit:
+To install an exact audited commit, use a full clone so Git can resolve the
+commit:
 
 ```bash
 git clone https://github.com/Osmantic/ODS.git
@@ -134,24 +154,29 @@ or modify the tree before installation.
 
 ### Windows PowerShell Install
 
-Windows users should install from a normal user PowerShell, not an elevated
-Administrator shell:
+Windows has no qualified tagged release. `v3.0.0`'s `install.ps1` runs the
+retired native Docker Desktop installer with Hermes, not the current Ubuntu on
+WSL2 setup, and it is affected by GHSA-vqpg-pvjj-4cmq. Install from `main` with
+the [Windows Quickstart](WINDOWS-QUICKSTART.md), or pin an audited commit from
+a normal user PowerShell (not an elevated Administrator shell):
 
 ```powershell
-git clone --depth 1 --branch v2.6.0 https://github.com/Osmantic/ODS.git
+git clone https://github.com/Osmantic/ODS.git
 cd ODS
+git checkout AUDITED_COMMIT_SHA
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\install.ps1
 ```
 
-The PowerShell installer writes runtime state under `$env:USERPROFILE\ods` by
-default, or `$env:ODS_HOME` if set.
+Setup installs ODS inside Ubuntu on WSL2; the runtime lives in `~/ods` inside
+Ubuntu.
 
-### Desktop Installer
+### Desktop Installer (removed)
 
-The Tauri desktop installer is a convenience wrapper around the source
-installer flow. For maximum provenance control, prefer the manual source
-install until you have reviewed the desktop installer build you are using.
+The repository no longer carries the Tauri desktop installer that lived under
+`installer/`. It was never a supported install path: CI did not build it, no
+release shipped it, and its installer arguments no longer matched the current
+installers. Use the commands above.
 
 ## Inspect Before Running
 
@@ -172,11 +197,14 @@ curl -fsSLo main-get-ods.sh \
 cmp get-ods.sh main-get-ods.sh
 ```
 
-On Windows, clone first and inspect `install.ps1` before running it:
+On Windows, clone the commit you intend to run and inspect the entry points
+first: `install.ps1` hands off to `ods\installers\windows-portal.ps1` and
+`ods\installers\windows\lib\wsl-portal-setup.ps1`.
 
 ```powershell
-git clone --depth 1 --branch v2.6.0 https://github.com/Osmantic/ODS.git
+git clone https://github.com/Osmantic/ODS.git
 cd ODS
+git checkout AUDITED_COMMIT_SHA
 notepad .\install.ps1
 .\install.ps1
 ```
@@ -196,16 +224,21 @@ ODS currently relies on:
 
 ODS does not yet publish a complete signed-release or checksum/SBOM chain for
 every installer artifact. Users who need strict provenance should install from
-a reviewed tag or internal fork and record the exact commit or release tag.
+an audited commit or internal fork and record the exact commit; no published
+tag currently qualifies.
 
 ## Provenance Roadmap
+
+The [signed source release pipeline](SIGNED_SOURCE_RELEASES.md) defines the
+candidate producer and the separately staged verified consumer. It only creates draft
+releases from new, verified signed tags. First-candidate signing, verification
+and installation tests remain required before this chain can be called complete.
 
 1. Publish checksums for release installer artifacts.
 2. Sign release artifacts and tags with maintainer-controlled signing keys.
 3. Publish SBOMs for release artifacts and core container images.
-4. Record build provenance for desktop installer artifacts.
-5. Document the exact validation receipt tied to each release candidate.
-6. Keep inspect-first and manual source install paths available.
+4. Document the exact validation receipt tied to each release candidate.
+5. Keep inspect-first and manual source install paths available.
 
 These are roadmap items, not current guarantees.
 

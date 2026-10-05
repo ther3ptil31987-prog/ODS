@@ -23,12 +23,13 @@ from gpu import (
     get_gpu_info_nvidia_detailed,
     get_gpu_info_windows_host,
     get_gpu_info_windows_host_detailed,
+    get_gpu_info_wsl_host_detailed,
+    get_wsl_gpu_backend,
     _live_env_value,
     read_gpu_topology,
 )
 from models import GPUInfo, IndividualGPU, MultiGPUStatus
 from models import AmdRuntimeStatus
-from lemonade_client import LemonadeClient, LemonadeClientError, LemonadeSettings, normalize_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ _HISTORY_POLL_INTERVAL = 5.0
 
 # Simple per-endpoint TTL caches
 _detailed_cache: dict = {"expires": 0.0, "value": None}
+_detailed_lock = asyncio.Lock()
 _topology_cache: dict = {"expires": 0.0, "value": None}
 _GPU_DETAILED_TTL = 3.0
 _GPU_TOPOLOGY_TTL = 300.0
@@ -84,7 +86,7 @@ def _get_raw_gpus(gpu_backend: str) -> Optional[list[IndividualGPU]]:
     result = get_gpu_info_nvidia_detailed()
     if result:
         return result
-    return get_gpu_info_amd_detailed()
+    return get_gpu_info_amd_detailed() or get_gpu_info_wsl_host_detailed()
 
 
 def _env_int(name: str, default: int = 0) -> int:
@@ -100,15 +102,15 @@ def _env_int(name: str, default: int = 0) -> int:
 def _amd_host_runtime_fallback_gpus() -> Optional[list[IndividualGPU]]:
     """Represent a healthy host-backed AMD runtime when container GPU sysfs is absent.
 
-    Windows Docker Desktop installs route inference through a host Lemonade or
+    Windows Docker Desktop installs route inference through a host
     llama-server process. In that mode dashboard-api cannot read AMD DRM sysfs
     from inside the Linux container, but the runtime is still configured and
     usable. Return a conservative capability/status object instead of 503.
     """
-    runtime = _clean_env("AMD_INFERENCE_RUNTIME").lower()
+    runtime = _amd_runtime_name(_clean_env("AMD_INFERENCE_RUNTIME"))
     location = _clean_env("AMD_INFERENCE_LOCATION").lower()
     runtime_mode = _clean_env("AMD_INFERENCE_RUNTIME_MODE").lower()
-    if runtime not in {"lemonade", "llama-server"} or location != "host":
+    if runtime != "llama-server" or location != "host":
         return None
     if not runtime_mode.startswith("windows"):
         return None
@@ -138,8 +140,7 @@ def _amd_host_runtime_fallback_gpus() -> Optional[list[IndividualGPU]]:
 
     count = max(1, _env_int("GPU_COUNT", 1))
     backend = _clean_env("AMD_INFERENCE_BACKEND").lower() or "unknown"
-    runtime_label = "Lemonade" if runtime == "lemonade" else "llama-server"
-    name = f"AMD {runtime_label} host runtime"
+    name = "AMD llama-server host runtime"
     if backend not in {"", "unknown"}:
         name = f"{name} ({backend})"
 
@@ -166,6 +167,12 @@ def _amd_host_runtime_fallback_gpus() -> Optional[list[IndividualGPU]]:
 
 def _clean_env(name: str) -> str:
     return os.environ.get(name, "").strip()
+
+
+def _amd_runtime_name(value: str) -> str:
+    """Every managed AMD runtime is llama-server; ``lemonade`` reads as it for one release."""
+    runtime = value.strip().lower()
+    return "llama-server" if runtime == "lemonade" else runtime
 
 
 def _join_url(base_url: str, path: str) -> str:
@@ -211,49 +218,25 @@ def _env_bool(name: str) -> bool:
     return _clean_env(name).lower() in {"1", "true", "yes", "on"}
 
 
-def _external_lemonade_active() -> bool:
-    return (
-        _env_bool("LEMONADE_EXTERNAL")
-        or _clean_env("AMD_INFERENCE_RUNTIME_MODE").lower() == "external-lemonade"
-        or _clean_env("AMD_INFERENCE_MANAGED").lower() == "false"
-    )
-
-
-def _runtime_base_url(runtime: str, location: str, port: int) -> str:
-    if runtime == "lemonade" and _external_lemonade_active():
-        external_base = _clean_env("LEMONADE_CONTAINER_BASE_URL") or _clean_env("LEMONADE_BASE_URL")
-        if external_base:
-            external_base = external_base.rstrip("/")
-            for suffix in ("/api/v1", "/v1", "/api"):
-                if external_base.endswith(suffix):
-                    external_base = external_base[: -len(suffix)]
-                    break
-            return external_base
+def _runtime_base_url(location: str, port: int) -> str:
     if location == "host":
+        # The Windows-hosted server as containers reach it; the legacy key
+        # name is read for one release.
+        configured = _clean_env("NATIVE_LLM_CONTAINER_BASE_URL") or _clean_env("LEMONADE_CONTAINER_BASE_URL")
+        if configured:
+            configured = configured.rstrip("/")
+            for suffix in ("/api/v1", "/v1", "/api"):
+                if configured.endswith(suffix):
+                    return configured[: -len(suffix)]
+            return configured
         return f"http://host.docker.internal:{port}"
     if location == "container":
         return f"http://llama-server:{port}"
-    return (
-        _clean_env("OLLAMA_URL")
-        or _clean_env("LLM_URL")
-        or _clean_env("LLM_API_URL")
-        or "http://llama-server:8080"
-    )
-
-
-def _runtime_api_path(runtime: str) -> str:
-    configured = _clean_env("LLM_API_BASE_PATH")
-    if configured:
-        return configured
-    if runtime == "lemonade":
-        return "/api/v1"
-    return "/v1"
-
-
-def _runtime_health_path(runtime: str, api_path: str) -> str:
-    if runtime == "lemonade":
-        return _join_url(api_path, "health")
-    return "/health"
+    for key in ("OLLAMA_URL", "LLM_URL", "LLM_API_URL"):
+        value = _clean_env(key)
+        if value and "litellm" not in value.lower():
+            return value
+    return "http://llama-server:8080"
 
 
 def _probe_amd_health(health_url: str) -> tuple[str, str, Optional[str]]:
@@ -281,47 +264,6 @@ def _probe_amd_health(health_url: str) -> tuple[str, str, Optional[str]]:
     return "unhealthy", version, f"health_http_{status}"
 
 
-def _external_lemonade_warning(prefix: str, exc: LemonadeClientError) -> str:
-    if exc.kind == "provider_unreachable":
-        return f"{prefix}_unreachable"
-    return f"{prefix}_{exc.kind}"
-
-
-def _loaded_model_from_health(payload: dict) -> Optional[str]:
-    for key in ("model_loaded", "loaded_model", "active_model", "model"):
-        value = payload.get(key)
-        if value:
-            return str(value)
-    return None
-
-
-async def _probe_external_lemonade(api_base: str, api_path: str) -> tuple[str, str, list[str], Optional[str], Optional[int]]:
-    settings = LemonadeSettings(
-        base_url=normalize_base_url(api_base, api_path),
-        api_base_path=api_path,
-        api_key=_clean_env("LEMONADE_API_KEY") or _clean_env("LITELLM_LEMONADE_API_KEY"),
-        timeout=2.0,
-    )
-    warnings: list[str] = []
-
-    async with LemonadeClient(settings=settings) as client:
-        try:
-            health_payload = await client.health()
-        except LemonadeClientError as exc:
-            status = "unreachable" if exc.kind in {"provider_unreachable", "timeout"} else "unhealthy"
-            return status, "unknown", [_external_lemonade_warning("health", exc)], None, None
-
-        version = str(health_payload.get("version") or "unknown")
-        loaded_model = _loaded_model_from_health(health_payload)
-        model_count: Optional[int] = None
-        try:
-            model_count = len(await client.models())
-        except LemonadeClientError as exc:
-            warnings.append(_external_lemonade_warning("models", exc))
-
-    return "reachable", version, warnings, loaded_model, model_count
-
-
 # ============================================================================
 # Endpoints
 # ============================================================================
@@ -329,21 +271,32 @@ async def _probe_external_lemonade(api_base: str, api_path: str) -> tuple[str, s
 @router.get("/api/gpu/detailed", response_model=MultiGPUStatus, dependencies=[Depends(verify_api_key)])
 async def gpu_detailed():
     """Per-GPU metrics with service assignment info (cached 3 s)."""
-    now = time.monotonic()
-    if now < _detailed_cache["expires"] and _detailed_cache["value"] is not None:
-        return _detailed_cache["value"]
+    # Multiple dashboard clients can miss the same cache entry. Recheck under
+    # the lock so only one successful probe populates each new snapshot.
+    async with _detailed_lock:
+        if time.monotonic() < _detailed_cache["expires"] and _detailed_cache["value"] is not None:
+            return _detailed_cache["value"]
+        result = await _read_detailed_gpu_status()
+        _detailed_cache["value"] = result
+        _detailed_cache["expires"] = time.monotonic() + _GPU_DETAILED_TTL
+        return result
 
+
+async def _read_detailed_gpu_status() -> MultiGPUStatus:
+    """Discover one complete GPU snapshot without publishing partial results."""
     gpu_backend = os.environ.get("GPU_BACKEND", "").lower() or "nvidia"
     gpus = await asyncio.to_thread(_get_raw_gpus, gpu_backend)
     if not gpus:
         raise HTTPException(status_code=503, detail="No GPU data available")
 
+    if all(gpu.uuid.startswith("luid_0x") for gpu in gpus):
+        gpu_backend = await asyncio.to_thread(get_wsl_gpu_backend)
     aggregate = aggregate_gpu_details(gpus, gpu_backend)
 
     assignment_full = decode_gpu_assignment()
     assignment_data = assignment_full.get("gpu_assignment") if assignment_full else None
 
-    result = MultiGPUStatus(
+    return MultiGPUStatus(
         gpu_count=len(gpus),
         backend=gpu_backend,
         gpus=gpus,
@@ -353,9 +306,6 @@ async def gpu_detailed():
         tensor_split=_live_env_value("LLAMA_ARG_TENSOR_SPLIT") or None,
         aggregate=aggregate,
     )
-    _detailed_cache["expires"] = now + _GPU_DETAILED_TTL
-    _detailed_cache["value"] = result
-    return result
 
 
 @router.get("/api/gpu/topology", dependencies=[Depends(verify_api_key)])
@@ -414,13 +364,14 @@ async def amd_runtime():
     if supported_warning:
         warnings.append(supported_warning)
 
+    runtime = _amd_runtime_name(runtime)
     if not runtime:
-        legacy_backend = _clean_env("LLM_BACKEND").lower()
-        if legacy_backend in {"lemonade", "llama-server"}:
+        legacy_backend = _amd_runtime_name(_clean_env("LLM_BACKEND"))
+        if legacy_backend == "llama-server":
             runtime = legacy_backend
             warnings.append("amd_runtime_env_missing")
     if not selected_backend:
-        selected_backend = _clean_env("LEMONADE_LLAMACPP_BACKEND").lower() or "unknown"
+        selected_backend = "unknown"
         warnings.append("amd_backend_env_missing")
     if not location:
         location = "unknown"
@@ -435,7 +386,7 @@ async def amd_runtime():
     elif selected_backend not in {"", "unknown", "none"} and selected_backend not in supported_backends:
         warnings.append("amd_selected_backend_not_supported")
 
-    if runtime not in {"lemonade", "llama-server"}:
+    if runtime != "llama-server":
         return AmdRuntimeStatus(
             available=False,
             reason="runtime_not_configured",
@@ -454,19 +405,15 @@ async def amd_runtime():
     if port_warning:
         warnings.append(port_warning)
 
-    api_path = _runtime_api_path(runtime)
-    base_url = _runtime_base_url(runtime, location, port)
-    api_base = _join_url(base_url, api_path)
-    health_url = _join_url(base_url, _runtime_health_path(runtime, api_path))
+    # Upstream llama-server: OpenAI routes under /v1, a public /health.
+    base_url = _runtime_base_url(location, port)
+    api_base = _join_url(base_url, "/v1")
+    health_url = _join_url(base_url, "/health")
     loaded_model: Optional[str] = None
     model_count: Optional[int] = None
-    if runtime == "lemonade" and _external_lemonade_active():
-        health, version, probe_warnings, loaded_model, model_count = await _probe_external_lemonade(api_base, api_path)
-        warnings.extend(probe_warnings)
-    else:
-        health, version, health_warning = await asyncio.to_thread(_probe_amd_health, health_url)
-        if health_warning:
-            warnings.append(health_warning)
+    health, version, health_warning = await asyncio.to_thread(_probe_amd_health, health_url)
+    if health_warning:
+        warnings.append(health_warning)
 
     return AmdRuntimeStatus(
         available=True,
@@ -526,23 +473,26 @@ async def gpu_history():
 async def poll_gpu_history() -> None:
     """Background task: append a per-GPU sample to _GPU_HISTORY every 5 s."""
     while True:
+        readings = {}
         try:
             gpu_backend = os.environ.get("GPU_BACKEND", "").lower() or "nvidia"
             gpus = await asyncio.to_thread(_get_raw_gpus, gpu_backend)
             if gpus:
-                sample = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "gpus": {
-                        str(g.index): {
-                            "utilization": g.utilization_percent if g.utilization_available else None,
-                            "memory_percent": g.memory_percent if g.memory_usage_available else None,
-                            "temperature": g.temperature_c if g.temperature_available else None,
-                            "power_w": g.power_w,
-                        }
-                        for g in gpus
-                    },
+                readings = {
+                    str(g.index): {
+                        "utilization": g.utilization_percent if g.utilization_available else None,
+                        "memory_percent": g.memory_percent if g.memory_usage_available else None,
+                        "temperature": g.temperature_c if g.temperature_available else None,
+                        "power_w": g.power_w,
+                    }
+                    for g in gpus
                 }
-                _GPU_HISTORY.append(sample)
         except Exception:  # Broad catch: background task must survive transient failures
             logger.exception("GPU history poll failed")
+        # Advance the bounded window even when discovery is unavailable. The
+        # history endpoint represents absent readings as null, never as zero.
+        _GPU_HISTORY.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "gpus": readings,
+        })
         await asyncio.sleep(_HISTORY_POLL_INTERVAL)

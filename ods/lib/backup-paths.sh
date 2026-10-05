@@ -24,7 +24,6 @@ ODS_USER_DATA_PATHS=(
     "data/open-webui"       # chats, prompts, RAG documents
     "data/n8n"              # workflows and credentials
     "data/qdrant"           # vector collections
-    "data/openclaw"         # agent workspace
     "data/hermes"           # agent state and configuration
     "data/persona"          # Hermes persona (SOUL.md)
     "data/hermes-proxy"     # proxy session state
@@ -39,6 +38,7 @@ ODS_USER_DATA_PATHS=(
     "data/litellm"
     "data/livekit"
     "data/ollama"
+    "data/openclaw"         # removed legacy OpenClaw extension's agent data
 )
 
 # Excluded on purpose. Each entry is a cache that is re-downloaded or
@@ -46,7 +46,21 @@ ODS_USER_DATA_PATHS=(
 # "deliberately skipped" from "forgotten".
 # shellcheck disable=SC2034  # consumed by tests/test-backup-data-coverage.sh
 ODS_BACKUP_EXCLUDED_DATA_PATHS=(
+    "data/hermes-auth"   # startup policy receipt; regenerate from restored seed/config
     "data/models"        # GGUF weights — re-downloadable, tens of GB
-    "data/whisper"       # STT model cache (the cache backup type covers it)
+    "data/whisper"       # STT model cache
+    "data/embeddings"    # TEI model cache
+)
+
+# The cache tier: captured only by `ods backup -t full` and put back by
+# `ods restore`. These are the excluded directories above — large and
+# re-downloadable, so the default user-data backup skips them — but a full
+# backup exists precisely so an install can be moved or rebuilt without
+# downloading tens of GB again. Paths match the compose bind mounts
+# (./data/models:/models, ./data/whisper:<hub cache>, ./data/embeddings:/data).
+# shellcheck disable=SC2034  # consumed by ods-backup.sh and ods-restore.sh
+ODS_BACKUP_CACHE_PATHS=(
+    "data/models"        # GGUF weights served by llama-server
+    "data/whisper"       # faster-whisper Hugging Face hub cache
     "data/embeddings"    # TEI model cache
 )

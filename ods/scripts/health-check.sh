@@ -29,6 +29,11 @@ for arg in "$@"; do
         --quiet) QUIET=true ;;
     esac
 done
+# --json is for machines: stdout must be the JSON document and nothing else,
+# so the human banner and per-check lines (all routed through log) are off.
+if $JSON_OUTPUT; then
+    QUIET=true
+fi
 
 # Config (defaults; .env overrides after load_env_file below)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" 
@@ -96,10 +101,9 @@ _now_ms() {
 test_llm() {
     local start
     start=$(_now_ms)
-    # Lemonade (AMD) serves its OpenAI-compatible API under /api/v1;
-    # llama-server uses /v1. Honor LLM_API_BASE_PATH from .env (written by
-    # phase 06, default /v1) so the probe hits the backend that is actually
-    # running instead of failing on every Lemonade install.
+    # llama-server serves its OpenAI-compatible API under /v1. Honor
+    # LLM_API_BASE_PATH from .env (written by phase 06, default /v1) so the
+    # probe hits the path the configured backend serves.
     local base_path="${LLM_API_BASE_PATH:-/v1}"
     local response
     response=$(curl -sf --max-time $TIMEOUT \

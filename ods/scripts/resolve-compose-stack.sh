@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The tree this resolver ships in; --script-dir may name another install.
+RESOLVER_ROOT="$SCRIPT_DIR"
 TIER="1"
 GPU_BACKEND="nvidia"
 PROFILE_OVERLAYS=""
@@ -10,6 +12,7 @@ SKIP_BROKEN="false"
 GPU_COUNT="1"
 ODS_MODE="${ODS_MODE:-local}"
 SKIP_GPU_OVERLAYS="${ODS_SKIP_GPU_OVERLAYS:-${ODS_SKIP_GPU_OVERLAYS_FOR:-}}"
+ASSUME_ENABLED=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,6 +52,12 @@ while [[ $# -gt 0 ]]; do
             SKIP_GPU_OVERLAYS="${2:-$SKIP_GPU_OVERLAYS}"
             shift 2
             ;;
+        --assume-enabled)
+            # Comma-separated bundled services resolved as if already selected,
+            # so the host agent can download their images before an enable.
+            ASSUME_ENABLED="${2:-}"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1" >&2
             exit 1
@@ -73,7 +82,8 @@ if ! "$PYTHON_CMD" -c 'import yaml' >/dev/null 2>&1; then
     exit 2
 fi
 
-"$PYTHON_CMD" - "$SCRIPT_DIR" "$TIER" "$GPU_BACKEND" "$PROFILE_OVERLAYS" "$ENV_MODE" "$SKIP_BROKEN" "$GPU_COUNT" "$ODS_MODE" "$SKIP_GPU_OVERLAYS" <<'PY'
+ODS_RESOLVE_ASSUME_ENABLED="$ASSUME_ENABLED" \
+"$PYTHON_CMD" - "$SCRIPT_DIR" "$TIER" "$GPU_BACKEND" "$PROFILE_OVERLAYS" "$ENV_MODE" "$SKIP_BROKEN" "$GPU_COUNT" "$ODS_MODE" "$SKIP_GPU_OVERLAYS" "$RESOLVER_ROOT" <<'PY'
 import os
 import pathlib
 import platform
@@ -81,6 +91,8 @@ import sys
 import json
 
 script_dir = pathlib.Path(sys.argv[1])
+# The source tree of this resolver; --script-dir may name another directory.
+resolver_root = pathlib.Path(sys.argv[10])
 tier = (sys.argv[2] or "1").upper()
 gpu_backend = (sys.argv[3] or "nvidia").lower()
 profile_overlays = [x.strip() for x in (sys.argv[4] or "").split(",") if x.strip()]
@@ -88,19 +100,59 @@ env_mode = (sys.argv[5] or "false").lower() == "true"
 skip_broken = (sys.argv[6] or "false").lower() == "true"
 gpu_count = int(sys.argv[7] or "1")
 ods_mode = (sys.argv[8] or os.environ.get("ODS_MODE", "local")).lower()
+# Compatibility read for one release: "lemonade" is the retired name of the
+# managed AMD local mode. Installer reruns and updates migrate it to "local".
+if ods_mode == "lemonade":
+    ods_mode = "local"
 skip_gpu_overlays = {
     x.strip().lower()
     for x in (sys.argv[9] or os.environ.get("ODS_SKIP_GPU_OVERLAYS", "")).split(",")
     if x.strip()
 }
-lemonade_external = (
-    os.environ.get("LEMONADE_EXTERNAL", "").lower() in {"1", "true", "yes", "on"}
-    or (
-        os.environ.get("AMD_INFERENCE_RUNTIME", "").lower() == "lemonade"
-        and os.environ.get("AMD_INFERENCE_MANAGED", "").lower() == "false"
-    )
+if os.environ.get("WHISPER_ACCELERATION", "").strip().lower() == "cpu":
+    skip_gpu_overlays.add("whisper")
+# Bundled services the caller is about to select. Only image preparation asks
+# for this; the selected stack never includes an unselected service.
+assume_enabled = {
+    x.strip() for x in os.environ.get("ODS_RESOLVE_ASSUME_ENABLED", "").split(",") if x.strip()
+}
+def _install_env_value(name):
+    """Return a selector from the caller, else from the installation's .env.
+
+    Installer phases export their current choice (an empty value included)
+    before .env is rewritten; ods-cli exports .env. The host agent passes only
+    a fixed selector list, so a selector missing from the environment is read
+    from the installed .env.
+    """
+    if name in os.environ:
+        return os.environ[name].strip()
+    env_path = script_dir / ".env"
+    if not env_path.is_file():
+        return ""
+    sys.path.insert(0, str(resolver_root / "extensions/services/dashboard-api"))
+    from env_values import parse_env_value
+    value = ""
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        key, separator, raw = line.partition("=")
+        if separator and key.strip() == name:
+            value = parse_env_value(raw).strip()
+    return value
+
+
+# An ODS-managed llama-server outside this stack (the Windows Portal runs
+# llama-server.exe while this stack runs in WSL). Its origin, not the
+# credential, selects the overlay.
+host_native = bool(_install_env_value("NATIVE_LLM_BASE_URL"))
+# The host agent passes only a presence marker, keeping an upstream URL that
+# may contain credentials out of the resolver child process. Installer calls
+# without the marker retain their existing EXTERNAL_LLM_URL behavior.
+external_selection = os.environ.get("ODS_EXTERNAL_LLM_SELECTED")
+external_llm = (
+    external_selection.lower() == "true" if external_selection is not None
+    else bool(os.environ.get("EXTERNAL_LLM_URL", "").strip())
 )
-external_llm = bool(os.environ.get("EXTERNAL_LLM_URL", "").strip())
+gateway_only = os.environ.get("ODS_GATEWAY_ONLY", "").lower() == "true"
+enable_open_webui = os.environ.get("ENABLE_OPEN_WEBUI", "true").lower() == "true"
 
 IS_DARWIN = platform.system() == "Darwin"
 APPLE_OVERLAY = "installers/macos/docker-compose.macos.yml" if IS_DARWIN else "docker-compose.apple.yml"
@@ -112,19 +164,20 @@ def existing(overlays):
 resolved = []
 primary = "docker-compose.yml"
 
-if profile_overlays and existing(profile_overlays):
+# An ODS-managed host-native runtime owns inference selection, even when
+# hardware detection supplied a local CPU/AMD/NVIDIA profile to the installer.
+if host_native and ods_mode != "cloud" and not external_llm:
+    # The model stays local and switchable. The cloud overlay would profile
+    # model-router out and can leave a stale router container serving Pixel
+    # after reinstall; this overlay disables only the in-stack llama-server.
+    if not existing(["docker-compose.base.yml", "docker-compose.host-native-llm.yml"]):
+        print("ERROR: NATIVE_LLM_BASE_URL is set but docker-compose.host-native-llm.yml is missing", file=sys.stderr)
+        sys.exit(1)
+    resolved = ["docker-compose.base.yml", "docker-compose.host-native-llm.yml"]
+    primary = "docker-compose.host-native-llm.yml"
+elif profile_overlays and existing(profile_overlays):
     resolved = profile_overlays
     primary = profile_overlays[-1]
-elif lemonade_external and ods_mode == "lemonade":
-    if existing(["docker-compose.base.yml", "docker-compose.cloud.yml", "docker-compose.lemonade-external.yml"]):
-        resolved = ["docker-compose.base.yml", "docker-compose.cloud.yml", "docker-compose.lemonade-external.yml"]
-        primary = "docker-compose.lemonade-external.yml"
-    elif existing(["docker-compose.base.yml", "docker-compose.cloud.yml"]):
-        resolved = ["docker-compose.base.yml", "docker-compose.cloud.yml"]
-        primary = "docker-compose.cloud.yml"
-    elif existing(["docker-compose.base.yml"]):
-        resolved = ["docker-compose.base.yml"]
-        primary = "docker-compose.base.yml"
 elif ods_mode == "cloud" or tier == "CLOUD":
     if existing(["docker-compose.base.yml", "docker-compose.cloud.yml"]):
         resolved = ["docker-compose.base.yml", "docker-compose.cloud.yml"]
@@ -182,6 +235,20 @@ else:
 if not resolved:
     resolved = [primary]
 
+# The ROCm image replaces the Vulkan default when selected. It is layered after
+# docker-compose.amd.yml (also when a hardware profile chose that overlay) so
+# /dev/dri and the GPU groups still come from there.
+if "docker-compose.amd.yml" in resolved:
+    amd_inference_backend = _install_env_value("AMD_INFERENCE_BACKEND").lower() or "vulkan"
+    if amd_inference_backend not in {"vulkan", "rocm"}:
+        print(f"ERROR: AMD_INFERENCE_BACKEND must be vulkan or rocm, got {amd_inference_backend!r}", file=sys.stderr)
+        sys.exit(1)
+    if amd_inference_backend == "rocm" and "docker-compose.amd-rocm.yml" not in resolved:
+        if not (script_dir / "docker-compose.amd-rocm.yml").exists():
+            print("ERROR: AMD_INFERENCE_BACKEND=rocm but docker-compose.amd-rocm.yml is missing", file=sys.stderr)
+            sys.exit(1)
+        resolved.insert(resolved.index("docker-compose.amd.yml") + 1, "docker-compose.amd-rocm.yml")
+
 # A generated auth file is an override, never a primary/profile input. Remove
 # stale cached occurrences before extension discovery so it cannot make a
 # partial core service appear to exist or influence overlay eligibility.
@@ -214,16 +281,6 @@ _LOOPBACK_VAR_DEFAULT_RE = re.compile(
     r"^\$\{[A-Za-z_][A-Za-z0-9_]*:-127\.0\.0\.1\}$",
 )
 
-# Capabilities and security_opt strings that grant container escape primitives.
-_DANGEROUS_CAPS = {
-    "SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "NET_RAW",
-    "DAC_OVERRIDE", "SETUID", "SETGID", "SYS_MODULE",
-    "SYS_RAWIO", "ALL",
-}
-_DANGEROUS_SECURITY_OPTS = {
-    "seccomp:unconfined", "apparmor:unconfined", "label:disable",
-}
-
 # Core service IDs — user extensions must not declare services with these names
 # (would shadow the built-in services in the compose merge). Mirrors the
 # dashboard-api install endpoint's CORE_SERVICE_IDS / skip_name_collision check
@@ -240,16 +297,16 @@ except (OSError, ValueError):
     _CORE_SERVICE_IDS = {
         "ape", "comfyui", "dashboard", "dashboard-api",
         "embeddings", "langfuse", "litellm", "llama-server", "n8n",
-        "open-webui", "openclaw", "perplexica", "privacy-shield", "qdrant",
+        "open-webui", "perplexica", "privacy-shield", "qdrant",
         "remote-provider-egress", "remote-provider-ssh-tunnel",
         "searxng", "token-spy", "tts", "whisper",
     }
 
 
-def _host_part_is_loopback(host):
-    if host == "127.0.0.1":
-        return True
-    return bool(_LOOPBACK_VAR_DEFAULT_RE.fullmatch(host))
+def _host_part_is_loopback(host: str) -> bool:
+    # An environment override can turn a loopback default into a public bind.
+    # Reject old interpolated recipes; do not rewrite their approved contents.
+    return host == "127.0.0.1"
 
 
 def _split_port_host(port_str):
@@ -267,34 +324,709 @@ def _split_port_host(port_str):
     return host, rest
 
 
-def _scan_user_compose_content(compose_path):
+_extension_build_contexts = {}
+
+
+def verify_source_runtime(candidate, service):
+    """Enforce the source sandbox at proposal, publication and re-enable time.
+
+    Defaults in the generator alone are insufficient: a proposed Dockerfile
+    can omit USER and a saved recipe may be edited before a restart.
+    """
+    target = candidate.get('manifest', {}).get('service', {}).get('id', '')
+    network = target + '-sandbox'
+    uid = str(service.get('user', ''))
+    if not re.fullmatch(r'[1-9][0-9]*(?::[1-9][0-9]*)?', uid):
+        raise ValueError('Source runtime requires an explicit non-root numeric user')
+    if (service.get('cap_drop') != ['ALL'] or service.get('cap_add')
+            or service.get('security_opt') != ['no-new-privileges:true']
+            or service.get('read_only') is not True):
+        raise ValueError('Source runtime requires read-only, capability-free confinement')
+    if (service.get('networks') != [network] or 'network_mode' in service
+            or candidate['compose'].get('networks', {}).get(network) != {'internal': True}):
+        raise ValueError('Source runtime requires its own internal sandbox network')
+    if service.get('ports'):
+        # An internal network cannot publish ports, so this service would be
+        # unreachable. Web-service source recipes are refused at generation.
+        raise ValueError('Source runtime cannot publish ports: its sandbox network is internal')
+    cpus, pids = service.get('cpus'), service.get('pids_limit')
+    memory = service.get('mem_limit')
+    if (isinstance(cpus, bool) or not isinstance(cpus, (int, float)) or not 0 < cpus <= 32
+            or isinstance(pids, bool) or not isinstance(pids, int) or not 0 < pids <= 4096
+            or not isinstance(memory, str) or not re.fullmatch(r'[1-9][0-9]*(?:m|g)', memory.lower())):
+        raise ValueError('Source runtime requires bounded CPU, memory and PID limits')
+    memory_mib = int(memory[:-1]) * (1024 if memory[-1].lower() == 'g' else 1)
+    if memory_mib > 32768:
+        raise ValueError('Source runtime memory limit exceeds 32 GiB')
+
+
+def _extension_build_context(compose_path, build):
+    """Accept bounded build inputs; never forward arbitrary host paths/options."""
+    root = script_dir / "data" / "user-extensions"
+    directory = compose_path.parent
+    if directory.parent.resolve() != root.resolve() or directory.is_symlink():
+        raise ValueError("build must belong to an installed extension")
+    if isinstance(build, str):
+        build = {"context": build}
+    if not isinstance(build, dict):
+        raise ValueError("unsupported build options")
+    context = build.get("context", ".")
+    if isinstance(context, str) and context.startswith("https://github.com/"):
+        # The API publishes commit-bound GitHub recipes. Preserve their remote
+        # context across Windows/Linux/macOS rather than treating it as a path.
+        # Revalidate the complete installed recipe before forwarding to Docker.
+        import hashlib
+        from urllib.parse import urlsplit
+        if set(build) - {"context", "dockerfile", "dockerfile_inline", "target"}:
+            raise ValueError("unsupported remote build options")
+        parsed = urlsplit(context)
+        match = re.fullmatch(r"/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9][A-Za-z0-9._-]{0,99})\.git", parsed.path)
+        revision, separator, subdir = parsed.fragment.partition(":")
+        if (parsed.netloc != "github.com" or parsed.query or not match
+                or not re.fullmatch(r"[a-f0-9]{40}", revision) or (separator and not subdir)):
+            raise ValueError("remote build requires an immutable public GitHub commit")
+        repository = "https://github.com/" + match[1] + "/" + match[2]
+        for name in ("upstream.json", "manifest.yaml", compose_path.name):
+            source = directory / name
+            if source.is_symlink() or not source.is_file() or source.stat().st_size > 524288:
+                raise ValueError("invalid installed recipe file")
+        upstream = json.loads((directory / "upstream.json").read_text(encoding="utf-8"))
+        manifest = yaml.safe_load((directory / "manifest.yaml").read_text(encoding="utf-8"))
+        compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+        if (not isinstance(upstream, dict) or upstream.get("origin") != "github-proposal"
+                or not isinstance(upstream.get("repository"), str)
+                or upstream["repository"].rstrip("/").removesuffix(".git").lower() != repository.lower()
+                or upstream.get("commit") != revision):
+            raise ValueError("remote build does not match installed provenance")
+        if not isinstance(manifest, dict) or not isinstance(compose, dict) or not isinstance(compose.get("services"), dict):
+            raise ValueError("invalid source recipe documents")
+        candidate = {"repository": upstream["repository"], "commit": revision, "manifest": manifest, "compose": compose}
+        for definition in compose['services'].values():
+            if not isinstance(definition, dict):
+                raise ValueError('Source runtime service must be a mapping')
+            verify_source_runtime(candidate, definition)
+        digest = hashlib.sha256(json.dumps(candidate, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        if upstream.get("recipeDigest") != digest:
+            raise ValueError("installed source recipe changed")
+        dockerfile = build.get("dockerfile", "Dockerfile")
+        for value, required in ((subdir, False), (dockerfile, True)):
+            if (not isinstance(value, str) or len(value) > 256 or (required and not value)
+                    or (value and any(not re.fullmatch(r"[A-Za-z0-9_.-]+", part)
+                                      or part in {".", ".."} for part in value.split("/")))):
+                raise ValueError("Dockerfile must stay inside the source context")
+        target = build.get("target")
+        if target is not None and (not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", target)):
+            raise ValueError("invalid build target")
+        inline = build.get("dockerfile_inline")
+        if "dockerfile_inline" in build and ("dockerfile" in build or not isinstance(inline, str)
+                or not inline.strip() or len(inline.encode("utf-8")) > 24576
+                or any(ord(char) < 32 and char not in "\n\r\t" for char in inline)
+                or "$" in re.findall(r"\$\$|\$", inline)):
+            raise ValueError("invalid inline Dockerfile")
+        receipts = upstream.get("sourceFiles")
+        if not isinstance(receipts, list):
+            raise ValueError("missing source build evidence")
+        matched = False
+        for service_name, service in compose["services"].items():
+            if not isinstance(service, dict) or service.get("build") != build:
+                continue
+            matched = True
+            if service.get("image") != f"ods-source-{service_name}:{revision}" or service.get("pull_policy") != "never":
+                raise ValueError("source image must be owned and commit-bound")
+            receipt = next((item for item in receipts if isinstance(item, dict) and item.get("service") == service_name), None)
+            if inline is not None:
+                expected = {"service": service_name, "kind": "proposed-dockerfile", "sha256": hashlib.sha256(inline.encode("utf-8")).hexdigest()}
+                if receipt != expected:
+                    raise ValueError("inline Dockerfile evidence changed")
+            elif (not isinstance(receipt, dict) or receipt.get("path") != "/".join(filter(None, (subdir, dockerfile)))
+                    or not isinstance(receipt.get("blob"), str) or not re.fullmatch(r"[a-f0-9]{40}", receipt["blob"])):
+                raise ValueError("upstream Dockerfile evidence changed")
+        if not matched:
+            raise ValueError("source build absent from installed recipe")
+        return context
+    if set(build) - {"context", "dockerfile", "target", "args"}:
+        raise ValueError("unsupported build options")
+    if not isinstance(context, str) or "$" in context or ("\\" in context and os.name != "nt"):
+        raise ValueError("invalid build context")
+    # The API stages files in its /data mount. Resolve that precise alias on
+    # the host; Linux, macOS and Windows do not share the container's root.
+    alias = "/data/user-extensions/" + directory.name
+    if context == alias or context.startswith(alias + "/"):
+        context = "." + context[len(alias):]
+    candidate = pathlib.Path(context)
+    if not candidate.is_absolute():
+        candidate = directory / candidate
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(directory.resolve()) or not resolved.is_dir():
+        raise ValueError("build context escapes extension or is missing")
+    dockerfile = build.get("dockerfile", "Dockerfile")
+    if not isinstance(dockerfile, str) or "$" in dockerfile or ("\\" in dockerfile and os.name != "nt"):
+        raise ValueError("invalid Dockerfile path")
+    source = resolved / dockerfile
+    if not source.resolve().is_relative_to(resolved) or not source.is_file():
+        raise ValueError("Dockerfile escapes context or is missing")
+    # Build contexts may otherwise follow links outside their permitted tree.
+    for entry in resolved.rglob("*"):
+        if entry.is_symlink() or not entry.resolve().is_relative_to(resolved):
+            raise ValueError("symlinks are not supported in extension builds")
+    args = build.get("args", {})
+    if not isinstance(args, dict) or any(not isinstance(k, str) or not isinstance(v, (str, int, float, bool)) for k, v in args.items()):
+        raise ValueError("build arguments must have explicit values")
+    target = build.get("target")
+    if target is not None and (not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", target)):
+        raise ValueError("invalid build target")
+    return str(resolved)
+
+
+# The only extra_hosts entry a curated library recipe may declare. Mirrors
+# dashboard-api _scan_compose_content(allowed_trusted_extra_hosts). No recipe
+# in the library declares it any more; the route stays for curated recipes
+# installed before GAIA left the library, which still do, so they keep
+# resolving.
+_TRUSTED_LIBRARY_EXTRA_HOSTS = {"host.docker.internal:host-gateway"}
+
+# Accelerator access a curated library recipe may request, only from its own
+# backend overlay and only in the shapes ODS core uses for GPU workloads: the
+# AMD overlays pass /dev/dri (and /dev/kfd for ROCm) through unchanged, and
+# docker-compose.nvidia.yml plus the comfyui/whisper overlays reserve driver
+# nvidia with capabilities [gpu] by count or device_ids. Mirrors dashboard-api
+# _TRUSTED_LIBRARY_AMD_DEVICES / _is_ods_nvidia_gpu_reservation.
+_TRUSTED_LIBRARY_AMD_DEVICES = {"/dev/kfd:/dev/kfd", "/dev/dri:/dev/dri"}
+_NVIDIA_DEVICE_ID_RE = re.compile(r"[A-Za-z0-9_.:${}-]+")
+
+
+def _is_ods_nvidia_gpu_reservation(entry):
+    """True for one reservations.devices entry in the shape ODS core writes."""
+    if not isinstance(entry, dict) or set(entry) - {"driver", "capabilities", "count", "device_ids"}:
+        return False
+    if entry.get("driver") != "nvidia" or entry.get("capabilities") != ["gpu"]:
+        return False
+    if "count" in entry and "device_ids" in entry:
+        return False
+    count = entry.get("count", "all")
+    if count != "all" and not (type(count) is int and count >= 1):
+        return False
+    device_ids = entry.get("device_ids", ["all"])
+    return isinstance(device_ids, list) and bool(device_ids) and all(
+        isinstance(item, str) and _NVIDIA_DEVICE_ID_RE.fullmatch(item) for item in device_ids)
+
+
+# >>> shared compose policy >>>
+# One rule set for both extension compose validators: dashboard-api
+# routers/extensions.py:_scan_compose_content (install and enable time) and
+# scripts/resolve-compose-stack.sh:_scan_user_compose_content (every `ods`
+# command). This block is byte-identical in the two files, and
+# dashboard-api tests/test_compose_policy_parity.py fails when they drift.
+#
+# The validators read PyYAML values, but Docker Compose decides what runs, so
+# every rule judges a value the way Compose resolves it and fails closed where
+# the file alone cannot decide:
+#   * Compose casts the strings true/yes/y/on (any case) to boolean true, so
+#     only an explicit false passes a boolean guard.
+#   * Compose substitutes ${VAR}, ${VAR:-default} and $VAR from the owner's
+#     environment when it renders the project. A guarded value that
+#     interpolates is rejected; the only exceptions are exact shapes ODS core
+#     itself uses (the GPU group ids, the install owner's uid:gid, and the
+#     accelerator and port shapes checked by each validator).
+#   * include:, extends:, env_file, volumes_from, secrets and configs pull
+#     other files, host paths or containers into a service outside this scan.
+#   * Compose resolves every relative bind source against the project
+#     directory, which is the ODS install directory (the first -f file), not
+#     the extension's own directory: ./.env there is the owner's secrets and
+#     ./scripts is code the ods CLI runs on the host. An imported recipe may
+#     bind only its own ./data/<id> and ./config/<id>, and never when <id>
+#     names a folder ODS keeps there itself (_COMPOSE_POLICY_RESERVED_NAMES).
+#   * PyYAML keeps the last of two duplicate keys and Compose refuses them;
+#     the loader refuses them too instead of judging a value Compose never
+#     sees.
+_COMPOSE_POLICY_FALSE = frozenset({"false", "no", "n", "off"})
+# Folders under ./data and ./config that belong to ODS itself, or to a
+# shipped extension whose folder differs from its id. No extension may use
+# one of these names as its id, because ./data/<id> and ./config/<id> are
+# where an extension's own files go.
+_COMPOSE_POLICY_RESERVED_NAMES = frozenset({
+    "auth", "backends", "backups", "config", "config-backups", "data",
+    "extension-progress", "extensions-library", "hermes-auth",
+    "installer-backups", "models", "openclaw", "paperless", "persona",
+    "piper", "pixel", "pixel-chat-results", "pixel-native",
+    "pixel-providers", "remote-provider", "state", "system-tuning",
+    "user-extensions",
+})
+# Top-level keys an extension compose file may declare (plus x-* fields).
+_COMPOSE_POLICY_TOP_LEVEL = frozenset({"services", "volumes", "networks", "version"})
+_COMPOSE_POLICY_TOP_LEVEL_REASONS = {
+    "include": "pulls in other Compose files",
+    "name": "renames the whole Compose project",
+    "secrets": "reads host files as secrets",
+    "configs": "reads host files as configs",
+}
+# Service keys that reach host files, other containers, host code or the
+# runtime outside what this scan can judge. No shipped recipe uses them.
+_COMPOSE_POLICY_DENIED_SERVICE_KEYS = {
+    "extends": "extends another service definition",
+    "env_file": "reads an env_file from the host",
+    "label_file": "reads a label_file from the host",
+    "volumes_from": "mounts another container's volumes",
+    "secrets": "mounts Compose secrets",
+    "configs": "mounts Compose configs",
+    "device_cgroup_rules": "declares device_cgroup_rules",
+    "cgroup_parent": "sets cgroup_parent",
+    "credential_spec": "reads a credential_spec",
+    "annotations": "sets runtime annotations",
+    "develop": "syncs host files with develop",
+    "post_start": "runs a post_start lifecycle hook",
+    "pre_stop": "runs a pre_stop lifecycle hook",
+    "provider": "runs a host provider plugin",
+    "models": "attaches Docker models",
+}
+# Namespace modes: "host" shares the host's namespace; container:/service:
+# joins another container's (a core service's secrets and loopback ports).
+_COMPOSE_POLICY_NAMESPACES = (
+    ("network_mode", "network mode"),
+    ("pid", "PID namespace"),
+    ("ipc", "IPC namespace"),
+    ("uts", "UTS namespace"),
+    ("userns_mode", "user namespace"),
+    ("cgroup", "cgroup namespace"),
+)
+# Docker's default capability set, minus the defaults ODS always refused
+# (DAC_OVERRIDE, NET_RAW, SETGID, SETUID). Adding one of these is harmless;
+# any other capability (SYS_ADMIN, DAC_READ_SEARCH, BPF, ...) is refused.
+_COMPOSE_POLICY_ALLOWED_CAPS = frozenset({
+    "AUDIT_WRITE", "CHOWN", "FOWNER", "FSETID", "KILL", "MKNOD",
+    "NET_BIND_SERVICE", "SETFCAP", "SETPCAP", "SYS_CHROOT",
+})
+# Every other security_opt (seccomp/apparmor/systempaths=unconfined,
+# label=disable or type:spc_t, a seccomp profile path, writable-cgroups)
+# relaxes confinement.
+_COMPOSE_POLICY_SECURITY_OPTS = frozenset({
+    "no-new-privileges", "no-new-privileges:true", "no-new-privileges=true",
+    "no-new-privileges:false", "no-new-privileges=false",
+})
+# The render/video groups ODS core adds beside its AMD /dev/kfd and /dev/dri
+# passthrough (docker-compose.amd.yml). A curated recipe may add them only in
+# the overlay that holds that passthrough.
+_COMPOSE_POLICY_GPU_GROUPS = frozenset({"${VIDEO_GID:-44}", "${RENDER_GID:-992}"})
+# The install owner, as ODS core and curated recipes write it.
+_COMPOSE_POLICY_OWNER_USER_RE = re.compile(r"\$\{ODS_UID:-[1-9][0-9]*\}(?::\$\{ODS_GID:-[0-9]+\})?")
+_COMPOSE_POLICY_ROOT_UID_RE = re.compile(r"[+-]?[0-9]+")
+_COMPOSE_POLICY_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/]|[\\/]{2}")
+_COMPOSE_POLICY_RESERVATION_KEYS = frozenset({"cpus", "memory", "devices"})
+_COMPOSE_POLICY_NETWORK_KEYS = frozenset({"external", "name", "internal", "labels"})
+# Networks docker-compose.base.yml declares for the remote-provider egress
+# boundary. Compose merges every -f file into one project, so an extension
+# that declared or referenced one of these keys would join it and reach the
+# egress or the SSH tunnel. Only built-in LiteLLM joins them.
+_COMPOSE_POLICY_CORE_NETWORKS = frozenset({"remote-provider", "remote-provider-outbound"})
+_COMPOSE_POLICY_VOLUME_KEYS = frozenset({"labels"})
+_COMPOSE_POLICY_MARKER_MAX_BYTES = 524288
+# A Compose file with every alias expanded; ODS's largest is a few hundred
+# nodes. Bounds alias bombs before anything walks the parsed document.
+_COMPOSE_POLICY_MAX_NODES = 100000
+
+
+class _ComposePolicyLoader(yaml.SafeLoader):
+    """SafeLoader that refuses duplicate mapping keys, as Compose does."""
+
+    def _refuse_duplicate_keys(self, node):
+        # SafeConstructor.flatten_mapping rewrites a mapping node in place
+        # (merged keys first, then its own), so judge each node once, on the
+        # keys its author wrote, before that happens. A layered merge
+        # (x-b: {<<: *a, restart: always}) then merged again is not a
+        # duplicate.
+        checked = self.__dict__.setdefault("_compose_policy_checked", set())
+        if id(node) in checked:
+            return
+        checked.add(id(node))
+        seen = set()
+        for key_node, value_node in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                merged = value_node.value if isinstance(value_node, yaml.SequenceNode) else [value_node]
+                for item in merged:
+                    if isinstance(item, yaml.MappingNode):
+                        self._refuse_duplicate_keys(item)
+                continue
+            if not isinstance(key_node, yaml.ScalarNode):
+                continue
+            key = self.construct_object(key_node, deep=True)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping", node.start_mark,
+                    f"found duplicate key {key!r}", key_node.start_mark)
+            seen.add(key)
+
+    def construct_mapping(self, node, deep=False):
+        if isinstance(node, yaml.MappingNode):
+            self._refuse_duplicate_keys(node)
+        return super().construct_mapping(node, deep=deep)
+
+
+def _compose_policy_bound_expansion(data):
+    """ValueError when data refers to itself or, with every alias expanded,
+    exceeds _COMPOSE_POLICY_MAX_NODES. Linear in the parsed (shared) size."""
+    sizes, active, pending = {}, set(), [(data, False)]
+    while pending:
+        item, finished = pending.pop()
+        if not isinstance(item, (dict, list)) or (not finished and id(item) in sizes):
+            continue
+        children = [*item.keys(), *item.values()] if isinstance(item, dict) else item
+        if finished:
+            active.discard(id(item))
+            sizes[id(item)] = 1 + sum(sizes[id(child)] if isinstance(child, (dict, list)) else 1
+                                      for child in children)
+            if sizes[id(item)] > _COMPOSE_POLICY_MAX_NODES:
+                raise ValueError("document expands beyond %d nodes (excessive aliasing)"
+                                 % _COMPOSE_POLICY_MAX_NODES)
+            continue
+        if id(item) in active:
+            raise ValueError("self-referencing anchor")
+        active.add(id(item))
+        pending.append((item, True))
+        pending.extend((child, False) for child in children if isinstance(child, (dict, list)))
+
+
+def _compose_policy_load(text):
+    """Parse one Compose document; ValueError for anything not judgeable.
+
+    That is invalid YAML, several documents, a duplicate key, Compose's own
+    !reset/!override tags (unknown to SafeLoader), self-referencing anchors,
+    alias bombs and unboundedly nested structures.
+    """
+    try:
+        data = yaml.load(text, Loader=_ComposePolicyLoader)  # noqa: S506 - SafeLoader subclass
+        _compose_policy_bound_expansion(data)
+    except (yaml.YAMLError, RecursionError, MemoryError, ValueError) as exc:
+        raise ValueError(str(exc) or type(exc).__name__) from None
+    return data
+
+
+def _compose_policy_interpolates(value):
+    """True when Compose would substitute into any string within value."""
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            if "$" in item.replace("$$", ""):
+                return True
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+    return False
+
+
+def _compose_policy_false(value):
+    """True when Compose reads value as boolean false (absent counts)."""
+    if value is None or value is False:
+        return True
+    return (isinstance(value, str) and not _compose_policy_interpolates(value)
+            and value.strip().lower() in _COMPOSE_POLICY_FALSE)
+
+
+def _compose_policy_list(name, key, value, problems):
+    """value as a list, or None after recording that Compose would not see one."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    problems.append(f"service '{name}' {key} must be a list")
+    return None
+
+
+def _compose_policy_volume_problems(name, volumes, *, builtin, namespace):
+    problems = []
+    for volume in _compose_policy_list(name, "volumes", volumes, problems) or []:
+        if isinstance(volume, dict):
+            source = volume.get("source")
+            source = "" if source is None else str(source)
+            spec = volume
+            host_path = volume.get("type") == "bind"
+        elif isinstance(volume, str):
+            source = volume.split(":", 1)[0]
+            spec = volume
+            host_path = source.startswith(".")
+        else:
+            problems.append(f"service '{name}' has an unsupported volume entry")
+            continue
+        text = str(spec)
+        if "docker.sock" in text or "docker_engine" in text:
+            problems.append(f"service '{name}' has a Docker socket mount")
+        # Built-in extensions ship with ODS; litellm selects its config file
+        # from the owner's ODS_MODE. User and library files may not choose a
+        # host path at render time.
+        if not builtin and _compose_policy_interpolates(spec):
+            problems.append(f"service '{name}' volume '{text}' chooses its source with ${{...}} interpolation")
+            continue
+        if isinstance(volume, str) and _COMPOSE_POLICY_WINDOWS_PATH_RE.match(volume):
+            source = volume.rsplit(":", 1)[0] if volume.count(":") > 1 else volume
+        if source.startswith(("/", "~")) or _COMPOSE_POLICY_WINDOWS_PATH_RE.match(source):
+            problems.append(f"service '{name}' bind-mounts absolute host path '{source}'")
+        elif ".." in source.replace("\\", "/").split("/"):
+            problems.append(
+                f"service '{name}' bind-mounts relative host path '{source}' escaping the project directory")
+        elif host_path:
+            parts = [part for part in source.replace("\\", "/").split("/") if part not in ("", ".")]
+            if not parts or parts[0].startswith(".") or parts in (["data"], ["config"]):
+                problems.append(f"service '{name}' bind-mounts the ODS install directory or its "
+                                f"secrets ('{source}')")
+            elif namespace is not None and namespace in _COMPOSE_POLICY_RESERVED_NAMES:
+                problems.append(f"service '{name}' bind-mounts '{source}', but '{namespace}' "
+                                f"names a folder ODS keeps for itself")
+            elif namespace is not None and (len(parts) < 2 or parts[0] not in ("data", "config")
+                                            or parts[1] != namespace):
+                problems.append(f"service '{name}' bind-mounts '{source}' outside its own "
+                                f"./data/{namespace} and ./config/{namespace}")
+    return problems
+
+
+def _compose_policy_service_problems(name, service, *, own_services, accelerator=None,
+                                     builtin=False, check_root_user=True, namespace=None):
+    """Policy problems of one service definition (an empty list passes).
+
+    ``accelerator`` is the backend whose GPU this file may request: the
+    caller passes it only for a curated recipe's own compose.<backend>.yaml.
+    ``builtin`` is for ODS's own extensions (read-only EXTENSIONS_DIR).
+    ``namespace`` is the extension id of an untrusted (imported) recipe,
+    whose relative bind mounts must stay in ./data/<id> or ./config/<id>.
+    """
+    problems = []
+    for key, reason in _COMPOSE_POLICY_DENIED_SERVICE_KEYS.items():
+        if key in service:
+            problems.append(f"service '{name}' {reason}")
+    if not _compose_policy_false(service.get("privileged")):
+        problems.append(f"service '{name}' uses privileged mode")
+    if not _compose_policy_false(service.get("use_api_socket")):
+        problems.append(f"service '{name}' mounts the Docker API socket (use_api_socket)")
+    for key, label in _COMPOSE_POLICY_NAMESPACES:
+        mode = service.get(key)
+        if mode is None:
+            continue
+        if not isinstance(mode, str) or _compose_policy_interpolates(mode):
+            problems.append(f"service '{name}' {key} must be a literal string")
+            continue
+        normalized = mode.strip().lower()
+        kind, _, target = mode.strip().partition(":")
+        if normalized == "host":
+            problems.append(f"service '{name}' uses host {label}")
+        elif kind.lower() == "container":
+            problems.append(f"service '{name}' joins another container's {label}")
+        elif kind.lower() == "service" and target not in own_services:
+            problems.append(f"service '{name}' joins the {label} of service '{target}' outside this file")
+    for cap in _compose_policy_list(name, "cap_add", service.get("cap_add"), problems) or []:
+        if str(cap).strip().upper().removeprefix("CAP_") not in _COMPOSE_POLICY_ALLOWED_CAPS:
+            problems.append(f"service '{name}' adds dangerous capability: {cap}")
+    for opt in _compose_policy_list(name, "security_opt", service.get("security_opt"), problems) or []:
+        if str(opt).strip().lower() not in _COMPOSE_POLICY_SECURITY_OPTS:
+            problems.append(f"service '{name}' uses dangerous security_opt '{opt}'")
+    groups = _compose_policy_list(name, "group_add", service.get("group_add"), problems) or []
+    if groups and accelerator != "amd":
+        problems.append(f"service '{name}' adds supplementary groups (group_add); only a curated "
+                        f"recipe's compose.amd.yaml may add the GPU video/render groups")
+    elif any(not isinstance(group, str) or group not in _COMPOSE_POLICY_GPU_GROUPS for group in groups):
+        problems.append(f"service '{name}' adds groups other than the GPU video/render groups")
+    if service.get("sysctls"):
+        problems.append(f"service '{name}' declares sysctls")
+    if check_root_user and service.get("user") is not None:
+        user = str(service["user"]).strip()
+        uid = user.split(":", 1)[0].strip()
+        if _compose_policy_interpolates(user):
+            if not _COMPOSE_POLICY_OWNER_USER_RE.fullmatch(user):
+                problems.append(f"service '{name}' chooses its user with ${{...}} interpolation")
+        elif uid.lower() == "root" or (_COMPOSE_POLICY_ROOT_UID_RE.fullmatch(uid) and int(uid) == 0):
+            problems.append(f"service '{name}' runs as root")
+    labels = service.get("labels")
+    if isinstance(labels, dict):
+        label_keys = list(labels)
+    elif isinstance(labels, list):
+        label_keys = [str(label).split("=", 1)[0] for label in labels]
+    else:
+        label_keys = []
+        if labels is not None:
+            problems.append(f"service '{name}' labels must be a mapping or a list")
+    for label in label_keys:
+        if (_compose_policy_interpolates(label)
+                or str(label).strip().lower().startswith(("com.docker.compose.", "io.docker."))):
+            problems.append(f"service '{name}' uses reserved Docker Compose label '{label}'")
+    problems.extend(_compose_policy_volume_problems(name, service.get("volumes"), builtin=builtin,
+                                                    namespace=namespace))
+    networks = service.get("networks")
+    if isinstance(networks, dict) and any(options not in (None, {}) for options in networks.values()):
+        problems.append(f"service '{name}' sets per-network options (aliases, addresses)")
+    deploy = service.get("deploy")
+    resources = deploy.get("resources") if isinstance(deploy, dict) else None
+    reservations = resources.get("reservations") if isinstance(resources, dict) else None
+    if isinstance(reservations, dict) and set(reservations) - _COMPOSE_POLICY_RESERVATION_KEYS:
+        extra = ", ".join(sorted(map(str, set(reservations) - _COMPOSE_POLICY_RESERVATION_KEYS)))
+        problems.append(f"service '{name}' reserves unsupported resources: {extra}")
+    return problems
+
+
+def _compose_policy_document_problems(data, *, builtin=False):
+    """Policy problems of the top level: keys, named networks and volumes.
+
+    Also which networks each service joins: an extension may join only the
+    default network or one its own file declares, never an ODS core network.
+    ``builtin`` marks an extension shipped with ODS, which may join core
+    networks that docker-compose.base.yml declares.
+    """
+    problems = []
+    for key in data:
+        if not isinstance(key, str) or not (key in _COMPOSE_POLICY_TOP_LEVEL or key.startswith("x-")):
+            reason = _COMPOSE_POLICY_TOP_LEVEL_REASONS.get(key, "is not permitted in an extension")
+            problems.append(f"top-level '{key}' {reason}")
+    networks = data.get("networks")
+    if networks is not None and not isinstance(networks, dict):
+        problems.append("top-level networks must be a mapping")
+    declared = set(networks) if isinstance(networks, dict) else set()
+    services = data.get("services")
+    for name, service in (services.items() if isinstance(services, dict) else ()):
+        joined = service.get("networks") if isinstance(service, dict) else None
+        for key in (list(joined) if isinstance(joined, (dict, list)) else ()):
+            if not isinstance(key, str):
+                problems.append(f"service '{name}' lists an invalid network entry")
+            elif key in _COMPOSE_POLICY_CORE_NETWORKS:
+                if not builtin:
+                    problems.append(f"service '{name}' joins ODS core network '{key}'")
+            elif not builtin and key != "default" and key not in declared:
+                problems.append(f"service '{name}' joins network '{key}' that its file does not declare")
+    for key, network in (networks.items() if isinstance(networks, dict) else ()):
+        if key in _COMPOSE_POLICY_CORE_NETWORKS:
+            problems.append(f"network '{key}' is reserved for ODS core")
+            continue
+        if network is None:
+            continue
+        if not isinstance(network, dict) or set(network) - _COMPOSE_POLICY_NETWORK_KEYS:
+            problems.append(f"network '{key}' sets a driver or options")
+            continue
+        external = network.get("external")
+        named = network.get("name")
+        if isinstance(external, dict):
+            named = external.get("name", named)
+        if named is None and not _compose_policy_false(external):
+            named = key
+        # Only ODS's own network may be joined by name; any other name can be
+        # Docker's host or default bridge network or another project's.
+        if named is not None and named != "ods-network":
+            problems.append(f"network '{key}' joins Docker network '{named}' outside ODS")
+    volumes = data.get("volumes")
+    if volumes is not None and not isinstance(volumes, dict):
+        problems.append("top-level volumes must be a mapping")
+    for key, volume in (volumes.items() if isinstance(volumes, dict) else ()):
+        if volume is None:
+            continue
+        if not isinstance(volume, dict):
+            problems.append(f"named volume '{key}' must be a mapping")
+            continue
+        options = volume.get("driver_opts")
+        if isinstance(options, dict) and str(options.get("device", "")).startswith("/"):
+            problems.append(f"named volume '{key}' uses driver_opts to bind-mount host path "
+                            f"'{options.get('device')}'")
+        elif set(volume) - _COMPOSE_POLICY_VOLUME_KEYS:
+            problems.append(f"named volume '{key}' sets a driver, driver_opts, name or external")
+    return problems
+
+
+def _compose_policy_unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _compose_policy_library_origin(extension_dir):
+    """Classify an extension by its upstream.json provenance marker.
+
+    "curated": no marker, or one without origin github-proposal;
+    "imported": origin github-proposal (a proposed GitHub recipe);
+    "invalid": a link or other non-regular file, over 512 KiB, not UTF-8
+    JSON, or with a duplicate key. Trust is the absence of the imported
+    marker, so an invalid marker must never read as curated.
+    """
+    import stat
+
+    marker = extension_dir / "upstream.json"
+    try:
+        if marker.is_symlink():
+            return "invalid"
+        if not marker.exists():
+            return "curated"
+        descriptor = os.open(marker, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(descriptor, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return "invalid"
+            raw = stream.read(_COMPOSE_POLICY_MARKER_MAX_BYTES + 1)
+        if len(raw) > _COMPOSE_POLICY_MARKER_MAX_BYTES:
+            return "invalid"
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_compose_policy_unique_object)
+    except (OSError, ValueError, RecursionError):
+        return "invalid"
+    if isinstance(value, dict) and value.get("origin") == "github-proposal":
+        return "imported"
+    return "curated"
+# <<< shared compose policy <<<
+
+
+def _library_recipe_trusted(extension_dir):
+    """Mirror dashboard-api's install-time trust decision for one extension.
+
+    ``_staged_library_extension`` treats a library recipe as curated unless
+    its upstream.json records ``origin: github-proposal`` (an imported GitHub
+    recipe). An upstream.json that is a link, oversized, not JSON or has a
+    duplicate key was not written by that install path, so it fails closed
+    (see ``_compose_policy_library_origin``; the dashboard refuses to install
+    such a recipe at all).
+    """
+    return _compose_policy_library_origin(extension_dir) == "curated"
+
+
+def _scan_user_compose_content(compose_path, trusted_library=False, accelerator=None, extension_id=None):
     """Reject compose fragments containing dangerous directives.
 
     Mirrors dashboard-api/routers/extensions.py:_scan_compose_content (without
     the FastAPI HTTPException dependency). Returns ``(ok, warnings)``: ``ok``
     is False on any rejection, ``warnings`` is a list of human-readable
-    messages. User-extension contexts are always untrusted at the resolver
-    layer — no ``trusted=True`` exemption.
+    messages. User-extension contexts are untrusted at the resolver layer; the
+    exemptions are the dashboard's own and need ``trusted_library`` (see
+    ``_library_recipe_trusted``): an ``extra_hosts`` list may contain exactly
+    ``host.docker.internal:host-gateway``, and when ``accelerator`` names the
+    backend of the overlay being scanned ("nvidia" or "amd"), that backend's
+    GPU in exactly the ODS core shape (see ``_TRUSTED_LIBRARY_AMD_DEVICES``
+    and ``_is_ods_nvidia_gpu_reservation``). Nothing else grants a device;
+    ``gpus`` and ``runtime`` are rejected for every user extension. Every
+    other rule is the shared compose policy (``_compose_policy_*``), the same
+    code dashboard-api runs. ``extension_id`` names the user extension being
+    scanned: an untrusted one may bind-mount only its own ./data/<id> and
+    ./config/<id> (the override file passes none).
     """
+    if not trusted_library:
+        accelerator = None
+    namespace = None if trusted_library else extension_id
     try:
-        data = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
-    except (yaml.YAMLError, OSError) as e:
+        data = _compose_policy_load(compose_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
         return (False, [f"invalid compose file {compose_path}: {e}"])
 
     if not isinstance(data, dict):
         return (False, [f"compose file {compose_path} must be a YAML mapping"])
 
     warnings = []
-    services = data.get("services", {})
-    if not isinstance(services, dict):
-        return (True, warnings)
-
     ok = True
+    build_contexts = {}
 
     def reject(msg):
         nonlocal ok
         ok = False
         warnings.append(msg)
+
+    for problem in _compose_policy_document_problems(data):
+        reject(problem)
+    services = data.get("services", {})
+    if not isinstance(services, dict):
+        return (ok, warnings)
+    own_services = {str(name) for name in services}
 
     for svc_name, svc_def in services.items():
         if not isinstance(svc_def, dict):
@@ -304,79 +1036,65 @@ def _scan_user_compose_content(compose_path):
         # dashboard-api install endpoint's skip_name_collision=False path.
         if svc_name in _CORE_SERVICE_IDS:
             reject(f"service '{svc_name}' collides with a built-in core service name")
-        if svc_def.get("privileged") is True:
-            reject(f"service '{svc_name}' uses privileged mode")
+        # Docker DNS answers to container names too, so a container named
+        # after a core service would shadow it for every caller on ods-network.
+        container_name = svc_def.get("container_name")
+        if container_name is not None:
+            if not isinstance(container_name, str) or _compose_policy_interpolates(container_name):
+                reject(f"service '{svc_name}' container name must be a literal string")
+            elif container_name.lower() in _CORE_SERVICE_IDS | {f"ods-{sid}" for sid in _CORE_SERVICE_IDS}:
+                reject(f"container name '{container_name}' collides with a built-in core service name")
+        for problem in _compose_policy_service_problems(
+                svc_name, svc_def, own_services=own_services, accelerator=accelerator,
+                namespace=namespace):
+            reject(problem)
         if "build" in svc_def:
-            reject(f"service '{svc_name}' uses a local build — only pre-built images are allowed for user extensions")
-        user = svc_def.get("user")
-        if user is not None and str(user).split(":")[0] in ("root", "0"):
-            reject(f"service '{svc_name}' runs as root")
-        if svc_def.get("network_mode") == "host":
-            reject(f"service '{svc_name}' uses host network mode")
-        if svc_def.get("pid") == "host":
-            reject(f"service '{svc_name}' uses host PID namespace")
-        if svc_def.get("ipc") == "host":
-            reject(f"service '{svc_name}' uses host IPC namespace")
-        if svc_def.get("userns_mode") == "host":
-            reject(f"service '{svc_name}' uses host user namespace")
-        cap_add = svc_def.get("cap_add", [])
-        if isinstance(cap_add, list):
-            for cap in cap_add:
-                if str(cap).upper() in _DANGEROUS_CAPS:
-                    reject(f"service '{svc_name}' adds dangerous capability: {cap}")
-        security_opt = svc_def.get("security_opt", [])
-        if isinstance(security_opt, list):
-            for opt in security_opt:
-                opt_str = str(opt).lower().replace("=", ":")
-                if opt_str in _DANGEROUS_SECURITY_OPTS:
-                    reject(f"service '{svc_name}' uses dangerous security_opt '{opt}'")
-        if svc_def.get("devices"):
-            reject(f"service '{svc_name}' declares devices")
+            try:
+                build_contexts[svc_name] = {"build": {"context": _extension_build_context(compose_path, svc_def["build"])}}
+            except (ValueError, OSError, yaml.YAMLError) as exc:
+                reject(f"service '{svc_name}' build rejected: {exc}")
+        # gpus: and runtime: are other routes to a GPU (Compose `gpus: all`,
+        # the legacy NVIDIA runtime), and a runtime also swaps the container's
+        # isolation. No user extension may set either, curated or imported.
+        if "gpus" in svc_def:
+            reject(f"service '{svc_name}' requests GPUs via gpus")
+        if "runtime" in svc_def:
+            reject(f"service '{svc_name}' sets a container runtime")
+        devices = svc_def.get("devices")
+        if devices:
+            if accelerator != "amd":
+                reject(f"service '{svc_name}' declares devices")
+            elif not isinstance(devices, list) or any(
+                    not isinstance(entry, str) or entry not in _TRUSTED_LIBRARY_AMD_DEVICES
+                    for entry in devices):
+                reject(f"service '{svc_name}' declares unsupported devices")
         deploy = svc_def.get("deploy")
         if isinstance(deploy, dict):
             resources = deploy.get("resources")
             if isinstance(resources, dict):
                 reservations = resources.get("reservations")
                 if isinstance(reservations, dict) and reservations.get("devices"):
-                    reject(f"service '{svc_name}' requests GPU passthrough via deploy.resources.reservations.devices")
-        volumes = svc_def.get("volumes", [])
-        if isinstance(volumes, list):
-            for vol in volumes:
-                if isinstance(vol, dict):
-                    source = str(vol.get("source", ""))
-                    target = str(vol.get("target", ""))
-                    if "docker.sock" in source or "docker.sock" in target:
-                        reject(f"service '{svc_name}' mounts the Docker socket")
-                    if source.startswith("/"):
-                        reject(f"service '{svc_name}' bind-mounts absolute host path '{source}'")
-                    continue
-                vol_str = str(vol)
-                if "docker.sock" in vol_str:
-                    reject(f"service '{svc_name}' mounts the Docker socket")
-                vol_parts = vol_str.split(":")
-                if len(vol_parts) >= 2 and vol_parts[0].startswith("/"):
-                    reject(f"service '{svc_name}' bind-mounts absolute host path '{vol_parts[0]}'")
-        if svc_def.get("extra_hosts"):
-            reject(f"service '{svc_name}' declares extra_hosts")
-        if svc_def.get("sysctls"):
-            reject(f"service '{svc_name}' declares sysctls")
-        labels = svc_def.get("labels", [])
-        if isinstance(labels, dict):
-            label_keys = labels.keys()
-        elif isinstance(labels, list):
-            label_keys = [lbl.split("=", 1)[0] for lbl in labels if isinstance(lbl, str)]
-        else:
-            label_keys = []
-        for lk in label_keys:
-            if str(lk).startswith("com.docker.compose."):
-                reject(f"service '{svc_name}' uses reserved Docker Compose label '{lk}'")
+                    requests = reservations["devices"]
+                    if accelerator != "nvidia":
+                        reject(f"service '{svc_name}' requests GPU passthrough via deploy.resources.reservations.devices")
+                    elif not isinstance(requests, list) or not all(
+                            _is_ods_nvidia_gpu_reservation(entry) for entry in requests):
+                        reject(f"service '{svc_name}' requests an unsupported GPU reservation")
+        extra_hosts = svc_def.get("extra_hosts")
+        if extra_hosts:
+            if not trusted_library:
+                reject(f"service '{svc_name}' declares extra_hosts")
+            elif not isinstance(extra_hosts, list) or any(
+                    not isinstance(entry, str) or entry.strip() not in _TRUSTED_LIBRARY_EXTRA_HOSTS
+                    for entry in extra_hosts):
+                reject(f"service '{svc_name}' declares unsupported extra_hosts")
         ports = svc_def.get("ports", [])
         if isinstance(ports, list):
             for port in ports:
                 if isinstance(port, dict):
                     host_ip = port.get("host_ip", "")
                     if port.get("published") and not _host_part_is_loopback(host_ip):
-                        reject(f"service '{svc_name}' dict port binding must use host_ip 127.0.0.1 or '${{VAR:-127.0.0.1}}'")
+                        reject(f"service '{svc_name}' dict port binding must use literal host_ip 127.0.0.1")
                 else:
                     port_str = str(port)
                     host_part, rest = _split_port_host(port_str)
@@ -384,30 +1102,64 @@ def _scan_user_compose_content(compose_path):
                         reject(f"service '{svc_name}' port '{port_str}' must use 127.0.0.1:host:container format")
                         continue
                     if not _host_part_is_loopback(host_part):
-                        reject(f"service '{svc_name}' port '{port_str}' must bind 127.0.0.1 (literal or '${{VAR:-127.0.0.1}}')")
+                        reject(f"service '{svc_name}' port '{port_str}' must bind literal 127.0.0.1")
                         continue
                     core = rest.split("/", 1)[0]
                     if ":" not in core:
                         reject(f"service '{svc_name}' port '{port_str}' must specify host:host_port:container_port")
 
-    top_volumes = data.get("volumes", {})
-    if isinstance(top_volumes, dict):
-        for vol_name, vol_def in top_volumes.items():
-            if not isinstance(vol_def, dict):
-                continue
-            driver_opts = vol_def.get("driver_opts", {})
-            if not isinstance(driver_opts, dict):
-                continue
-            vol_type = str(driver_opts.get("type", "")).lower()
-            device = str(driver_opts.get("device", ""))
-            if vol_type in ("none", "bind") and device.startswith("/"):
-                reject(f"named volume '{vol_name}' uses driver_opts to bind-mount host path '{device}'")
-
+    if ok:
+        _extension_build_contexts[str(compose_path.resolve())] = build_contexts
     return (ok, warnings)
 
 
-def _extension_base_path(service_dir, service, label):
-    """Return an enabled extension base path, or None when it is disabled."""
+def _source_runtime_merge_problems(entries):
+    """A second recipe/overlay cannot weaken a commit-bound source sandbox.
+
+    Per-file checks are insufficient: Compose merges services and networks.
+    Source receipts authorize one complete document, not later overrides or
+    other extensions joining its private network.
+    """
+    services, networks = {}, {}
+    # YAML lets a section be present but empty (`services:` or `networks:`),
+    # which parses as None. Such recipes are not source recipes; never crash.
+    for path, document in entries:
+        if not isinstance(document, dict):
+            continue
+        definitions = document.get('services')
+        if not isinstance(definitions, dict):
+            continue
+        remote = any(isinstance(item, dict) and isinstance(item.get('build'), dict)
+                     and str(item['build'].get('context', '')).startswith('https://github.com/')
+                     for item in definitions.values())
+        if remote:
+            for key in definitions:
+                services.setdefault(key, set()).add(str(path))
+            for key in document.get('networks') or {}:
+                networks.setdefault(key, set()).add(str(path))
+    problems = []
+    for path, document in entries:
+        if not isinstance(document, dict):
+            continue
+        for name, definition in (document.get('services') or {}).items():
+            if name in services and services[name] != {str(path)}:
+                problems.append(f"source service '{name}' is overridden by another recipe or overlay")
+            if isinstance(definition, dict):
+                for network in definition.get('networks') or []:
+                    if network in networks and networks[network] != {str(path)}:
+                        problems.append(f"source sandbox '{network}' is joined by another recipe or overlay")
+        for network in document.get('networks') or {}:
+            if network in networks and networks[network] != {str(path)}:
+                problems.append(f"source sandbox '{network}' is overridden by another recipe or overlay")
+    return problems
+
+
+def _extension_base_path(service_dir, service, label, assumed=frozenset()):
+    """Return an enabled extension base path, or None when it is disabled.
+
+    ``assumed`` names bundled services the caller is about to select; only
+    the bundled-service discovery passes it.
+    """
     compose_rel = service.get("compose_file", "compose.yaml")
     if not isinstance(compose_rel, str) or not compose_rel:
         print(f"WARNING: {label}: manifest has no usable compose_file, skipping overlays", file=sys.stderr)
@@ -427,8 +1179,11 @@ def _extension_base_path(service_dir, service, label):
 
     if compose_path.exists():
         return compose_path
-    if (service_dir / f"{compose_rel}.disabled").exists():
-        return None
+    disabled_path = service_dir / f"{compose_rel}.disabled"
+    if disabled_path.exists():
+        # A bundled service about to be selected resolves with the file its
+        # selection will restore, so its images match what `up` will use.
+        return disabled_path if service_dir.name in assumed else None
 
     print(
         f"WARNING: {label}: compose_file '{compose_rel}' not found, skipping overlays",
@@ -447,6 +1202,44 @@ def _load_compose_mapping(compose_path, label):
         print(f"ERROR: {label} must be a YAML mapping", file=sys.stderr)
         sys.exit(1)
     return data
+
+
+_LOCAL_INFERENCE_DEPENDENCIES = {
+    "llama-server",
+    "llama-server-ready",
+    "model-router",
+}
+
+
+def _compose_requires_local_inference(compose_path):
+    """Return true when an overlay explicitly waits on a local model service.
+
+    Backend-named user overlays predate mode-specific overlays. Some of them
+    use ``compose.nvidia.yaml`` or ``compose.cpu.yaml`` only to add a
+    ``depends_on: llama-server`` readiness edge, not to request accelerator
+    access. Retaining that edge in cloud, external-LLM, or host-native mode
+    makes the complete Compose project invalid because managed local
+    inference is profiled out.
+    """
+    data = _load_compose_mapping(compose_path, f"Compose file {compose_path}")
+    services = data.get("services", {})
+    if not isinstance(services, dict):
+        return False
+    for service in services.values():
+        if not isinstance(service, dict):
+            continue
+        depends_on = service.get("depends_on", {})
+        if isinstance(depends_on, dict):
+            dependency_names = depends_on.keys()
+        elif isinstance(depends_on, list):
+            dependency_names = depends_on
+        else:
+            continue
+        if _LOCAL_INFERENCE_DEPENDENCIES.intersection(
+            str(name) for name in dependency_names
+        ):
+            return True
+    return False
 
 
 def _declared_compose_services(files, strict=True):
@@ -547,7 +1340,7 @@ if ext_dir.exists():
                 continue
             compose_rel = service.get("compose_file")
             if compose_rel:
-                compose_path = _extension_base_path(service_dir, service, service_dir.name)
+                compose_path = _extension_base_path(service_dir, service, service_dir.name, assume_enabled)
                 if compose_path is None:
                     continue
                 resolved.append(str(compose_path.relative_to(script_dir)))
@@ -570,11 +1363,11 @@ if ext_dir.exists():
             # service_healthy` inside compose.local.yaml overlays can never be
             # satisfied and deadlocks the stack. The real LLM-ready gate on macOS
             # is the `llama-server-ready` sidecar defined in the macOS overlay.
-            # External Lemonade is also a host process. Its stack layers the
-            # cloud overlay to profile out ODS's managed llama-server, so
-            # local-mode overlays that wait on `llama-server: service_healthy`
-            # would point at a disabled service and break lifecycle commands.
-            if ods_mode in ("local", "hybrid", "lemonade") and tier != "CLOUD" and gpu_backend != "apple" and not lemonade_external and not external_llm:
+            # A host-native runtime is also a host process. Its overlay
+            # profiles out ODS's in-stack llama-server, so local-mode overlays
+            # that wait on `llama-server: service_healthy` would point at a
+            # disabled service and break lifecycle commands.
+            if ods_mode in ("local", "hybrid") and tier != "CLOUD" and gpu_backend != "apple" and not host_native and not external_llm:
                 local_mode_overlay = service_dir / "compose.local.yaml"
                 if local_mode_overlay.exists():
                     resolved.append(str(local_mode_overlay.relative_to(script_dir)))
@@ -603,12 +1396,35 @@ if ext_dir.exists():
                 # Unexpected error — re-raise to crash visibly
                 raise
 
+# Services a refused user-extension fragment would have declared, with the
+# reason, so dependents dropped by _drop_unresolvable_user_extensions() can say
+# why their dependency is missing.
+_refused_services = {}
+
+
+def _note_refused_fragment(service_dir, compose_path, warnings):
+    try:
+        data = _compose_policy_load(compose_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    services = data.get("services") if isinstance(data, dict) else None
+    reason = (f"which {service_dir.name}/{compose_path.name} declares but was refused: "
+              f"{warnings[0] if warnings else 'compose policy'}")
+    for name in (services if isinstance(services, dict) else ()):
+        _refused_services.setdefault(str(name), reason)
+
+
 # Discover enabled user-installed extensions (from dashboard portal)
 user_ext_dir = script_dir / "data" / "user-extensions"
 if user_ext_dir.exists():
     try:
         for service_dir in sorted(user_ext_dir.iterdir()):
             if not service_dir.is_dir():
+                continue
+            # Extension IDs never start with a dot. The dashboard keeps its
+            # staging (.tmp) and definition backups (.backups) here; they are
+            # not legacy manifest-less extensions and must not warn.
+            if service_dir.name.startswith("."):
                 continue
             # Find manifest
             manifest_path = None
@@ -633,12 +1449,13 @@ if user_ext_dir.exists():
                     service = manifest.get("service", {}) if isinstance(manifest, dict) else {}
                 else:
                     service = {}
-                # Apply gpu_backends filter — same predicate as the built-in loop above.
+                # Imported recipes without GPU metadata are unrestricted, as
+                # in the catalog. Explicit backend restrictions still apply.
                 # Gated on isinstance(manifest, dict) so the manifest-less compat
                 # carve-out (legacy user extensions that pre-date the manifest convention)
                 # falls through unfiltered.
                 if isinstance(manifest, dict):
-                    backends = service.get("gpu_backends", ["amd", "nvidia"])
+                    backends = service.get("gpu_backends", ["all"])
                     # "none" means CPU-only — compatible with any GPU backend
                     if gpu_backend not in backends and "all" not in backends and "none" not in backends:
                         continue
@@ -652,10 +1469,16 @@ if user_ext_dir.exists():
                 # resolver runs every `ods` invocation, so a tampered-with
                 # compose dropped under data/user-extensions without going
                 # through the install API would otherwise bypass scanning.
-                ok, warnings = _scan_user_compose_content(compose_path)
+                # Curated library recipes keep the dashboard's narrow
+                # exemptions: host.docker.internal:host-gateway in every file,
+                # and the backend's ODS-shaped GPU only in compose.<backend>.yaml.
+                trusted_library = _library_recipe_trusted(service_dir)
+                ok, warnings = _scan_user_compose_content(compose_path, trusted_library,
+                                                          extension_id=service_dir.name)
                 for w in warnings:
                     print(f"WARNING: {service_dir.name}: {w}", file=sys.stderr)
                 if not ok:
+                    _note_refused_fragment(service_dir, compose_path, warnings)
                     continue
                 resolved.append(str(compose_path.relative_to(script_dir)))
                 # GPU-specific overlay (filesystem discovery — not in manifest)
@@ -663,11 +1486,31 @@ if user_ext_dir.exists():
                 if service_dir.name.lower() not in skip_gpu_overlays and gpu_overlay.exists():
                     # Fixed filename so traversal isn't possible, but the same
                     # security checks apply to the overlay's content.
-                    ok, warnings = _scan_user_compose_content(gpu_overlay)
+                    ok, warnings = _scan_user_compose_content(gpu_overlay, trusted_library, gpu_backend,
+                                                              extension_id=service_dir.name)
                     for w in warnings:
                         print(f"WARNING: {service_dir.name}: {w}", file=sys.stderr)
-                    if ok:
-                        resolved.append(str(gpu_overlay.relative_to(script_dir)))
+                    if not ok:
+                        _note_refused_fragment(service_dir, gpu_overlay, warnings)
+                    else:
+                        managed_local_inference = (
+                            ods_mode in ("local", "hybrid")
+                            and tier != "CLOUD"
+                            and not host_native
+                            and not external_llm
+                        )
+                        if (
+                            not managed_local_inference
+                            and _compose_requires_local_inference(gpu_overlay)
+                        ):
+                            print(
+                                f"WARNING: {service_dir.name}: skipping "
+                                f"{gpu_overlay.name} because this model mode has "
+                                "no managed local inference service",
+                                file=sys.stderr,
+                            )
+                        else:
+                            resolved.append(str(gpu_overlay.relative_to(script_dir)))
 
                 # Mode-specific overlay — depends_on for local/hybrid mode only.
                 # Skip on Apple Silicon: macOS runs llama-server natively on the host
@@ -675,22 +1518,25 @@ if user_ext_dir.exists():
                 # service_healthy` inside compose.local.yaml overlays can never be
                 # satisfied and deadlocks the stack. The real LLM-ready gate on macOS
                 # is the `llama-server-ready` sidecar defined in the macOS overlay.
-                # External Lemonade likewise runs on the host and uses the cloud
-                # overlay to disable ODS's managed llama-server, so user-local
-                # overlays must not add local llama-server health dependencies.
-                # Mirrors the same guard in the built-in loop above (PR #1004).
-                if ods_mode in ("local", "hybrid", "lemonade") and tier != "CLOUD" and gpu_backend != "apple" and not lemonade_external and not external_llm:
+                # A host-native runtime likewise disables ODS's in-stack
+                # llama-server, so user-local overlays must not add local
+                # llama-server health dependencies. Mirrors the same guard in
+                # the built-in loop above (PR #1004).
+                if ods_mode in ("local", "hybrid") and tier != "CLOUD" and gpu_backend != "apple" and not host_native and not external_llm:
                     local_mode_overlay = service_dir / "compose.local.yaml"
                     if local_mode_overlay.exists():
                         # Same content scan as compose.yaml/gpu overlay above —
                         # without it, a malicious user extension can put
                         # privileged: true / docker.sock mounts in compose.local.yaml
                         # and reach the host since ODS_MODE defaults to "local".
-                        ok, warnings = _scan_user_compose_content(local_mode_overlay)
+                        ok, warnings = _scan_user_compose_content(local_mode_overlay, trusted_library,
+                                                                  extension_id=service_dir.name)
                         for w in warnings:
                             print(f"WARNING: {service_dir.name}: {w}", file=sys.stderr)
                         if ok:
                             resolved.append(str(local_mode_overlay.relative_to(script_dir)))
+                        else:
+                            _note_refused_fragment(service_dir, local_mode_overlay, warnings)
 
                 # Multi-GPU overlay if we have more than 1 GPU
                 if gpu_count > 1:
@@ -698,11 +1544,14 @@ if user_ext_dir.exists():
                     if multi_gpu_overlay.exists():
                         # Fixed filename, but same content scan applies — see
                         # the gpu/local-mode overlay scans above.
-                        ok, warnings = _scan_user_compose_content(multi_gpu_overlay)
+                        ok, warnings = _scan_user_compose_content(multi_gpu_overlay, trusted_library,
+                                                                  extension_id=service_dir.name)
                         for w in warnings:
                             print(f"WARNING: {service_dir.name}: {w}", file=sys.stderr)
                         if ok:
                             resolved.append(str(multi_gpu_overlay.relative_to(script_dir)))
+                        else:
+                            _note_refused_fragment(service_dir, multi_gpu_overlay, warnings)
 
             except Exception as e:
                 # Narrow exception handling to specific parse/structure errors
@@ -734,6 +1583,38 @@ if external_llm:
         sys.exit(1)
     resolved.append("docker-compose.external-llm.yml")
 
+if not enable_open_webui:
+    if not (script_dir / "docker-compose.gateway-only.yml").exists():
+        print("ERROR: no-WebUI Compose overlay is missing", file=sys.stderr)
+        sys.exit(1)
+    resolved.append("docker-compose.gateway-only.yml")
+
+# Optional owner-registered model directories. Unlike untrusted extension
+# mounts, these explicitly authorized absolute roots must match the bounded
+# registry exactly; no extra Compose keys or writable mounts are accepted.
+model_stores_overlay = script_dir / ".model-stores.compose.json"
+if model_stores_overlay.exists():
+    sys.path.insert(0, str(script_dir / "extensions/services/dashboard-api"))
+    try:
+        from model_stores import validated_compose_overlay, active_compose_overlay
+        from env_values import parse_env_value
+        validated_compose_overlay(script_dir)
+        active_store_id = "default"
+        env_path = script_dir / ".env"
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key.strip() == "ODS_ACTIVE_MODEL_STORE":
+                    active_store_id = parse_env_value(value)
+        active_mount = active_compose_overlay(script_dir, active_store_id)
+    except (ImportError, ValueError) as exc:
+        print(f"ERROR: registered model mounts: {exc}", file=sys.stderr)
+        sys.exit(1)
+    resolved.append(".model-stores.compose.json")
+    resolved = [item for item in resolved if pathlib.Path(item).name != ".active-model-store.compose.json"]
+    if active_mount:
+        resolved.append(str(active_mount.relative_to(script_dir)))
+
 # Include docker-compose.override.yml if it exists (user customizations).
 # Even though the operator placed this file themselves, the resolver runs
 # under installer/CI and may handle composes from sources the operator
@@ -754,6 +1635,136 @@ if override.exists():
 # to local/non-Apple stacks or placing it before a user override.
 if ods_mode == "cloud" and gpu_backend == "apple" and macos_cloud_auth.exists():
     _append_macos_cloud_auth_overlay(resolved, macos_cloud_auth)
+
+# A successful native Pixel installation keeps these fragments disabled for
+# generic extension discovery. Restore their explicit selection after cache
+# invalidation, with the same final override order as the macOS installer.
+native_activation = script_dir / 'data/pixel-native/preparation/activation.json'
+if os.path.lexists(native_activation):
+    import importlib.util
+    try:
+        native_spec = importlib.util.spec_from_file_location('ods_native_stack',
+            script_dir / 'installers/macos/lib/pixel-native-stack.py')
+        native_stack = importlib.util.module_from_spec(native_spec)
+        native_spec.loader.exec_module(native_stack)
+        resolved = native_stack.resolve_files(script_dir, resolved)
+    except (ValueError, OSError, ImportError):
+        print('ERROR: Native Pixel Compose selection needs recovery; retain its installation receipts.', file=sys.stderr)
+        sys.exit(1)
+
+def _service_references(service):
+    """Services Compose requires to be declared for this service to load."""
+    references = set()
+    depends_on = service.get("depends_on")
+    if isinstance(depends_on, (dict, list)):
+        references.update(str(name) for name in depends_on if isinstance(name, str))
+    for key in ("network_mode", "pid", "ipc"):
+        mode = service.get(key)
+        if isinstance(mode, str) and mode.startswith("service:"):
+            references.add(mode.split(":", 1)[1])
+    for key in ("links", "volumes_from"):
+        entries = service.get(key)
+        for entry in entries if isinstance(entries, list) else ():
+            if isinstance(entry, str) and not entry.startswith("container:"):
+                references.add(entry.split(":", 1)[0])
+    return references
+
+
+def _drop_unresolvable_user_extensions(files):
+    """Drop user extensions that need a service no remaining file declares.
+
+    Compose refuses the WHOLE project when one service depends on an
+    undefined service (required or not), so a refused provider would
+    otherwise take every `ods` command down with its dependents. Drops
+    cascade transitively; each is reported with the chain back to the
+    refusal. ODS's own files are never dropped here. Profiles are not
+    modelled: a declared but profiled-out dependency still fails in Compose.
+    """
+    def extension_of(rel):
+        parts = pathlib.PurePath(rel).parts
+        return parts[2] if len(parts) > 3 and parts[:2] == ("data", "user-extensions") else None
+
+    declared_by, needs = {}, {}
+    for rel in files:
+        owner = extension_of(rel)
+        try:
+            text = (script_dir / rel).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue  # declares nothing; Compose reports the missing file itself
+        except OSError:
+            if owner is None:
+                return files  # the stack itself is unreadable; Compose reports it
+            continue
+        try:
+            data = _compose_policy_load(text) if owner else yaml.safe_load(text)
+        except (ValueError, yaml.YAMLError):
+            if owner is None:
+                return files
+            data = None
+        services = data.get("services") if isinstance(data, dict) else None
+        for name, service in (services.items() if isinstance(services, dict) else ()):
+            declared_by.setdefault(str(name), set()).add(owner)
+            if owner is not None and isinstance(service, dict):
+                for reference in _service_references(service):
+                    needs.setdefault(owner, {}).setdefault(reference, str(name))
+    unavailable = dict(_refused_services)
+    dropped = set()
+    changed = True
+    while changed:
+        changed = False
+        for owner in sorted(needs):
+            if owner in dropped:
+                continue
+            for reference, dependent in sorted(needs[owner].items()):
+                if declared_by.get(reference, set()) - dropped:
+                    continue
+                why = unavailable.get(reference, "which no enabled extension or ODS service declares")
+                cause = f"service '{dependent}' needs '{reference}', {why}"
+                print(f"WARNING: {owner}: skipped because {cause}", file=sys.stderr)
+                dropped.add(owner)
+                changed = True
+                for name, owners in declared_by.items():
+                    if owner in owners:
+                        unavailable.setdefault(name, f"which {owner} declares but was skipped because {cause}")
+                break
+    return [rel for rel in files if extension_of(rel) not in dropped]
+
+
+resolved = _drop_unresolvable_user_extensions(resolved)
+
+# Validate the complete selected set before generating trusted build overlays.
+_source_entries = []
+for _fragment in resolved:
+    _path = script_dir / _fragment
+    if _path.resolve().is_relative_to((script_dir / 'data/user-extensions').resolve()):
+        _source_entries.append((_path, _compose_policy_load(_path.read_text(encoding='utf-8'))))
+_source_problems = _source_runtime_merge_problems(_source_entries)
+if _source_problems:
+    raise ValueError('; '.join(_source_problems))
+
+# Each extension owns its projection so narrowed installs cannot accidentally
+# include unrelated services or require their missing configuration.
+import tempfile
+projected = []
+for fragment in resolved:
+    projected.append(fragment)
+    path = (script_dir / fragment).resolve()
+    contexts = _extension_build_contexts.get(str(path))
+    if not contexts:
+        continue
+    overlay = path.parent / (".ods-build-context-" + path.name + ".json")
+    if overlay.is_symlink():
+        raise ValueError("Invalid build context overlay")
+    fd, temporary = tempfile.mkstemp(prefix=".build-context-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"services": contexts}, stream)
+        os.replace(temporary, overlay)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    projected.append(str(overlay.relative_to(script_dir)))
+resolved = projected
 
 def to_flags(files):
     return " ".join(f"-f {f}" for f in files)

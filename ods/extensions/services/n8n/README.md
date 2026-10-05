@@ -22,8 +22,8 @@ Environment variables (set in `.env`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `N8N_USER` | `admin@ods.local` | Admin email address (required) |
-| `N8N_PASS` | *(required)* | Admin password — set before first start |
+| `N8N_USER` | `admin@ods.local` | Email of the n8n owner account ODS creates (see **Cannot log in**) |
+| `N8N_PASS` | *(generated)* | Password of that account; n8n resets the owner to it at every start |
 | `N8N_PORT` | `5678` | External port (maps to internal 5678) |
 | `N8N_AUTH` | `true` | Deprecated: n8n v2.x has built-in user management |
 | `N8N_HOST` | `localhost` | Hostname used in generated URLs |
@@ -66,8 +66,8 @@ curl -X POST http://localhost:3002/api/workflows/my-workflow-id/enable
 
 | Path (host) | Mounted at (container) | Contents |
 |-------------|------------------------|----------|
-| `data/n8n/` | `/home/node/.n8n` | Workflows, credentials, execution history |
-| `config/n8n/` | `/home/node/workflows` | Pre-built workflow templates |
+| `data/n8n/` | `/tmp/.n8n` | Workflows, credentials, execution history (persistent bind mount) |
+| `config/n8n/` | `/tmp/workflows` | Pre-built workflow templates |
 
 ## LLM Integration
 
@@ -96,8 +96,24 @@ docker compose logs n8n
 ```
 
 **Cannot log in:**
-- Verify `N8N_USER` and `N8N_PASS` are set in `.env`
-- Credentials are read on first start; to change them, update `.env` and recreate the container: `docker compose up -d --force-recreate n8n`
+- New installs, and installs where nobody had created n8n's owner yet, get
+  the owner account from `.env`: sign in with `N8N_USER` and `N8N_PASS`.
+  ODS sets it before n8n starts, so there is no first-run screen to claim.
+  n8n resets this account to those values at every start and does not let
+  you change them in n8n; to change the password, change `N8N_PASS` in
+  `.env` and restart n8n.
+- If someone created the owner on n8n's first-run screen before ODS
+  managed it, that account and its password stay as they are.
+- If you have lost that password, run
+  `docker exec -it ods-n8n n8n user-management:reset` (it removes the
+  other users; workflows and credentials move to the owner), then restart
+  n8n. ODS then sets the owner from `.env`.
+
+**Going back after an n8n upgrade:**
+- n8n's database upgrades cannot be undone. Before a new n8n version first
+  starts, ODS copies the database to `data/n8n/ods-backups/` and keeps the
+  two newest copies. To go back, stop n8n, restore a copy as
+  `data/n8n/database.sqlite`, and pin the previous image.
 
 **Webhooks not receiving external traffic:**
 - Put n8n behind an HTTPS reverse proxy and set `N8N_WEBHOOK_URL` to its public URL (e.g. `https://n8n.example.com`)
@@ -115,8 +131,14 @@ docker compose logs n8n
 
 **File permission errors on startup:**
 - n8n runs as `UID:GID` set in `.env` (default `1000:1000`)
+- Native macOS installs set `N8N_RUN_USER=node` because the image home directory is not accessible to the macOS host UID. Other platforms retain `ODS_UID:ODS_GID`; `N8N_RUN_USER` can explicitly override it.
 - Ensure `data/n8n/` is owned by that user: `chown -R 1000:1000 ods/data/n8n`
 
 ## License
 
-Part of ODS — Local AI Infrastructure
+The ODS integration does not relicense n8n. The pinned n8n 2.41.6 release uses
+the [Sustainable Use License and enterprise exceptions](https://github.com/n8n-io/n8n/blob/n8n%402.41.6/LICENSE.md).
+Its internal-business/personal-use permissions differ from its restrictions on
+providing or distributing the software to others. Review those terms before
+selling an appliance, offering a hosted service, or redistributing n8n; do not
+treat ODS's Apache license as permission for those uses.

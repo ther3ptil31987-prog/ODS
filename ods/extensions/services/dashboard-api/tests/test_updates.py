@@ -41,7 +41,10 @@ def test_get_version_authenticated(test_client):
     assert "latest" in data
     assert "update_available" in data
     assert "checked_at" in data
-    datetime.fromisoformat(data["checked_at"])  # valid ISO-8601 (regression: no trailing "Z" after the offset)
+    if data["checked_at"] is not None:
+        datetime.fromisoformat(data["checked_at"])
+    else:
+        assert data["check_status"] in ("checking", "unavailable")
 
 
 def test_get_version_with_mock_github(test_client, monkeypatch):
@@ -79,6 +82,45 @@ def test_get_version_with_mock_github(test_client, monkeypatch):
     data = resp.json()
     assert data["latest"] == "2.0.0"
     assert data["changelog_url"] == "https://github.com/test"
+
+
+def test_get_version_skips_github_when_update_check_disabled(test_client, monkeypatch, tmp_path):
+    """--offline writes DISABLE_UPDATE_CHECK=true; the dashboard must not call GitHub."""
+    import routers.updates as updates_mod
+
+    (tmp_path / ".env").write_text("ODS_VERSION=3.0.0\nDISABLE_UPDATE_CHECK=true\n", encoding="utf-8")
+    monkeypatch.setattr(updates_mod, "INSTALL_DIR", str(tmp_path))
+    monkeypatch.setattr(updates_mod, "_version_cache", {"expires_at": 0.0, "payload": None})
+    monkeypatch.setattr(updates_mod, "_version_refresh_task", None)
+
+    def fail_client(*args, **kwargs):
+        raise AssertionError("GitHub must not be contacted when update checks are disabled")
+
+    with patch("routers.updates.httpx.AsyncClient", side_effect=fail_client):
+        resp = test_client.get("/api/version?force=true", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["current"] == "3.0.0"
+    assert data["check_status"] == "disabled"
+    assert data["latest"] is None
+    assert data["update_available"] is False
+
+
+def test_update_check_flag_parsing(monkeypatch, tmp_path):
+    import routers.updates as updates_mod
+
+    monkeypatch.setattr(updates_mod, "INSTALL_DIR", str(tmp_path))
+    assert updates_mod._update_check_disabled() is False  # no .env
+    for text, expected in [
+        ("DISABLE_UPDATE_CHECK=true\n", True),
+        ('DISABLE_UPDATE_CHECK="true"\n', True),
+        ("DISABLE_UPDATE_CHECK=false\n", False),
+        ("DISABLE_UPDATE_CHECK=true\nDISABLE_UPDATE_CHECK=false\n", False),
+        ("OTHER=1\n", False),
+    ]:
+        (tmp_path / ".env").write_text(text, encoding="utf-8")
+        assert updates_mod._update_check_disabled() is expected, text
 
 
 def test_build_version_result_strips_v_prefix_from_current():
@@ -484,7 +526,7 @@ def test_update_dry_run_reads_compose_images(test_client, tmp_path, monkeypatch)
 
 
 def test_update_dry_run_no_files(test_client, tmp_path, monkeypatch):
-    """GET /api/update/dry-run with no .env or .version → defaults to 0.0.0."""
+    """Source installs use the packaged release when receipts are absent."""
     import routers.updates as updates_mod
 
     install_dir = tmp_path / "ods"
@@ -497,7 +539,7 @@ def test_update_dry_run_no_files(test_client, tmp_path, monkeypatch):
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["current_version"] == "0.0.0"
+    assert data["current_version"] == updates_mod._read_current_version()
     assert data["env_keys"] == {}
     assert data["images"] == []
 

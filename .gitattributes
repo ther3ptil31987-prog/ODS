@@ -1,3 +1,10 @@
+# Every text file is LF in the repository, in checkouts and in `git archive`
+# output, whatever the local core.autocrlf says. Git for Windows defaults to
+# core.autocrlf=true, which turned Python, JavaScript and other unpinned files
+# into CRLF in Windows checkouts and archives, so they no longer matched the
+# bytes users download. The rules below override this one where needed.
+* text=auto eol=lf
+
 # Force LF line endings for all shell scripts and Docker-mounted files.
 # Windows Git's core.autocrlf converts LF→CRLF on checkout, which breaks
 # shell shebangs inside Linux Docker containers (kernel reads #!/bin/sh\r
@@ -13,6 +20,12 @@ docker-entrypoint* text eol=lf
 *.env text eol=lf
 *.shellcheckrc text eol=lf
 
+# Source patches are hash-bound build inputs; checkout/archive must preserve LF.
+ods/extensions/services/pixel-agent/runtime-source/*.patch text eol=lf
+
+# Recorded preview snapshots reproduce a published digest byte for byte.
+ods/tests/fixtures/preview-controls/** -text -whitespace
+
 # PowerShell scripts can use CRLF (native Windows)
 *.ps1 text eol=crlf
 *.psm1 text eol=crlf
@@ -22,3 +35,9 @@ docker-entrypoint* text eol=lf
 # (column padding, trailing whitespace from rocm-smi/amd-smi/etc).
 # Don't let `git diff --check` flag intentional whitespace as an error.
 ods/tests/fixtures/amd/*.txt -whitespace
+
+# Recorded preview pages reproduce a published snapshot digest byte for byte.
+ods/tests/fixtures/preview-inspection-laptop-round*.html -text -whitespace
+
+# Exact third-party Vane bundle fixture is hash-bound and not a reviewable diff.
+ods/tests/fixtures/vane-v1.12.2-*.js -text -diff

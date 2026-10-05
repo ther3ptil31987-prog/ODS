@@ -6,13 +6,17 @@ import io
 import json
 import logging
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import threading
 import time
 import types
+from contextlib import nullcontext
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
+from urllib.parse import unquote
 
 import pytest
 
@@ -24,7 +28,715 @@ _mod = importlib.util.module_from_spec(_spec)
 sys.modules["ods_host_agent"] = _mod
 _spec.loader.exec_module(_mod)
 
+
+def test_host_selection_serializes_dependency_decisions_with_cli_helper(tmp_path, monkeypatch):
+    """The agent uses the installed host selector, including ordered stops."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    shutil.copyfile(_agent_path.parents[1] / "scripts" / "extension-selection.py",
+                    scripts / "extension-selection.py")
+    (scripts / "stop-owned-containers.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    (tmp_path / "docker-compose.base.yml").write_text("services: {}\n", encoding="utf-8")
+    (tmp_path / "data" / "user-extensions").mkdir(parents=True)
+    for name, dependencies in (("search", ""), ("consumer", "search")):
+        directory = tmp_path / "extensions" / "services" / name
+        directory.mkdir(parents=True)
+        (directory / "manifest.yaml").write_text(
+            f"service:\n  id: {name}\n  depends_on: [{dependencies}]\n", encoding="utf-8",
+        )
+        (directory / "compose.yaml").write_text(
+            f"services:\n  {name}:\n    image: example:latest\n", encoding="utf-8",
+        )
+    monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+    monkeypatch.setattr(_mod, "resolve_compose_flags",
+                        lambda **_kwargs: ["-f", "docker-compose.base.yml"])
+    if sys.platform == "win32":
+        # Dashboard's test conftest stubs fcntl for its own imports; the host
+        # selector must take the real Windows msvcrt branch instead.
+        monkeypatch.delitem(sys.modules, "fcntl", raising=False)
+    with pytest.raises(ValueError, match="consumer"):
+        _mod._apply_extension_selection(["search"], activate=False)
+    assert (tmp_path / "extensions/services/search/compose.yaml").is_file()
+    assert _mod._apply_extension_selection(["consumer"], activate=False) == "disabled"
+    assert _mod._apply_extension_selection(["search"], activate=False) == "disabled"
+    with pytest.raises(ValueError, match="missing"):
+        _mod._apply_extension_selection(["search", "missing"], activate=True)
+    assert (tmp_path / "extensions/services/search/compose.yaml.disabled").is_file()
+    digests = {
+        name: hashlib.sha256((tmp_path / "extensions/services" / name
+                              / "compose.yaml.disabled").read_bytes()).hexdigest()
+        for name in ("search", "consumer")
+    }
+    with pytest.raises(ValueError, match="content changed"):
+        _mod._apply_extension_selection(
+            ["search", "consumer"], activate=True,
+            expected_sha256={**digests, "search": "0" * 64},
+        )
+    assert (tmp_path / "extensions/services/search/compose.yaml.disabled").is_file()
+    assert _mod._apply_extension_selection(
+        ["search", "consumer"], activate=True, expected_sha256=digests,
+    ) == "enabled"
+    with pytest.raises(ValueError, match="content changed"):
+        _mod._apply_extension_selection(
+            ["search", "consumer"], activate=True,
+            expected_sha256={**digests, "consumer": "0" * 64},
+        )
+    assert not list((tmp_path / "data").glob(".extension-selection-*"))
+
+
+@pytest.mark.parametrize(("has_dependent", "stop_fails"), [
+    (False, False), (True, False), (False, True),
+])
+def test_failed_install_cleanup_stops_prior_retry_before_disabling(
+    tmp_path, monkeypatch, has_dependent, stop_fails,
+):
+    """A prior retry's container is stopped under the marker's graph lock."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    shutil.copyfile(_agent_path.parents[1] / "scripts" / "extension-selection.py",
+                    scripts / "extension-selection.py")
+    user_root = tmp_path / "data" / "user-extensions"
+    target = user_root / "my-ext"
+    target.mkdir(parents=True)
+    (target / "compose.yaml").write_text(
+        "services:\n  my-ext:\n    image: example:latest\n"
+        "    environment:\n      REQUIRED: ${MISSING_REQUIRED_SETTING:?}\n",
+        encoding="utf-8",
+    )
+    (target / "manifest.yaml").write_text(
+        "service:\n  id: my-ext\n", encoding="utf-8",
+    )
+    (target / "owner-data.db").write_text("keep", encoding="utf-8")
+    cache = tmp_path / ".compose-flags"
+    cache.write_text("stale", encoding="utf-8")
+    (tmp_path / "docker-compose.base.yml").write_text(
+        "services:\n  dashboard-api:\n    image: example:latest\n", encoding="utf-8",
+    )
+    if has_dependent:
+        consumer = user_root / "consumer"
+        consumer.mkdir()
+        (consumer / "manifest.yaml").write_text(
+            "service:\n  id: consumer\n  depends_on: [my-ext]\n", encoding="utf-8",
+        )
+        (consumer / "compose.yaml").write_text(
+            "services:\n  consumer:\n    image: example:latest\n", encoding="utf-8",
+        )
+    monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+    monkeypatch.setattr(_mod, "USER_EXTENSIONS_DIR", user_root)
+    monkeypatch.setattr(
+        _mod, "resolve_compose_flags",
+        lambda **_kwargs: ["-f", "docker-compose.base.yml"],
+    )
+    if sys.platform == "win32":
+        monkeypatch.delitem(sys.modules, "fcntl", raising=False)
+    selector = _mod._load_extension_selector()
+    stops = []
+
+    def stop_owned(_install_dir, service_id, mode, _flags, service_names,
+                   preserve_restart_policy=False):
+        assert (target / "compose.yaml").is_file()
+        assert cache.is_file()
+        assert mode == "owned"
+        assert preserve_restart_policy
+        stops.append((service_id, service_names))
+        if stop_fails:
+            raise selector.SelectionError("Could not confirm stop; selection unchanged")
+
+    monkeypatch.setattr(selector, "_stop_for_disable", stop_owned)
+    monkeypatch.setattr(_mod, "_load_extension_selector", lambda: selector)
+
+    note = _mod._disable_unprepared_install("my-ext")
+
+    assert (target / "owner-data.db").read_text(encoding="utf-8") == "keep"
+    if has_dependent or stop_fails:
+        assert "could not turn this extension off" in note
+        assert (target / "compose.yaml").is_file()
+        assert cache.is_file()
+        assert stops == ([] if has_dependent else [("my-ext", {"my-ext"})])
+    else:
+        assert "turned this extension off" in note
+        assert (target / "compose.yaml.disabled").is_file()
+        assert not (target / "compose.yaml").exists()
+        assert not cache.exists()
+        assert stops == [("my-ext", {"my-ext"})]
+
+
+def test_extension_start_and_disable_share_host_graph_lock(tmp_path, monkeypatch):
+    """The CLI cannot rename a marker during a selected Compose up."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    shutil.copyfile(_agent_path.parents[1] / "scripts" / "extension-selection.py",
+                    scripts / "extension-selection.py")
+    target = tmp_path / "data" / "user-extensions" / "my-ext"
+    target.mkdir(parents=True)
+    (target / "compose.yaml").write_text(
+        "services:\n  my-ext:\n    image: example:latest\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+    monkeypatch.setattr(_mod, "USER_EXTENSIONS_DIR", target.parent)
+    monkeypatch.setattr(_mod, "EXTENSIONS_DIR", tmp_path / "extensions" / "services")
+    if sys.platform == "win32":
+        monkeypatch.delitem(sys.modules, "fcntl", raising=False)
+
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+
+    def delayed_up(command, **_kwargs):
+        assert (target / "compose.yaml").is_file()
+        entered.set()
+        assert release.wait(timeout=5)
+        results.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(_mod.subprocess, "run", delayed_up)
+    worker = threading.Thread(
+        target=lambda: _mod._run_selected_extension_up("my-ext", ["-f", "base.yml"]),
+    )
+    worker.start()
+    try:
+        assert entered.wait(timeout=5)
+        selector = _mod._load_extension_selector()
+        with pytest.raises(selector.SelectionError, match="Timed out waiting"):
+            selector.run("disable", tmp_path, "my-ext", timeout=0.2)
+        assert (target / "compose.yaml").is_file()
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert results == [["docker", "compose", "-f", "base.yml", "up", "-d", "my-ext"]]
+    assert selector.run("disable", tmp_path, "my-ext") == "disabled"
+    with pytest.raises(RuntimeError, match="selection changed before start"):
+        _mod._run_selected_extension_up("my-ext", ["-f", "base.yml"])
+    assert len(results) == 1
+
+
+def test_host_selection_endpoint_requires_auth_and_preserves_batch(
+    monkeypatch, host_agent_wire_client,
+):
+    import threading
+    import urllib.error
+    import urllib.request
+    from http.server import HTTPServer
+
+    from routers import extensions as ext_router
+
+    calls = []
+    monkeypatch.setattr(_mod, "AGENT_API_KEY", "selection-wire-secret")
+    monkeypatch.setattr(
+        _mod, "_apply_extension_selection",
+        lambda service_ids, activate, expected_sha256=None: calls.append(
+            (service_ids, activate, expected_sha256)
+        ) or ("enabled" if activate else "disabled"),
+    )
+    server = HTTPServer(("127.0.0.1", 0), _mod.AgentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/v1/extension/select"
+
+        def post(body, token=None):
+            headers = {"Content-Type": "application/json"}
+            if token is not None:
+                headers["Authorization"] = f"Bearer {token}"
+            request = urllib.request.Request(
+                url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST",
+            )
+            return urllib.request.urlopen(request, timeout=2)
+
+        digests = {"search": "a" * 64, "consumer": "b" * 64}
+        body = {"action": "enable", "service_ids": ["search", "consumer"],
+                "expected_sha256": digests}
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            post(body)
+        assert rejected.value.code == 401
+        assert calls == []
+
+        host_agent_wire_client(server.server_address[1], key="selection-wire-secret")
+        result = ext_router._select_extensions_on_host(
+            "enable", ["search", "consumer"], expected_sha256=digests,
+        )
+        assert result["action"] == "enabled"
+        assert result["service_ids"] == ["search", "consumer"]
+        assert calls == [(["search", "consumer"], True, digests)]
+
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            post({"action": "enable", "service_ids": ["search", "consumer"]},
+                 "selection-wire-secret")
+        assert rejected.value.code == 400
+
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            post({"action": "disable", "service_ids": ["search", "consumer"]},
+                 "selection-wire-secret")
+        assert rejected.value.code == 400
+        assert calls == [(["search", "consumer"], True, digests)]
+
+        from fastapi import HTTPException
+
+        def blocked_by_late_dependent(service_ids, activate, expected_sha256=None):
+            raise ValueError("enabled consumer depends on search")
+
+        monkeypatch.setattr(_mod, "_apply_extension_selection", blocked_by_late_dependent)
+        with pytest.raises(HTTPException) as blocked:
+            ext_router._select_extensions_on_host("disable", ["search"])
+        assert blocked.value.status_code == 409
+        assert "consumer" in blocked.value.detail
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("model,settings,override", [
+    ("Systran/faster-whisper-base", "AUDIO_STT_MODEL=Systran/faster-whisper-base\n", False),
+    ("deepdml/faster-whisper-large-v3-turbo-ct2", "GPU_BACKEND=nvidia\n", False),
+    ("Systran/faster-whisper-base", "AUDIO_STT_MODEL=stale/model\nWHISPER_PORT=1\n", True),
+])
+def test_library_whisper_start_downloads_missing_model_and_reuses_cache(
+    tmp_path, monkeypatch, model, settings, override,
+):
+    calls = []
+    cached = set()
+
+    class ModelsHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            calls.append(("GET", self.path))
+            if self.path == "/v1/models":
+                self.send_response(200)
+            elif self.path.startswith("/v1/models/") and unquote(self.path[11:]) in cached:
+                self.send_response(200)
+            else:
+                self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self):
+            calls.append(("POST", self.path))
+            if self.path.startswith("/v1/models/"):
+                cached.add(unquote(self.path[11:]))
+                self.send_response(200)
+            else:
+                self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ModelsHandler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        (tmp_path / ".env").write_text(
+            settings + ("" if override else f"WHISPER_PORT={server.server_port}\n"),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        expected_path = "/v1/models/" + model.replace("/", "%2F")
+        compose_env = ({"AUDIO_STT_MODEL": model, "WHISPER_PORT": str(server.server_port)}
+                       if override else None)
+        assert _mod._whisper_model_ready_after_start(5, compose_env) == (True, "")
+        assert calls.count(("POST", expected_path)) == 1
+        assert _mod._whisper_model_ready_after_start(5, compose_env) == (True, "")
+        assert calls.count(("POST", expected_path)) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+
+
+def test_library_whisper_start_rejects_oversized_port_without_network(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("WHISPER_PORT=" + "9" * 5000 + "\n", encoding="utf-8")
+    monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+    assert _mod._whisper_model_ready_after_start(0)[0] is False
+
+
+def test_library_whisper_start_reports_permanent_model_rejection(tmp_path, monkeypatch):
+    class RejectingModelsHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200 if self.path == "/v1/models" else 404)
+            self.end_headers()
+
+        def do_POST(self):
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RejectingModelsHandler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        (tmp_path / ".env").write_text(
+            f"WHISPER_PORT={server.server_port}\n", encoding="utf-8",
+        )
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        started = time.monotonic()
+        ok, error = _mod._whisper_model_ready_after_start(5)
+        assert not ok and "HTTP 404" in error
+        assert time.monotonic() - started < 2
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+
+
+def test_core_recreation_excludes_unrelated_secrets_but_keeps_overlays_and_dependencies(tmp_path, monkeypatch):
+    monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+    monkeypatch.setattr(_mod, 'EXTENSIONS_DIR', tmp_path / 'extensions')
+    monkeypatch.setattr(_mod, 'USER_EXTENSIONS_DIR', tmp_path / 'user-extensions')
+    monkeypatch.setattr(_mod, 'CORE_SERVICE_IDS', {'litellm', 'open-webui'})
+    fragments = {
+        'extensions/unrelated/compose.yaml': 'services:\n  unrelated:\n    environment:\n      SECRET: ${UNRELATED_SECRET:?Required}\n',
+        'extensions/overlay/compose.yaml': 'services:\n  open-webui:\n    depends_on: [search]\n',
+        'extensions/overlay/compose.cpu.yaml': 'services:\n  helper:\n    image: helper:1\n',
+        'user-extensions/search/compose.yaml': 'services:\n  search:\n    network_mode: service:network\n',
+        'user-extensions/network/compose.yaml': 'services:\n  network:\n    image: network:1\n',
+    }
+    flags = ['-p', 'ods', '-f', 'base.yaml', '-f', 'gpu.yaml']
+    for name, body in fragments.items():
+        file = tmp_path / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(body)
+        flags += ['-f', name]
+    result = _mod._core_recreate_compose_flags(flags)
+    assert result == [value for value in flags[:6]] + sum(
+        (['-f', name] for name in fragments if '/unrelated/' not in name), [])
+    assert '${UNRELATED_SECRET:?Required}' in (tmp_path / next(iter(fragments))).read_text()
+
+
+def test_core_recreation_does_not_hide_invalid_extension_yaml(tmp_path, monkeypatch):
+    monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+    monkeypatch.setattr(_mod, 'EXTENSIONS_DIR', tmp_path / 'extensions')
+    monkeypatch.setattr(_mod, 'USER_EXTENSIONS_DIR', tmp_path / 'user-extensions')
+    file = tmp_path / 'extensions/broken/compose.yaml'
+    file.parent.mkdir(parents=True)
+    file.write_text('services: [unterminated')
+    with pytest.raises(ValueError, match='Invalid extension Compose YAML'):
+        _mod._core_recreate_compose_flags(['-f', str(file)])
+
+
+@pytest.mark.parametrize('exit_code,oom,success', [(0, False, True), (1, False, False), (0, True, False), (False, False, False)])
+def test_cli_success_requires_the_exact_container_exit_receipt(monkeypatch, exit_code, oom, success):
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ['docker', 'compose']:
+            return types.SimpleNamespace(returncode=0, stdout='a' * 64, stderr='')
+        return types.SimpleNamespace(returncode=0, stdout=json.dumps({
+            'Status': 'exited', 'ExitCode': exit_code, 'OOMKilled': oom, 'Error': ''}), stderr='')
+    monkeypatch.setattr(_mod.subprocess, 'run', run)
+    result, _ = _mod._verify_one_shot_exit(['-p', 'ods'], 'specific-cli')
+    assert result is success
+    assert calls[0] == ['docker', 'compose', '-p', 'ods', 'ps', '-a', '-q', 'specific-cli']
+    assert calls[1][-1] == 'a' * 64
+
+
+def test_cli_running_is_not_a_successful_one_shot_exit(monkeypatch):
+    clock = iter([0, 0, 2])
+    monkeypatch.setattr(_mod.time, 'monotonic', lambda: next(clock))
+    monkeypatch.setattr(_mod.time, 'sleep', lambda seconds: None)
+    def run(command, **kwargs):
+        return types.SimpleNamespace(returncode=0, stdout=('a' * 64 if command[1] == 'compose'
+            else json.dumps({'Status': 'running', 'ExitCode': 0})), stderr='')
+    monkeypatch.setattr(_mod.subprocess, 'run', run)
+    assert _mod._verify_one_shot_exit([], 'specific-cli', timeout=1)[0] is False
+
+
+class _FinishedPull:
+    """`docker compose pull` stand-in that has already exited with ``returncode``."""
+
+    def __init__(self, calls, command, returncode=0):
+        calls.append(list(command))
+        self.stdout = iter(())
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+@pytest.mark.parametrize('build_exit', [0, 1])
+def test_install_prepares_only_dependency_images_and_surfaces_build_failure(monkeypatch, build_exit):
+    monkeypatch.setenv('BUILD_TEST_TOKEN', 'private')
+    monkeypatch.setattr(_mod.platform, 'system', lambda: 'Linux')
+    config = {'services': {
+        'demo': {'build': {'context': 'https://github.com/example/demo.git#' + 'a' * 40},
+                 'image': 'ods-source-demo:local', 'depends_on': {'demo-db': {}, 'demo-worker': {}}},
+        'demo-db': {'image': 'postgres:17'},
+        'demo-worker': {'build': {'context': '/extension/worker'}, 'depends_on': ['demo-db']},
+        'unrelated': {'build': {'context': '/unrelated'}},
+    }}
+    calls, progress = [], []
+    def run(command, **kwargs):
+        calls.append(command)
+        return types.SimpleNamespace(returncode=build_exit if 'build' in command else 0,
+                                     stdout=json.dumps(config), stderr='private build output')
+    monkeypatch.setattr(_mod.subprocess, 'run', run)
+    monkeypatch.setattr(_mod.subprocess, 'Popen', lambda command, **kwargs: _FinishedPull(calls, command))
+    monkeypatch.setattr(_mod, '_write_progress', lambda *args: progress.append(args))
+    ok, error = _mod._prepare_install_images(['-p', 'ods'], 'demo')
+    assert ok is (build_exit == 0)
+    assert 'private' not in error
+    if build_exit:
+        assert error.splitlines()[0] == ('Source image build failed; containers were not started. '
+                                         'Untrusted build error: [REDACTED] build output')
+        assert error.splitlines()[1] == 'Untrusted build diagnostic (tail):'
+        assert error.endswith('\n[REDACTED] build output')
+    base = ['docker', 'compose', '-p', 'ods']
+    # The pull streams progress; the build keeps the plain Compose command.
+    assert calls == [base + ['config', '--format', 'json'],
+                     ['docker', 'compose', '--progress', 'plain', '-p', 'ods', 'pull', 'demo-db'],
+                     base + ['build', '--build-arg', 'BUILDKIT_CONTEXT_KEEP_GIT_DIR=1', 'demo', 'demo-worker']]
+    assert progress[-1][2] == 'Building images from source...'
+
+
+def test_build_diagnostic_preserves_actual_pip_failure_and_redacts_before_tail(tmp_path, monkeypatch):
+    monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+    (tmp_path / '.env').write_text('SERVICE_API_KEY=persisted-value\n')
+    monkeypatch.setenv('BUILD_TEST_TOKEN', 'process-value')
+    services = {'demo': {'environment': {'PASSWORD': 'compose-value'},
+                         'build': {'args': {'ACCESS_TOKEN': 'build-value'}}}}
+    failure = "ERROR: Directory '.' is not installable. Neither 'setup.py' nor 'pyproject.toml' found."
+    output = ('x' * 16000 + '\nprocess-value persisted-value compose-value build-value\n'
+              'https://user:pass@example.org/repo?token=query-value\nBearer bearer-value\n' + failure)
+    actual = _mod._install_build_diagnostic(types.SimpleNamespace(stderr=output), services)
+    assert actual.startswith(f'Untrusted build error: {failure}\nUntrusted build diagnostic (tail):\n')
+    assert actual.endswith(failure)
+    assert len(actual) <= 7600
+    for secret in ['process-value', 'persisted-value', 'compose-value', 'build-value',
+                   'user:pass', 'query-value', 'bearer-value']:
+        assert secret not in actual
+
+
+# Verbatim `docker compose build swagger-ui` output from tower2 (Compose 5.1.0,
+# buildx 0.31.1, 2026-09-25). The whole log fit the old 7600-character "tail",
+# so the message began at BuildKit step #1 and a 400-character excerpt of it
+# ended inside the FROM digest, 35 characters before the first error line.
+SWAGGER_UI_BUILD_LOG = '\n'.join([
+    '#1 [internal] load local bake definitions',
+    '#1 reading from stdin 620B done',
+    '#1 DONE 0.0s',
+    '',
+    '#2 [internal] load build definition from Dockerfile',
+    '#2 transferring dockerfile: 273B done',
+    '#2 DONE 0.0s',
+    '',
+    '#3 [internal] load metadata for docker.swagger.io/swaggerapi/swagger-ui:v5.33.0@sha256:f9b8432be04e320406157e26c3ff52a7e9a4bea7eabe5477e9636791737eb119',
+    '#3 ERROR: failed to copy: httpReadSeeker: failed open: unexpected status from GET request to https://docker.swagger.io/v2/swaggerapi/swagger-ui/manifests/sha256:f9b8432be04e320406157e26c3ff52a7e9a4bea7eabe5477e9636791737eb119: 429 Too Many Requests',
+    'toomanyrequests: You have reached your unauthenticated pull rate limit. https://www.docker.com/increase-rate-limit',
+    '------',
+    ' > [internal] load metadata for docker.swagger.io/swaggerapi/swagger-ui:v5.33.0@sha256:f9b8432be04e320406157e26c3ff52a7e9a4bea7eabe5477e9636791737eb119:',
+    '------',
+    '',
+    ' Image ods/swagger-ui:5.33.0-local-v1 Building ',
+    'Dockerfile:1',
+    '',
+    '--------------------',
+    '',
+    '   1 | >>> FROM docker.swagger.io/swaggerapi/swagger-ui:v5.33.0@sha256:f9b8432be04e320406157e26c3ff52a7e9a4bea7eabe5477e9636791737eb119',
+    '',
+    '   2 |     COPY nginx.conf /etc/nginx/nginx.conf',
+    '',
+    '   3 |     COPY index.html ods-initializer.js /usr/share/nginx/html/',
+    '',
+    '--------------------',
+    '',
+    'failed to solve: docker.swagger.io/swaggerapi/swagger-ui:v5.33.0@sha256:f9b8432be04e320406157e26c3ff52a7e9a4bea7eabe5477e9636791737eb119: failed to resolve source metadata for docker.swagger.io/swaggerapi/swagger-ui:v5.33.0@sha256:f9b8432be04e320406157e26c3ff52a7e9a4bea7eabe5477e9636791737eb119: failed to copy: httpReadSeeker: failed open: unexpected status from GET request to https://docker.swagger.io/v2/swaggerapi/swagger-ui/manifests/sha256:f9b8432be04e320406157e26c3ff52a7e9a4bea7eabe5477e9636791737eb119: 429 Too Many Requests',
+    '',
+    'toomanyrequests: You have reached your unauthenticated pull rate limit. https://www.docker.com/increase-rate-limit',
+    '',
+])
+
+
+def test_build_failure_message_leads_with_the_final_error_not_the_first_build_step(tmp_path, monkeypatch):
+    monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+    monkeypatch.setattr(_mod.platform, 'system', lambda: 'Linux')
+    services = {'swagger-ui': {'image': 'ods/swagger-ui:5.33.0-local-v1',
+                               'build': {'context': str(tmp_path), 'dockerfile': 'Dockerfile'}}}
+    def run(command, **kwargs):
+        if command[-3:] == ['config', '--format', 'json']:
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps({'services': services}), stderr='')
+        assert command == ['docker', 'compose', '-p', 'ods', 'build', 'swagger-ui']
+        return types.SimpleNamespace(returncode=1, stdout='', stderr=SWAGGER_UI_BUILD_LOG)
+    monkeypatch.setattr(_mod.subprocess, 'run', run)
+    monkeypatch.setattr(_mod, '_write_progress', lambda *args: None)
+
+    ok, error = _mod._prepare_install_images(['-p', 'ods'], 'swagger-ui')
+
+    assert ok is False
+    first = error.splitlines()[0]  # The dashboard card's collapsed summary.
+    assert first == ('Source image build failed; containers were not started. Untrusted build error: '
+                     'toomanyrequests: You have reached your unauthenticated pull rate limit. '
+                     'https://www.docker.com/increase-rate-limit')
+    assert 'unauthenticated pull rate limit' in error[:400]
+    assert error.splitlines()[1] == 'Untrusted build diagnostic (tail):'
+    tail = error.splitlines()[2:]
+    assert tail[0] == '#1 [internal] load local bake definitions'  # Whole log fits the bound.
+    assert tail[-2].endswith('429 Too Many Requests') and tail[-2].startswith('failed to solve: ')
+    assert tail[-1].startswith('toomanyrequests: ')
+    assert '' not in tail
+
+
+def test_build_diagnostic_tail_is_bounded_and_keeps_end_of_long_error_line(tmp_path, monkeypatch):
+    monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+    steps = '\n'.join(f'#{n} [stage {n}] RUN step {n} ' + 'o' * 80 for n in range(400))
+    chain = 'failed to solve: ' + 'wrapped: ' * 200 + 'exit code: 137'
+    actual = _mod._install_build_diagnostic(types.SimpleNamespace(stderr=steps + '\n' + chain), {})
+    first, label, *tail = actual.splitlines()
+    assert first.startswith('Untrusted build error: …') and first.endswith('wrapped: exit code: 137')
+    assert len(first) == len('Untrusted build error: ') + _mod.BUILD_ERROR_LINE_LIMIT
+    assert label == 'Untrusted build diagnostic (tail):'
+    assert len(actual) <= _mod.BUILD_DIAGNOSTIC_LIMIT
+    assert tail[0].startswith('#') and tail[0].endswith('o' * 80)  # No partial first line.
+    assert tail[-1] == chain and tail[-2].startswith('#399 ')
+
+
+def test_build_diagnostic_supports_stdout_and_absent_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+    assert _mod._install_build_diagnostic(types.SimpleNamespace(stderr='', stdout='failed step'), {}) == (
+        'Untrusted build error: failed step\nUntrusted build diagnostic (tail):\nfailed step')
+    assert 'No build diagnostic' in _mod._install_build_diagnostic(types.SimpleNamespace(), {})
+    assert 'No build diagnostic' in _mod._install_build_diagnostic(types.SimpleNamespace(stderr='\n \n'), {})
+
+
+@pytest.mark.parametrize('build_exit', [0, 1])
+def test_windows_remote_build_uses_compose_plan_without_url_file_entitlement(monkeypatch, build_exit):
+    monkeypatch.setattr(_mod.platform, 'system', lambda: 'Windows')
+    plan = json.dumps({'target': {'demo': {
+        'context': 'https://github.com/example/demo.git#' + 'a' * 40,
+        'dockerfile-inline': 'FROM scratch', 'tags': ['ods-source-demo:fixed'],
+        'args': {'OPTION': 'value'}, 'platforms': ['linux/arm64']}}})
+    calls = []
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return types.SimpleNamespace(returncode=0 if '--print' in command else build_exit,
+                                     stdout=plan, stderr='')
+    monkeypatch.setattr(_mod.subprocess, 'run', run)
+    result = _mod._build_install_sources(['docker', 'compose', '-f', 'overlay.yaml'],
+        ['demo'], {'demo': {'build': {'context': 'https://github.com/example/demo.git'}}})
+    assert result.returncode == build_exit
+    assert calls[0][0] == ['docker', 'compose', '-f', 'overlay.yaml', 'build', '--build-arg', 'BUILDKIT_CONTEXT_KEEP_GIT_DIR=1', '--print', 'demo']
+    assert calls[1][0] == ['docker', 'buildx', 'bake', '--file', '-', '--load', '--progress', 'plain', 'demo']
+    assert calls[1][1]['input'] == plan
+    assert len(calls) == 2  # Never replay a failed Dockerfile build.
+
+
+@pytest.mark.parametrize('output,code', [('{}', 0), ('invalid', 0), ('', 1)])
+def test_windows_invalid_or_unsupported_compose_plan_never_builds(monkeypatch, output, code):
+    monkeypatch.setattr(_mod.platform, 'system', lambda: 'Windows')
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return types.SimpleNamespace(returncode=code, stdout=output, stderr='')
+    monkeypatch.setattr(_mod.subprocess, 'run', run)
+    result = _mod._build_install_sources(['docker', 'compose'], ['demo'],
+        {'demo': {'build': {'context': 'https://github.com/example/demo.git'}}})
+    assert result.returncode != 0
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('services', [{}, {'demo': {'depends_on': ['missing'], 'image': 'demo:1'}},
+                                      {'demo': {'build': '.', 'depends_on': 'invalid'}}])
+def test_invalid_image_graph_never_downloads_or_builds(monkeypatch, services):
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return types.SimpleNamespace(returncode=0, stdout=json.dumps({'services': services}), stderr='')
+    monkeypatch.setattr(_mod.subprocess, 'run', run)
+    assert _mod._prepare_install_images([], 'demo')[0] is False
+    assert len(calls) == 1
+
+
+def test_image_preparation_allows_cached_images_and_absent_optional_dependency(monkeypatch):
+    calls = []
+    config = {'services': {'demo': {'image': 'demo:1', 'depends_on': {'optional': {'required': False}}}}}
+    def run(command, **kwargs):
+        calls.append(command)
+        return types.SimpleNamespace(returncode=0, stdout=json.dumps(config), stderr='')
+    monkeypatch.setattr(_mod.subprocess, 'run', run)
+    # The download fails, but a cached image may still satisfy `up`.
+    monkeypatch.setattr(_mod.subprocess, 'Popen', lambda command, **kwargs: _FinishedPull(calls, command, 1))
+    monkeypatch.setattr(_mod, '_write_progress', lambda *args: None)
+    assert _mod._prepare_install_images([], 'demo') == (True, '')
+    assert calls[-1] == ['docker', 'compose', '--progress', 'plain', 'pull', 'demo']
+
+
+def test_extension_stop_includes_owned_companions_but_not_shared_services(tmp_path, monkeypatch):
+    extension = tmp_path / 'karakeep'
+    extension.mkdir()
+    (extension / 'compose.yaml').write_text('''services:
+  karakeep:
+    depends_on: [litellm]
+  karakeep-chrome: {}
+  karakeep-search: {}
+  karakeep-independent: {}
+  karakeep-protected: {}
+  litellm: {}
+  dashboard: {}
+''', encoding='utf-8')
+    monkeypatch.setattr(_mod, '_find_ext_dir', lambda name: extension if name == 'karakeep' else tmp_path / name if name == 'karakeep-independent' else None)
+    monkeypatch.setattr(_mod, 'CORE_SERVICE_IDS', {'karakeep-protected'})
+    monkeypatch.setattr(_mod, 'resolve_compose_flags', lambda: ['-p', 'ods'])
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return types.SimpleNamespace(returncode=0, stderr='')
+    monkeypatch.setattr(_mod.subprocess, 'run', run)
+    assert _mod.docker_compose_action('karakeep', 'stop') == (True, '')
+    assert calls == [['docker', 'compose', '-p', 'ods', 'stop', 'karakeep', 'karakeep-chrome', 'karakeep-search']]
+
+
+@pytest.mark.parametrize('compose', ['services: [broken]', 'services: {other: {}}', 'services: ['])
+def test_extension_stop_rejects_unreadable_ownership_without_running_docker(tmp_path, monkeypatch, compose):
+    (tmp_path / 'compose.yaml').write_text(compose, encoding='utf-8')
+    monkeypatch.setattr(_mod, '_find_ext_dir', lambda _: tmp_path)
+    monkeypatch.setattr(_mod, 'resolve_compose_flags', lambda: [])
+    monkeypatch.setattr(_mod.subprocess, 'run', lambda *a, **k: pytest.fail('Must not run Docker'))
+    ok, error = _mod.docker_compose_action('karakeep', 'stop')
+    assert not ok
+    assert error
+
+
+def test_extension_stop_preserves_single_service_behavior_without_fragment(monkeypatch):
+    monkeypatch.setattr(_mod, '_find_ext_dir', lambda _: None)
+    assert _mod._extension_stop_targets('legacy') == ['legacy']
+
 _parse_mem_value = _mod._parse_mem_value
+
+
+def test_gpu_counters_prefer_available_powershell7(monkeypatch):
+    monkeypatch.setattr(_mod.shutil, 'which', lambda name: {'pwsh.exe': 'C:/PowerShell/pwsh.exe', 'powershell.exe': 'C:/Windows/powershell.exe'}.get(name))
+    calls = []
+    def run(command, **options):
+        calls.append((command, options))
+        return types.SimpleNamespace(returncode=0, stdout='{"adapters": []}')
+    monkeypatch.setattr(_mod.subprocess, 'run', run)
+    assert _mod._windows_gpu_counters('read CIM') == {'adapters': []}
+    assert len(calls) == 1 and calls[0][0][0] == 'C:/PowerShell/pwsh.exe'
+    assert 0 < calls[0][1]['timeout'] <= 8
+
+
+def test_gpu_counters_fallback_shares_deadline(monkeypatch):
+    monkeypatch.setattr(_mod.shutil, 'which', lambda name: name if name != 'pwsh' else None)
+    times = iter([0, 0.25, 3])
+    monkeypatch.setattr(_mod.time, 'monotonic', lambda: next(times))
+    calls = []
+    def run(command, **options):
+        calls.append((command[0], options['timeout']))
+        return types.SimpleNamespace(returncode=1 if len(calls) == 1 else 0, stdout='{"adapters": []}')
+    monkeypatch.setattr(_mod.subprocess, 'run', run)
+    assert _mod._windows_gpu_counters('read CIM') == {'adapters': []}
+    assert calls == [('pwsh.exe', 7.75), ('powershell.exe', 5)]
+
+
+def test_gpu_counters_failure_never_fabricates_zero_usage(monkeypatch):
+    monkeypatch.setattr(_mod.shutil, 'which', lambda _: None)
+    monkeypatch.setattr(_mod.subprocess, 'run', lambda *a, **kw: types.SimpleNamespace(returncode=0, stdout='{"error":"unavailable"}'))
+    with pytest.raises(RuntimeError, match='unavailable'):
+        _mod._windows_gpu_counters('read CIM')
+
 _iso_now = _mod._iso_now
 _to_bash_path = _mod._to_bash_path
 _resolve_agent_bind_addr = _mod._resolve_agent_bind_addr
@@ -32,9 +744,26 @@ _disable_conflicting_macos_bridge = _mod._disable_conflicting_macos_bridge
 resolve_compose_flags = _mod.resolve_compose_flags
 validate_core_recreate_ids = _mod.validate_core_recreate_ids
 invalidate_compose_cache = _mod.invalidate_compose_cache
-_post_install_core_recreate = _mod._post_install_core_recreate
 _split_nmcli_terse = _mod._split_nmcli_terse
 _request_server_shutdown = _mod._request_server_shutdown
+
+
+@pytest.mark.parametrize("value", [
+    "it's $5 \"q\" back\\slash", "  model #1  ", r"C:\models\file.gguf", "ordinary",
+])
+def test_load_env_reads_dashboard_writer(tmp_path, value):
+    from env_values import quote_env_value
+
+    path = tmp_path / ".env"
+    path.write_text("VALUE=" + quote_env_value(value) + "\n", encoding="utf-8")
+    assert _mod.load_env(path)["VALUE"] == value
+
+
+def test_load_env_retains_legacy_shell_quoted_values(tmp_path):
+    path = tmp_path / ".env"
+    value = "it's $5"
+    path.write_text(_mod._env_assignment("VALUE", value) + "\n", encoding="utf-8")
+    assert _mod.load_env(path)["VALUE"] == value
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +775,243 @@ def _isolate_opencode_config(monkeypatch, tmp_path):
         "_opencode_config_paths",
         lambda: (config_dir / "opencode.json", config_dir / "config.json"),
     )
+
+
+def _host_llm_runtime_fixture(monkeypatch, tmp_path, responses):
+    """A Windows host llama-server whose HTTP answers come from ``responses``."""
+    monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+    monkeypatch.setattr(_mod, "_host_llm_status_cache", (0.0, None))
+    (tmp_path / ".env").write_text(
+        "GPU_BACKEND=amd\nAMD_INFERENCE_LOCATION=host\nAMD_INFERENCE_RUNTIME=llama-server\n"
+        "AMD_INFERENCE_RUNTIME_MODE=windows-native-llama-server\nAMD_INFERENCE_PORT=18080\n"
+        "LLAMA_SERVER_API_KEY=" + "5e" * 32 + "\n",
+        encoding="utf-8",
+    )
+    requested: list = []
+
+    def runtime_http(env, path, **_kwargs):
+        requested.append(path)
+        answer = responses[path]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer if isinstance(answer, str) else json.dumps(answer)
+
+    monkeypatch.setattr(_mod, "_runtime_http", runtime_http)
+    return requested
+
+
+_LLAMA_METRICS = (
+    "# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.\n"
+    "# TYPE llamacpp:prompt_tokens_total counter\n"
+    "llamacpp:prompt_tokens_total 120\n"
+    "llamacpp:tokens_predicted_total 48\n"
+    "llamacpp:tokens_predicted_seconds_total 0.5\n"
+    "llamacpp:requests_processing 0\n"
+    "llamacpp:n_busy_slots_per_decode nan\n"
+)
+
+
+def test_host_llm_status_reads_health_model_context_and_counters(monkeypatch, tmp_path):
+    requested = _host_llm_runtime_fixture(monkeypatch, tmp_path, {
+        "/health": {"status": "ok"},
+        "/v1/models": {"object": "list", "data": [{"id": "model.gguf", "object": "model"}]},
+        "/props": {"model_path": r"C:\Users\private\models\model.gguf",
+                   "build_info": "b9014-3f0a4c2",
+                   "default_generation_settings": {"n_ctx": 65536}},
+        "/metrics": _LLAMA_METRICS,
+    })
+
+    payload = _mod._host_llm_status()
+
+    assert payload["schema_version"] == "ods.host-llm-status.v1"
+    assert payload["source"] == "windows-loopback"
+    assert payload["health"] == {
+        "status": "ok", "version": "b9014-3f0a4c2", "model_loaded": "model.gguf",
+        "context_length": 65536, "vision": None,
+    }
+    assert payload["metrics"] == {
+        "prompt_tokens_total": 120.0, "tokens_predicted_total": 48.0,
+        "tokens_predicted_seconds_total": 0.5, "requests_processing": 0.0,
+    }
+    # Latest-completion stats were a Lemonade API; llama.cpp has counters.
+    assert payload["stats"] is None
+    assert requested == ["/health", "/v1/models", "/props", "/metrics"]
+    assert "private" not in json.dumps(payload)
+
+
+def test_legacy_route_migration_moves_sharing_grants_with_the_model(monkeypatch, tmp_path):
+    # Inference-sharing grants pin the route's ids. The retired Lemonade id of
+    # the same GGUF becomes its llama-server alias, and the grants move too.
+    install = tmp_path / "ods"
+    (install / "data").mkdir(parents=True)
+    (install / ".env").write_text(
+        "ODS_MODE=local\nLLM_BACKEND=llama-server\nGGUF_FILE=Model.gguf\nLLM_MODEL=model-x\n"
+        "CTX_SIZE=32768\nMAX_CONTEXT=32768\n",
+        encoding="utf-8",
+    )
+    state = _mod._switchboard_state
+    state_path = install / "data" / "model-state.json"
+    state.record_verified_route(
+        state_path, catalog_id="model-x", runtime_model_id="Model.gguf", backend_kind="llama-server",
+        endpoint_id="llama-server-default", context_length=32768,
+        capabilities={"chat": True, "tools": False, "vision": False, "agentViable": False},
+        proof_identity="Model.gguf",
+    )
+    legacy = json.loads(state_path.read_text(encoding="utf-8"))
+    legacy["active"]["backend"] = {"kind": "lemonade", "endpointId": "lemonade-default",
+                                   "nativeRoute": "extra.Model.gguf"}
+    legacy["active"]["runtimeModelId"] = legacy["active"]["proof"]["identity"] = "extra.Model.gguf"
+    state_path.write_text(json.dumps(legacy), encoding="utf-8")
+    monkeypatch.setattr(_mod, "INSTALL_DIR", install)
+    monkeypatch.setattr(_mod, "DATA_DIR", install / "data")
+    monkeypatch.setattr(_mod, "_render_model_router_runtime_configs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(_mod, "_catalog_model_for_current_env", lambda _env: ("model-x", {}))
+    (install / "data" / "pixel-inference").mkdir()
+    moves: list = []
+
+    class FakeSharingStore:
+        def __init__(self, directory):
+            assert directory == install / "data" / "pixel-inference"
+
+        def rebind_model(self, *identities):
+            moves.append(identities)
+            return 2
+
+    import pixel_provider.sharing
+    monkeypatch.setattr(pixel_provider.sharing, "SharingStore", FakeSharingStore)
+
+    assert _mod._migrate_legacy_switchboard_route("startup") is True
+
+    assert moves == [("model-x", "extra.Model.gguf", "model-x", "Model.gguf")]
+    active = state.read_state(state_path)[0]["active"]
+    assert (active["backend"]["kind"], active["runtimeModelId"]) == ("llama-server", "Model.gguf")
+
+
+def test_sharing_grants_stay_put_where_sharing_was_never_turned_on(monkeypatch, tmp_path):
+    import pixel_provider.sharing
+    monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pixel_provider.sharing, "SharingStore",
+                        lambda _directory: pytest.fail("no sharing store exists here"))
+
+    _mod._rebind_pixel_sharing_grants(
+        {"catalogId": "model-x", "runtimeModelId": "extra.Model.gguf"}, "model-x", "Model.gguf",
+    )
+
+
+@pytest.mark.parametrize(("modalities", "vision"), [
+    ({"vision": True, "audio": False}, True),
+    ({"vision": False, "audio": False}, False),
+    ({"vision": "true"}, None),
+    (None, None),
+])
+def test_host_llm_status_reports_whether_a_vision_projector_is_loaded(monkeypatch, tmp_path, modalities, vision):
+    # ODS Talk sends images only to a model whose server loaded a projector;
+    # the dashboard cannot read the keyed server's /props itself.
+    props = {"default_generation_settings": {"n_ctx": 8192}}
+    if modalities is not None:
+        props["modalities"] = modalities
+    _host_llm_runtime_fixture(monkeypatch, tmp_path, {
+        "/health": {"status": "ok"},
+        "/v1/models": {"data": [{"id": "model.gguf"}]},
+        "/props": props,
+        "/metrics": "",
+    })
+
+    assert _mod._host_llm_status()["health"]["vision"] is vision
+
+
+def test_host_llm_status_redacts_a_path_shaped_model_id(monkeypatch, tmp_path):
+    _host_llm_runtime_fixture(monkeypatch, tmp_path, {
+        "/health": {"status": "ok"},
+        "/v1/models": {"data": [{"id": r"C:\Users\private\model.gguf"}]},
+        "/props": {"default_generation_settings": {"n_ctx": 4096}},
+        "/metrics": "",
+    })
+
+    payload = _mod._host_llm_status()
+
+    assert payload["health"]["model_loaded"] == "model.gguf"
+    assert payload["metrics"] is None
+    assert "private" not in json.dumps(payload)
+
+
+def test_host_llm_status_reports_loading_without_reading_telemetry(monkeypatch, tmp_path):
+    requested = _host_llm_runtime_fixture(monkeypatch, tmp_path, {
+        "/health": {"error": {"code": 503, "message": "Loading model", "type": "unavailable_error"}},
+    })
+
+    payload = _mod._host_llm_status()
+
+    assert payload["health"]["status"] == "loading"
+    assert payload["health"]["model_loaded"] is None
+    assert payload["metrics"] is None
+    assert requested == ["/health"]
+
+
+def test_host_llm_status_health_survives_a_telemetry_failure(monkeypatch, tmp_path):
+    _host_llm_runtime_fixture(monkeypatch, tmp_path, {
+        "/health": {"status": "ok"},
+        "/v1/models": {"data": [{"id": "model.gguf"}]},
+        "/props": {"default_generation_settings": {"n_ctx": 8192}},
+        "/metrics": OSError("llama-server /metrics is unreachable"),
+    })
+
+    payload = _mod._host_llm_status()
+
+    assert payload["health"]["status"] == "ok"
+    assert payload["health"]["model_loaded"] == "model.gguf"
+    assert payload["metrics"] is None
+
+
+def test_host_llm_status_is_unavailable_when_the_runtime_is_unreachable(monkeypatch, tmp_path):
+    _host_llm_runtime_fixture(monkeypatch, tmp_path, {
+        "/health": OSError("llama-server /health is unreachable (curl exit 7)"),
+    })
+    assert _mod._host_llm_status() is None
+
+
+def test_host_llm_status_is_unsupported_for_a_container_runtime(monkeypatch, tmp_path):
+    monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+    monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
+    (tmp_path / ".env").write_text("GPU_BACKEND=amd\nLLM_BACKEND=llama-server\n", encoding="utf-8")
+    monkeypatch.setattr(_mod, "_host_llm_status", lambda: pytest.fail("no host runtime to read"))
+    handler = _FakeHandler(b"")
+    handler.headers["Authorization"] = "Bearer test-key"
+    _mod.AgentHandler._handle_llm_status(handler)
+    assert handler.response_code == 501
+
+
+def test_host_llm_status_carries_the_runtime_key_only_through_the_transport(monkeypatch, tmp_path):
+    """The key reaches llama-server on curl's stdin, never in argv or the payload."""
+    monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+    monkeypatch.setattr(_mod, "_host_llm_status_cache", (0.0, None))
+    key = "5e" * 32
+    (tmp_path / ".env").write_text(
+        "GPU_BACKEND=amd\nAMD_INFERENCE_LOCATION=host\nAMD_INFERENCE_RUNTIME=llama-server\n"
+        "AMD_INFERENCE_PORT=18080\nLLAMA_SERVER_API_KEY=" + key + "\n",
+        encoding="utf-8",
+    )
+    calls: list = []
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs.get("input")))
+        body = {"/health": {"status": "ok"}, "/v1/models": {"data": [{"id": "m.gguf"}]},
+                "/props": {"default_generation_settings": {"n_ctx": 4096}}}.get(
+            cmd[-1].removeprefix("http://127.0.0.1:18080"), "")
+        return subprocess.CompletedProcess(cmd, 0, stdout=body if isinstance(body, str) else json.dumps(body))
+
+    monkeypatch.setattr(_mod.subprocess, "run", run)
+    payload = _mod._host_llm_status()
+    assert payload["health"]["model_loaded"] == "m.gguf"
+    assert [cmd[-1] for cmd, _ in calls] == [
+        "http://127.0.0.1:18080/health", "http://127.0.0.1:18080/v1/models",
+        "http://127.0.0.1:18080/props", "http://127.0.0.1:18080/metrics",
+    ]
+    assert all(key not in " ".join(cmd) for cmd, _ in calls)
+    assert all(stdin == f"Authorization: Bearer {key}\n" for _, stdin in calls)
+    assert key not in json.dumps(payload)
 
 
 def can_create_symlinks(tmp_path: Path) -> bool:
@@ -197,6 +1163,13 @@ class TestProgressWrites:
 
 class TestResolveAgentBindAddr:
 
+    @pytest.fixture(autouse=True)
+    def native_daemon_info(self, monkeypatch):
+        monkeypatch.setattr(
+            _mod.subprocess, "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "Ubuntu 24.04 LTS\n", ""),
+        )
+
     def test_explicit_bind_wins(self):
         assert _resolve_agent_bind_addr({"ODS_AGENT_BIND": "0.0.0.0"}, "Linux") == "0.0.0.0"
         assert _resolve_agent_bind_addr({"ODS_AGENT_BIND": "192.168.1.10"}, "Linux") == "192.168.1.10"
@@ -216,18 +1189,113 @@ class TestResolveAgentBindAddr:
         assert _resolve_agent_bind_addr({}, "Darwin") == "127.0.0.1"
 
     def test_linux_prefers_ods_network_gateway(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_running_under_wsl", lambda *_args, **_kwargs: False)
         monkeypatch.setattr(_mod, "_detect_docker_network_gateway", lambda network: "172.18.0.1")
         monkeypatch.setattr(_mod, "_detect_docker_bridge_gateway", lambda: "172.17.0.1")
 
         assert _resolve_agent_bind_addr({}, "Linux") == "172.18.0.1"
+        assert _resolve_agent_bind_addr({}, "Linux", require_ods_network=True) == "172.18.0.1"
+
+    def test_managed_linux_refuses_boot_race_bridge_fallback(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_running_under_wsl", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr(_mod, "_detect_docker_network_gateway", lambda network: "")
+        monkeypatch.setattr(_mod, "_detect_docker_bridge_gateway", lambda: "172.17.0.1")
+
+        with pytest.raises(RuntimeError, match="ods-network is unavailable"):
+            _resolve_agent_bind_addr({}, "Linux", require_ods_network=True)
+
+        # An explicit operator bind remains an intentional override.
+        assert _resolve_agent_bind_addr(
+            {"ODS_AGENT_BIND": "127.0.0.1"}, "Linux", require_ods_network=True
+        ) == "127.0.0.1"
+
+    def test_managed_wsl_keeps_its_local_bridge_contract(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_running_under_wsl", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(_mod, "_detect_docker_bridge_gateway", lambda: "172.17.0.1")
+        monkeypatch.setattr(_mod, "_local_bind_address_available", lambda address: address == "172.17.0.1")
+
+        assert _resolve_agent_bind_addr({}, "Linux", require_ods_network=True) == "172.17.0.1"
+
+    def test_systemd_unit_retries_until_scoped_network_exists(self):
+        unit = (_agent_path.parents[1] / "scripts/systemd/ods-host-agent.service").read_text(
+            encoding="utf-8"
+        )
+        assert "--require-ods-network" in unit
+        assert "StartLimitIntervalSec=0" in unit
+        assert "Restart=on-failure" in unit
+        assert "RestartSec=5" in unit
+
+    @pytest.mark.parametrize('gpu_backend', ['nvidia', 'amd', 'cpu'])
+    def test_wsl_boot_recovers_after_docker_starts_without_guessing_route(self, monkeypatch, gpu_backend):
+        results = iter([subprocess.CompletedProcess([], 1, '', 'daemon starting'),
+                        subprocess.CompletedProcess([], 0, 'Docker Desktop\n', '')])
+        monkeypatch.setattr(_mod, '_running_under_wsl', lambda *_args: True)
+        monkeypatch.setattr(_mod.subprocess, 'run', lambda *_args, **_kwargs: next(results))
+        monkeypatch.setattr(_mod, '_detect_docker_bridge_gateway',
+                            lambda: pytest.fail('unknown/Desktop daemon must not guess a native bridge'))
+        env = {'GPU_BACKEND': gpu_backend}
+        with pytest.raises(RuntimeError, match='Cannot identify'):
+            _resolve_agent_bind_addr(env, 'Linux', require_ods_network=True)
+        # The installed service retries the same entry point, without a
+        # sticky failure or fallback address surviving the previous attempt.
+        assert _resolve_agent_bind_addr(env, 'Linux', require_ods_network=True) == '127.0.0.1'
+
+    def test_wsl_native_docker_uses_locally_owned_bridge_gateway(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_running_under_wsl", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(_mod, "_detect_docker_bridge_gateway", lambda: "172.17.0.1")
+        monkeypatch.setattr(_mod, "_local_bind_address_available", lambda address: address == "172.17.0.1")
+
+        assert _resolve_agent_bind_addr({}, "Linux") == "172.17.0.1"
+
+    def test_wsl_docker_desktop_uses_loopback_for_unbindable_bridge(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_running_under_wsl", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(
+            _mod,
+            "_detect_docker_bridge_gateway",
+            lambda: "172.17.0.1",
+        )
+        monkeypatch.setattr(_mod, "_local_bind_address_available", lambda _address: False)
+
+        assert _resolve_agent_bind_addr({}, "Linux") == "127.0.0.1"
+
+    def test_wsl_desktop_ignores_leftover_bindable_native_bridge(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_running_under_wsl", lambda *_args: True)
+        monkeypatch.setattr(_mod, "_detect_docker_bridge_gateway", lambda: "172.17.0.1")
+        monkeypatch.setattr(_mod, "_local_bind_address_available", lambda _address: True)
+        monkeypatch.setattr(
+            _mod.subprocess, "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "Docker Desktop\n", ""),
+        )
+        assert _resolve_agent_bind_addr({}, "Linux", require_ods_network=True) == "127.0.0.1"
+
+    @pytest.mark.parametrize("returncode,output", [(1, ""), (0, "")])
+    def test_wsl_refuses_unknown_daemon_route(self, monkeypatch, returncode, output):
+        monkeypatch.setattr(_mod, "_running_under_wsl", lambda *_args: True)
+        monkeypatch.setattr(
+            _mod.subprocess, "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args[0], returncode, output, ""),
+        )
+        with pytest.raises(RuntimeError, match="Cannot identify the WSL Docker daemon"):
+            _resolve_agent_bind_addr({}, "Linux", require_ods_network=True)
+
+    @pytest.mark.parametrize("error", [OSError("missing docker"), subprocess.TimeoutExpired("docker", 10)])
+    def test_wsl_daemon_io_failure_is_actionable(self, monkeypatch, error):
+        monkeypatch.setattr(_mod, "_running_under_wsl", lambda *_args: True)
+        def fail(*args, **kwargs):
+            raise error
+        monkeypatch.setattr(_mod.subprocess, "run", fail)
+        with pytest.raises(RuntimeError, match="Cannot identify the WSL Docker daemon"):
+            _resolve_agent_bind_addr({}, "Linux", require_ods_network=True)
 
     def test_linux_falls_back_to_bridge_gateway(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_running_under_wsl", lambda *_args, **_kwargs: False)
         monkeypatch.setattr(_mod, "_detect_docker_network_gateway", lambda network: "")
         monkeypatch.setattr(_mod, "_detect_docker_bridge_gateway", lambda: "172.17.0.1")
 
         assert _resolve_agent_bind_addr({}, "Linux") == "172.17.0.1"
 
     def test_linux_falls_back_to_loopback(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_running_under_wsl", lambda *_args, **_kwargs: False)
         monkeypatch.setattr(_mod, "_detect_docker_network_gateway", lambda network: "")
         monkeypatch.setattr(_mod, "_detect_docker_bridge_gateway", lambda: "")
 
@@ -390,6 +1458,78 @@ class TestMacosDirectBindBridgeCollision:
 
 
 class TestResolveComposeFlags:
+
+    def test_reresolve_uses_persisted_gateway_route_without_upstream_url(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir = tmp_path / "ods"
+        scripts_dir = install_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "resolve-compose-stack.sh").write_text("#!/usr/bin/env bash\n")
+        upstream = "https://private.example.test/token-in-url"
+        (install_dir / ".env").write_text(
+            "ODS_MODE=local\nODS_GATEWAY_ONLY=true\nENABLE_OPEN_WEBUI=false\n"
+            f"EXTERNAL_LLM_URL={upstream}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "TIER", "1")
+        monkeypatch.setattr(_mod, "GPU_BACKEND", "nvidia")
+        monkeypatch.setattr(_mod, "GPU_COUNT", "1")
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod, "_find_usable_bash", lambda: "/bin/bash")
+        monkeypatch.setenv("ODS_GATEWAY_ONLY", "false")
+        monkeypatch.setenv("ENABLE_OPEN_WEBUI", "true")
+        monkeypatch.setenv("EXTERNAL_LLM_URL", "http://stale.example.test")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0,
+                stdout="-f docker-compose.base.yml -f docker-compose.external-llm.yml\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        assert resolve_compose_flags()[-2:] == ["-f", "docker-compose.external-llm.yml"]
+        env = calls[0][1]["env"]
+        assert env["ODS_EXTERNAL_LLM_SELECTED"] == "true"
+        assert env["ODS_GATEWAY_ONLY"] == "true"
+        assert env["ENABLE_OPEN_WEBUI"] == "false"
+        assert "EXTERNAL_LLM_URL" not in env
+        assert upstream not in str(calls)
+
+    def test_reresolve_keeps_local_route_when_agent_environment_is_stale(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir = tmp_path / "ods"
+        scripts_dir = install_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "resolve-compose-stack.sh").write_text("#!/usr/bin/env bash\n")
+        (install_dir / ".env").write_text("ODS_MODE=local\n", encoding="utf-8")
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "TIER", "1")
+        monkeypatch.setattr(_mod, "GPU_BACKEND", "nvidia")
+        monkeypatch.setattr(_mod, "GPU_COUNT", "1")
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod, "_find_usable_bash", lambda: "/bin/bash")
+        monkeypatch.setenv("EXTERNAL_LLM_URL", "http://stale.example.test")
+        monkeypatch.setenv("ODS_GATEWAY_ONLY", "true")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="-f docker-compose.base.yml\n", stderr="",
+            )
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        assert resolve_compose_flags() == ["-f", "docker-compose.base.yml"]
+        env = calls[0][1]["env"]
+        assert env["ODS_EXTERNAL_LLM_SELECTED"] == "false"
+        assert "EXTERNAL_LLM_URL" not in env
+        assert "ODS_GATEWAY_ONLY" not in env
 
     def test_windows_passes_host_python_to_bash_resolver(self, tmp_path, monkeypatch):
         install_dir = tmp_path / "ods"
@@ -901,7 +2041,41 @@ class TestFindUsableBash:
         monkeypatch.setattr(_mod.subprocess, "run", fake_run)
 
         assert _mod._find_usable_bash() is None
-        assert _mod._usable_bash is False
+        # Negative result is not cached as False — it resets to None so a
+        # subsequent call can re-probe if the transient condition clears.
+        assert _mod._usable_bash is None
+
+    def test_bash_discovery_retries_after_a_transient_probe_failure(self, monkeypatch):
+        git = r"C:\Test\Git\cmd\git.exe"
+        bash = r"C:\Test\Git\bin\bash.exe"
+        outcomes = iter([1, 0])
+
+        monkeypatch.setattr(_mod, "_usable_bash", None)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(_mod.shutil, "which", lambda name: git if name == "git" else None)
+        monkeypatch.setattr(_mod.Path, "exists", lambda path: str(path) == bash)
+
+        def fake_run(cmd, *args, **kwargs):
+            return subprocess.CompletedProcess(cmd, next(outcomes), "ok", "")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        assert _mod._find_usable_bash() is None
+        assert _mod._usable_bash is None
+        assert _mod._find_usable_bash() == bash
+        assert _mod._usable_bash == bash
+
+    def test_update_bash_retries_after_a_transient_discovery_failure(self, monkeypatch):
+        bash = "/test/bin/bash"
+        outcomes = iter([None, bash])
+
+        monkeypatch.setattr(_mod, "_update_usable_bash", None)
+        monkeypatch.setattr(_mod, "_find_usable_bash", lambda: next(outcomes))
+
+        assert _mod._find_update_bash() is None
+        assert _mod._update_usable_bash is None
+        assert _mod._find_update_bash() == bash
+        assert _mod._update_usable_bash == bash
 
 
 class TestValidateCoreRecreateIds:
@@ -939,6 +2113,128 @@ class TestValidateCoreRecreateIds:
 
 
 class TestResolveComposeFlagsCache:
+
+    def test_cached_recipe_is_checked_before_any_docker_command(self, tmp_path, monkeypatch):
+        import shutil
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        source = Path(_mod.__file__).resolve().parent.parent / 'scripts/resolve-compose-stack.sh'
+        shutil.copyfile(source, scripts / source.name)
+        extension = tmp_path / 'data/user-extensions/example'
+        extension.mkdir(parents=True)
+        (extension / 'compose.yaml').write_text(
+            'services:\n  example:\n    image: example/app:1\n    privileged: true\n', encoding='utf-8')
+        saved = '-f docker-compose.base.yml -f data/user-extensions/example/compose.yaml'
+        (tmp_path / '.compose-flags').write_text(saved, encoding='utf-8')
+        monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+        monkeypatch.setattr(_mod.subprocess, 'run', lambda *a, **k: pytest.fail('No Docker command may run'))
+        with pytest.raises(ValueError, match='requires review'):
+            resolve_compose_flags()
+        assert (tmp_path / '.compose-flags').read_text(encoding='utf-8') == saved
+
+    def test_dashboard_disable_recovers_policy_rejected_target_without_starting_it(
+        self, tmp_path, monkeypatch,
+    ):
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        shutil.copyfile(_agent_path.parents[1] / 'scripts/extension-selection.py',
+                        scripts / 'extension-selection.py')
+        (scripts / 'stop-owned-containers.py').write_text(
+            'raise SystemExit(0)\n', encoding='utf-8',
+        )
+        (tmp_path / 'docker-compose.base.yml').write_text(
+            'services: {}\n', encoding='utf-8',
+        )
+        extension = tmp_path / 'data/user-extensions/example'
+        extension.mkdir(parents=True)
+        (extension / 'manifest.yaml').write_text(
+            'service:\n  id: example\n', encoding='utf-8',
+        )
+        (extension / 'compose.yaml').write_text(
+            'services:\n  example:\n    image: example/app:1\n    privileged: true\n',
+            encoding='utf-8',
+        )
+        (extension / 'owner-data.db').write_text('keep', encoding='utf-8')
+        (tmp_path / '.compose-flags').write_text(
+            '-f docker-compose.base.yml -f data/user-extensions/example/compose.yaml',
+            encoding='utf-8',
+        )
+        monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+        monkeypatch.setattr(_mod._model_stores, 'active_compose_overlay',
+                            lambda *_args: None)
+        if sys.platform == 'win32':
+            monkeypatch.delitem(sys.modules, 'fcntl', raising=False)
+
+        with pytest.raises(ValueError, match='requires review'):
+            _mod._apply_extension_selection(['example'], activate=True)
+        assert (extension / 'compose.yaml').is_file()
+
+        assert _mod._apply_extension_selection(['example'], activate=False) == 'disabled'
+        assert (extension / 'compose.yaml.disabled').is_file()
+        assert (extension / 'owner-data.db').read_text(encoding='utf-8') == 'keep'
+        assert not (tmp_path / '.compose-flags').exists()
+
+    @pytest.mark.parametrize('order', [('other', 'example'), ('example', 'other')])
+    def test_dashboard_disable_does_not_bypass_another_rejected_recipe(
+        self, tmp_path, monkeypatch, order,
+    ):
+        user_root = tmp_path / 'data/user-extensions'
+        for service_id in ('other', 'example'):
+            extension = user_root / service_id
+            extension.mkdir(parents=True)
+            (extension / 'manifest.yaml').write_text(
+                f'service:\n  id: {service_id}\n', encoding='utf-8',
+            )
+            (extension / 'compose.yaml').write_text(
+                f'services:\n  {service_id}:\n    image: example/app:1\n'
+                '    privileged: true\n',
+                encoding='utf-8',
+            )
+        (tmp_path / '.compose-flags').write_text(
+            ' '.join(f'-f data/user-extensions/{service_id}/compose.yaml'
+                     for service_id in order), encoding='utf-8',
+        )
+        monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+        with pytest.raises(ValueError, match='Cached extension other requires review'):
+            _mod.resolve_compose_flags(recovery_disable_service='example')
+        assert (user_root / 'example/compose.yaml').is_file()
+
+    def test_dashboard_recovery_keeps_base_overlay_provider_selected(
+        self, tmp_path, monkeypatch,
+    ):
+        scripts = tmp_path / 'scripts'
+        scripts.mkdir()
+        shutil.copyfile(_agent_path.parents[1] / 'scripts/extension-selection.py',
+                        scripts / 'extension-selection.py')
+        (scripts / 'stop-owned-containers.py').write_text(
+            'raise AssertionError("base provider must not be stopped")\n',
+            encoding='utf-8',
+        )
+        (tmp_path / 'docker-compose.external-llm.yml').write_text(
+            'services:\n  litellm: {}\n', encoding='utf-8',
+        )
+        extension = tmp_path / 'data/user-extensions/litellm'
+        extension.mkdir(parents=True)
+        (extension / 'manifest.yaml').write_text(
+            'service:\n  id: litellm\n', encoding='utf-8',
+        )
+        (extension / 'compose.yaml').write_text(
+            'services:\n  litellm:\n    image: example/litellm:1\n'
+            '    privileged: true\n', encoding='utf-8',
+        )
+        (tmp_path / '.compose-flags').write_text(
+            '-f docker-compose.external-llm.yml '
+            '-f data/user-extensions/litellm/compose.yaml', encoding='utf-8',
+        )
+        monkeypatch.setattr(_mod, 'INSTALL_DIR', tmp_path)
+        monkeypatch.setattr(_mod._model_stores, 'active_compose_overlay',
+                            lambda *_args: None)
+        if sys.platform == 'win32':
+            monkeypatch.delitem(sys.modules, 'fcntl', raising=False)
+
+        with pytest.raises(ValueError, match='requires litellm'):
+            _mod._apply_extension_selection(['litellm'], activate=False)
+        assert (extension / 'compose.yaml').is_file()
 
     def test_prefers_saved_compose_flags_file(self, tmp_path, monkeypatch):
         install_dir = tmp_path / "ods"
@@ -1435,12 +2731,14 @@ class TestUpdateWire:
 
 
 class TestComposeToggleWire:
-    """End-to-end HTTP test for built-in compose toggles via the host agent."""
+    """An old Dashboard must not bypass host selection while updating."""
 
-    def test_client_posts_to_host_agent_and_renames_builtin_compose(
+    def test_legacy_toggle_fails_closed_without_changing_compose(
         self, tmp_path, monkeypatch, host_agent_wire_client,
     ):
         import threading
+        import urllib.error
+        import urllib.request
         from http.server import HTTPServer
 
         from routers import extensions as ext_router
@@ -1466,14 +2764,24 @@ class TestComposeToggleWire:
         thread.start()
         try:
             host_agent_wire_client(port)
-
-            assert ext_router._call_agent_compose_rename("activate", "fakesvc") is True
-            assert (ext_dir / "compose.yaml").exists()
-            assert not (ext_dir / "compose.yaml.disabled").exists()
-
-            assert ext_router._call_agent_compose_rename("deactivate", "fakesvc") is True
+            assert ext_router._call_agent_compose_rename("activate", "fakesvc") is False
             assert (ext_dir / "compose.yaml.disabled").exists()
             assert not (ext_dir / "compose.yaml").exists()
+
+            for action in ("activate", "deactivate"):
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/extension/{action}",
+                    data=json.dumps({"service_id": "fakesvc"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json",
+                             "Authorization": "Bearer wire-test-secret"},
+                    method="POST",
+                )
+                with pytest.raises(urllib.error.HTTPError) as rejected:
+                    urllib.request.urlopen(request, timeout=2)
+                assert rejected.value.code == 410
+                assert "Finish updating ODS" in rejected.value.read().decode("utf-8")
+                assert (ext_dir / "compose.yaml.disabled").exists()
+                assert not (ext_dir / "compose.yaml").exists()
 
             host_agent_wire_client(port, key="wrong-secret")
             assert ext_router._call_agent_compose_rename("activate", "fakesvc") is False
@@ -1671,6 +2979,45 @@ class TestSyncExtensionConfigWire:
             assert _body.get("preserve_existing") is True
             assert (target / "settings.yaml").read_text(encoding="utf-8") == "server: customized\n"
             assert (target / "new.yaml").read_text(encoding="utf-8") == "new: default\n"
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    @pytest.mark.parametrize("layout", ["absent", "no-config", "other-service", "file-conflict"])
+    def test_preserving_sync_noop_receipts_and_file_conflicts(self, tmp_path, monkeypatch, layout):
+        import threading
+        from http.server import HTTPServer
+
+        install_dir = tmp_path / "install"
+        user_root = install_dir / "data" / "user-extensions"
+        user_root.mkdir(parents=True)
+        if layout != "absent":
+            extension = user_root / "fakesvc"
+            extension.mkdir()
+            if layout == "other-service":
+                (extension / "config" / "another").mkdir(parents=True)
+            if layout == "file-conflict":
+                source = extension / "config" / "fakesvc"
+                source.mkdir(parents=True)
+                (source / "settings.yaml").write_text("setting: default", encoding="utf-8")
+                (install_dir / "config" / "fakesvc" / "settings.yaml").mkdir(parents=True)
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "USER_EXTENSIONS_DIR", user_root)
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "wire-test-secret")
+        server = HTTPServer(("127.0.0.1", 0), _mod.AgentHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            status, body = self._post(server.server_address[1], "fakesvc", preserve_existing=True)
+            if layout == "file-conflict":
+                assert status == 500
+                assert "must be a file" in body["error"]
+                assert (install_dir / "config" / "fakesvc" / "settings.yaml").is_dir()
+            else:
+                assert status == 200
+                assert body["preserve_existing"] is True
+                assert body["synced"] == []
         finally:
             server.shutdown()
             server.server_close()
@@ -2113,84 +3460,6 @@ class TestInstallStartCommandNoDeps:
         )
 
 
-# --- _post_install_core_recreate ---
-#
-# openclaw's compose.yaml adds OPENAI_API_BASE_URLS to open-webui as an overlay;
-# `docker compose up -d openclaw` (used by _handle_install) won't pick up
-# overlay changes targeting already-running core services without
-# `--force-recreate`. Hence the post-install recreate of open-webui whenever
-# openclaw is installed.
-
-
-class TestPostInstallCoreRecreate:
-
-    def test_openclaw_triggers_open_webui_recreate(self, monkeypatch):
-        calls = []
-
-        def _fake_recreate(ids):
-            calls.append(list(ids))
-            return True, ""
-
-        monkeypatch.setattr(_mod, "docker_compose_recreate", _fake_recreate)
-        _post_install_core_recreate("openclaw")
-        assert calls == [["open-webui"]]
-
-    def test_non_openclaw_service_is_noop(self, monkeypatch):
-        calls = []
-
-        def _fake_recreate(ids):
-            calls.append(list(ids))
-            return True, ""
-
-        monkeypatch.setattr(_mod, "docker_compose_recreate", _fake_recreate)
-        for svc in ("litellm", "n8n", "perplexica", "whisper", "comfyui"):
-            _post_install_core_recreate(svc)
-        assert calls == []
-
-    def test_recreate_failure_is_swallowed(self, monkeypatch):
-        """Install must not fail if the post-install recreate errors — openclaw
-        is already running; the overlay just won't take effect until a manual
-        core restart."""
-
-        def _fake_recreate(_ids):
-            return False, "docker compose exploded"
-
-        monkeypatch.setattr(_mod, "docker_compose_recreate", _fake_recreate)
-        # Must not raise
-        _post_install_core_recreate("openclaw")
-
-
-class TestRunInstallCallsPostInstallRecreate:
-    """Source-level check that the install closure calls
-    _post_install_core_recreate after the "started" progress write.
-
-    The dynamic flow runs in a daemon thread + nested closure, which makes
-    runtime mocking fragile (see TestInstallHookEnvAllowlist for the same
-    reasoning). Source-level assertion is sufficient to lock the wiring."""
-
-    def _install_source(self):
-        import inspect
-        return inspect.getsource(_mod.AgentHandler._handle_install)
-
-    def test_install_calls_post_install_core_recreate(self):
-        src = self._install_source()
-        assert "_post_install_core_recreate(service_id)" in src, (
-            "_run_install must invoke _post_install_core_recreate(service_id) "
-            "after emitting the 'started' progress record"
-        )
-
-    def test_recreate_is_after_started_progress_write(self):
-        src = self._install_source()
-        started_idx = src.find('"started"')
-        recreate_idx = src.find("_post_install_core_recreate(")
-        assert started_idx != -1, "expected 'started' progress write in _handle_install"
-        assert recreate_idx != -1, "expected _post_install_core_recreate call in _handle_install"
-        assert started_idx < recreate_idx, (
-            "_post_install_core_recreate must run AFTER the 'started' progress "
-            "write so the client sees success even if the recreate fails"
-        )
-
-
 # --- _handle_env_update ---
 
 
@@ -2225,12 +3494,186 @@ class _FakeHandler:
         return json.loads(self.wfile.getvalue().decode("utf-8"))
 
 
+class TestPixelOperationsStatus:
+    @pytest.fixture(autouse=True)
+    def _auth(self, monkeypatch):
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
+
+    def test_projects_exact_manager_receipt_and_fixed_approval_command(
+        self, monkeypatch
+    ):
+        job_id = "ops-1788127319657-f3262c99a419"
+        plan_hash = "e" * 64
+
+        class TrustedApproval:
+            def lstat(self):
+                return types.SimpleNamespace(
+                    st_mode=_mod.stat_mod.S_IFREG | 0o755,
+                    st_nlink=1,
+                    st_uid=1000,
+                    st_size=4096,
+                )
+
+            def __str__(self):
+                return "/opt/ods/bin/ods-pixel-approve"
+
+        class TrustedInstall:
+            def __truediv__(self, item):
+                return self if item == "bin" else TrustedApproval()
+
+        class TrustedHelper:
+            def lstat(self):
+                return types.SimpleNamespace(
+                    st_mode=_mod.stat_mod.S_IFREG | 0o755,
+                    st_nlink=1,
+                    st_uid=0,
+                    st_size=4096,
+                )
+
+            def __str__(self):
+                return "/usr/local/libexec/ods-pixel-extension-manager.py"
+
+        projection = {
+            "schemaVersion": 1,
+            "kind": "ods-pixel-operations-status",
+            "jobId": job_id,
+            "planHash": plan_hash,
+            "status": "awaiting-approval",
+            "riskTier": "managed",
+            "approvalRequired": True,
+            "updatedAt": "2026-08-30T22:01:59Z",
+        }
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(projection).encode("utf-8"),
+                stderr=b"",
+            )
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", TrustedInstall())
+        monkeypatch.setattr(_mod, "PIXEL_OPS_STATUS_HELPER", TrustedHelper())
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod.os, "getuid", lambda: 1000, raising=False)
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        handler = _FakeHandler(b"")
+
+        _mod.AgentHandler._handle_pixel_ops_status(
+            handler,
+            {"job_id": [job_id], "plan_hash": [plan_hash]},
+        )
+
+        assert handler.response_code == 200
+        body = handler.parse_response()
+        assert body == {
+            **projection,
+            "approvalCommand": f"/opt/ods/bin/ods-pixel-approve {job_id} {plan_hash} --confirm",
+        }
+        assert calls[0][0] == [
+            "/usr/bin/python3",
+            "/usr/local/libexec/ods-pixel-extension-manager.py",
+            "status",
+            "/run/ods-pixel-manager/extension-manager.sock",
+            job_id,
+            plan_hash,
+        ]
+        assert calls[0][1]["cwd"] == "/"
+        assert calls[0][1]["env"] == {
+            "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            {"job_id": ["../../shadow"], "plan_hash": ["e" * 64]},
+            {
+                "job_id": ["ops-1788127319657-f3262c99a419"],
+                "plan_hash": ["e" * 64],
+                "path": ["/etc/shadow"],
+            },
+        ],
+    )
+    def test_rejects_unbounded_status_queries(self, query):
+        handler = _FakeHandler(b"")
+        _mod.AgentHandler._handle_pixel_ops_status(handler, query)
+        assert handler.response_code == 400
+
+
 class TestRemoteProviderLifecycle:
     """Direct host-agent tests for remote-provider lifecycle planning/apply."""
 
     @pytest.fixture(autouse=True)
     def _auth(self, monkeypatch):
         monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX secret modes")
+    def test_repairs_legacy_provider_secret_modes_without_widening_peer_token(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        secret_dir = tmp_path / "remote-provider" / "secrets"
+        secret_dir.mkdir(parents=True)
+        provider = secret_dir / "provider-api-key"
+        peer = secret_dir / "peer-token"
+        provider.write_text("provider-secret\n", encoding="utf-8")
+        peer.write_text("peer-secret\n", encoding="utf-8")
+        provider.chmod(0o600)
+        peer.chmod(0o600)
+
+        repaired = _mod._repair_remote_provider_secret_permissions()
+
+        assert repaired == ["REMOTE_LLM_API_KEY"]
+        assert stat.S_IMODE(provider.stat().st_mode) == 0o640
+        assert stat.S_IMODE(peer.stat().st_mode) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX secret modes")
+    def test_secret_writer_keeps_peer_token_owner_only(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(_mod, "_remote_provider_secret_owner", lambda: (None, None))
+
+        _mod._write_remote_provider_secret("REMOTE_LLM_API_KEY", "provider-secret")
+        _mod._write_remote_provider_secret("REMOTE_ODS_PEER_TOKEN", "peer-secret")
+
+        secret_dir = tmp_path / "remote-provider" / "secrets"
+        assert stat.S_IMODE((secret_dir / "provider-api-key").stat().st_mode) == 0o640
+        assert stat.S_IMODE((secret_dir / "peer-token").stat().st_mode) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX secret modes")
+    def test_secret_permission_repair_refuses_symlinks(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        if not can_create_symlinks(tmp_path):
+            pytest.skip("symlinks unavailable")
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        secret_dir = tmp_path / "remote-provider" / "secrets"
+        secret_dir.mkdir(parents=True)
+        target = tmp_path / "outside-secret"
+        target.write_text("outside\n", encoding="utf-8")
+        target.chmod(0o600)
+        (secret_dir / "provider-api-key").symlink_to(target)
+
+        assert _mod._repair_remote_provider_secret_permissions() == []
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX secret ownership")
+    def test_root_secret_owner_uses_provider_group_without_container_ownership(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(_mod.os, "geteuid", lambda: 0)
+
+        assert _mod._remote_provider_secret_owner() == (
+            0,
+            _mod._REMOTE_PROVIDER_EGRESS_GID,
+        )
 
     def _configure_payload(self):
         return {
@@ -2374,6 +3817,17 @@ class TestRemoteProviderLifecycle:
     ):
         monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
         probes = self._patch_successful_probe(monkeypatch)
+        monkeypatch.setattr(
+            _mod,
+            "_activate_remote_provider_route",
+            lambda route: {
+                "active": True,
+                "proven": True,
+                "publicModel": "ods/current",
+                "model": route["provider"]["model"],
+                "pixel": "reconciled",
+            },
+        )
         payload = self._configure_payload()
         handler = _FakeHandler(json.dumps(payload).encode("utf-8"))
 
@@ -2386,6 +3840,7 @@ class TestRemoteProviderLifecycle:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         assert handler.response_code == 200
         assert body["applied"] is True
+        assert body["staged"] is False
         assert body["mutated"] is True
         assert body["rollback"] == {"attempted": False, "ok": None}
         assert body["probe"]["schema"] == "ods.remote-provider-probe-receipt.v1"
@@ -2402,6 +3857,8 @@ class TestRemoteProviderLifecycle:
         assert probes[0][0]["provider"]["baseUrl"] == "https://gpu.example.test/v1"
         assert probes[0][1] == "unit-test-provider-token"
         assert secret_path.read_text(encoding="utf-8") == "unit-test-provider-token\n"
+        if os.name != "nt":
+            assert stat.S_IMODE(secret_path.stat().st_mode) == 0o640
         assert "unit-test-provider-token" not in dumped
 
     def test_route_state_preserves_ssh_metadata_without_secret_values(self):
@@ -2445,7 +3902,8 @@ class TestRemoteProviderLifecycle:
         secret_dir = root / "secrets"
         state = json.loads(state_path.read_text(encoding="utf-8"))
         assert handler.response_code == 200
-        assert body["applied"] is True
+        assert body["applied"] is False
+        assert body["staged"] is True
         assert body["mutated"] is True
         assert body["proof"] == {
             "required": True,
@@ -2470,6 +3928,9 @@ class TestRemoteProviderLifecycle:
         assert (secret_dir / "known_hosts").read_text(encoding="utf-8") == (
             "gpu.example.test ssh-ed25519 AAAATEST\n"
         )
+        if os.name != "nt":
+            for filename in ("provider-api-key", "ssh-identity", "known_hosts"):
+                assert stat.S_IMODE((secret_dir / filename).stat().st_mode) == 0o640
         assert "unit-test-provider-token" not in dumped
         assert "unit-test-key" not in dumped
         assert "AAAATEST" not in dumped
@@ -2492,6 +3953,17 @@ class TestRemoteProviderLifecycle:
         plan = _mod._plan_remote_provider_lifecycle_operation(payload)
         state = _mod._remote_provider_route_state_from_plan(plan)
         (root / "routing-state.json").write_text(json.dumps(state), encoding="utf-8")
+        monkeypatch.setattr(
+            _mod,
+            "_activate_remote_provider_route",
+            lambda route: {
+                "active": True,
+                "proven": True,
+                "publicModel": "ods/current",
+                "model": route["provider"]["model"],
+                "pixel": "reconciled",
+            },
+        )
         handler = _FakeHandler(b"")
 
         _mod.AgentHandler._handle_remote_provider_ssh_supervisor_status(handler)
@@ -2523,6 +3995,18 @@ class TestRemoteProviderLifecycle:
         plan = _mod._plan_remote_provider_lifecycle_operation(payload)
         state = _mod._remote_provider_route_state_from_plan(plan)
         (root / "routing-state.json").write_text(json.dumps(state), encoding="utf-8")
+        monkeypatch.setattr(
+            _mod,
+            "_activate_remote_provider_route",
+            lambda route: {
+                "active": True,
+                "proven": True,
+                "publicModel": "ods/current",
+                "model": route["provider"]["model"],
+                "routeFingerprint": _mod._remote_provider_route_fingerprint(route),
+                "pixel": "reconciled",
+            },
+        )
         handler = _FakeHandler(
             json.dumps(self._egress_probe_response()).encode("utf-8")
         )
@@ -2553,6 +4037,14 @@ class TestRemoteProviderLifecycle:
             "schema": "ods.remote-provider-proof-record.v1",
             "recorded": True,
             "status": expected_status,
+            "activation": {
+                "active": True,
+                "proven": True,
+                "publicModel": "ods/current",
+                "model": "qwen/remote:latest",
+                "routeFingerprint": _mod._remote_provider_route_fingerprint(state),
+                "pixel": "reconciled",
+            },
         }
         assert recorded_state["provider"]["transport"] == "ssh"
         assert recorded_state["ssh"]["host"] == "gpu.example.test"
@@ -2638,7 +4130,7 @@ class TestRemoteProviderLifecycle:
         body = handler.parse_response()
         dumped = json.dumps(body, sort_keys=True)
         assert handler.response_code == 200
-        assert body["applied"] is True
+        assert body["applied"] is False
         assert body["mutated"] is False
         assert body["probe"]["ok"] is True
         assert body["probe"]["verifiedAt"] == "2026-07-26T00:00:00+00:00"
@@ -2715,12 +4207,20 @@ class TestRemoteProviderLifecycle:
         tmp_path,
     ):
         monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(
+            _mod,
+            "_deactivate_remote_provider_route",
+            lambda: {"active": False, "restored": False, "reason": "not_activated"},
+        )
         root = tmp_path / "remote-provider"
         secret_path = root / "secrets" / "provider-api-key"
         secret_path.parent.mkdir(parents=True)
         secret_path.write_text("old-provider-token\n", encoding="utf-8")
+        active_plan = _mod._plan_remote_provider_lifecycle_operation(
+            self._configure_payload()
+        )
         (root / "routing-state.json").write_text(
-            json.dumps({"schema": "ods.remote-routing-state.v1", "enabled": True}),
+            json.dumps(_mod._remote_provider_route_state_from_plan(active_plan)),
             encoding="utf-8",
         )
         handler = _FakeHandler(json.dumps({"action": "disable"}).encode("utf-8"))
@@ -2731,7 +4231,274 @@ class TestRemoteProviderLifecycle:
         assert handler.response_code == 200
         assert state["enabled"] is False
         assert state["provider"] is None
+        assert state["resume"]["available"] is True
+        assert len(state["resume"]["profileSha256"]) == 64
+        profile = root / "provider-profile.json"
+        assert profile.exists()
+        if os.name != "nt":
+            assert stat.S_IMODE(profile.stat().st_mode) == 0o600
         assert secret_path.read_text(encoding="utf-8") == "old-provider-token\n"
+
+    def test_apply_enable_reproves_saved_direct_route_without_new_secrets(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        probes = self._patch_successful_probe(monkeypatch)
+        activations = []
+        monkeypatch.setattr(
+            _mod,
+            "_activate_remote_provider_route",
+            lambda route: activations.append(route) or {
+                "active": True,
+                "proven": True,
+                "model": route["provider"]["model"],
+            },
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_deactivate_remote_provider_route",
+            lambda: {"active": False, "restored": True, "proven": True},
+        )
+
+        configure = _FakeHandler(
+            json.dumps(self._configure_payload()).encode("utf-8")
+        )
+        _mod.AgentHandler._handle_remote_provider_apply(configure)
+        disable = _FakeHandler(json.dumps({"action": "disable"}).encode("utf-8"))
+        _mod.AgentHandler._handle_remote_provider_apply(disable)
+        enable = _FakeHandler(json.dumps({"action": "enable"}).encode("utf-8"))
+        _mod.AgentHandler._handle_remote_provider_apply(enable)
+
+        root = tmp_path / "remote-provider"
+        state = json.loads((root / "routing-state.json").read_text(encoding="utf-8"))
+        body = enable.parse_response()
+        assert configure.response_code == 200
+        assert disable.response_code == 200
+        assert enable.response_code == 200
+        assert body["action"] == "enable"
+        assert body["applied"] is True
+        assert body["staged"] is False
+        assert body["probe"]["ok"] is True
+        assert state["enabled"] is True
+        assert state["provider"]["model"] == "qwen/remote:latest"
+        assert state["status"]["proven"] is True
+        assert state["resume"]["available"] is True
+        assert len(probes) == 2
+        assert probes[-1][1] == "unit-test-provider-token"
+        assert len(activations) == 2
+
+    def test_apply_enable_stages_saved_ssh_route_for_fresh_egress_proof(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(
+            _mod,
+            "_deactivate_remote_provider_route",
+            lambda: {"active": False, "restored": True, "proven": True},
+        )
+        configure = _FakeHandler(
+            json.dumps(self._ssh_configure_payload()).encode("utf-8")
+        )
+        _mod.AgentHandler._handle_remote_provider_apply(configure)
+        disable = _FakeHandler(json.dumps({"action": "disable"}).encode("utf-8"))
+        _mod.AgentHandler._handle_remote_provider_apply(disable)
+        enable = _FakeHandler(json.dumps({"action": "enable"}).encode("utf-8"))
+        _mod.AgentHandler._handle_remote_provider_apply(enable)
+
+        body = enable.parse_response()
+        state = json.loads(
+            (tmp_path / "remote-provider" / "routing-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert configure.response_code == 200
+        assert disable.response_code == 200
+        assert enable.response_code == 200
+        assert body["action"] == "enable"
+        assert body["applied"] is False
+        assert body["staged"] is True
+        assert body["proof"]["reason"] == "pending-ssh-tunnel-proof"
+        assert state["enabled"] is True
+        assert state["provider"]["transport"] == "ssh"
+        assert state["status"]["proven"] is False
+        assert state["resume"]["available"] is True
+
+    def test_apply_enable_rejects_tampered_saved_profile_and_stays_disabled(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        self._patch_successful_probe(monkeypatch)
+        monkeypatch.setattr(
+            _mod,
+            "_activate_remote_provider_route",
+            lambda route: {"active": True, "proven": True},
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_deactivate_remote_provider_route",
+            lambda: {"active": False, "restored": True, "proven": True},
+        )
+        configure = _FakeHandler(
+            json.dumps(self._configure_payload()).encode("utf-8")
+        )
+        _mod.AgentHandler._handle_remote_provider_apply(configure)
+        disable = _FakeHandler(json.dumps({"action": "disable"}).encode("utf-8"))
+        _mod.AgentHandler._handle_remote_provider_apply(disable)
+        profile = tmp_path / "remote-provider" / "provider-profile.json"
+        profile.write_text(profile.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        enable = _FakeHandler(json.dumps({"action": "enable"}).encode("utf-8"))
+        _mod.AgentHandler._handle_remote_provider_apply(enable)
+
+        state = json.loads(
+            (tmp_path / "remote-provider" / "routing-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert enable.response_code == 500
+        assert "fingerprint does not match" in enable.parse_response()["error"]
+        assert state["enabled"] is False
+
+    def test_apply_disable_drops_stale_resume_instead_of_blocking_local_fallback(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        self._patch_successful_probe(monkeypatch)
+        monkeypatch.setattr(
+            _mod,
+            "_activate_remote_provider_route",
+            lambda route: {"active": True, "proven": True},
+        )
+        deactivations = []
+        monkeypatch.setattr(
+            _mod,
+            "_deactivate_remote_provider_route",
+            lambda: deactivations.append(True) or {
+                "active": False,
+                "restored": True,
+                "proven": True,
+            },
+        )
+        configure = _FakeHandler(
+            json.dumps(self._configure_payload()).encode("utf-8")
+        )
+        _mod.AgentHandler._handle_remote_provider_apply(configure)
+        disable_once = _FakeHandler(json.dumps({"action": "disable"}).encode("utf-8"))
+        _mod.AgentHandler._handle_remote_provider_apply(disable_once)
+        root = tmp_path / "remote-provider"
+        profile = root / "provider-profile.json"
+        profile.write_text(profile.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+        disable_again = _FakeHandler(
+            json.dumps({"action": "disable"}).encode("utf-8")
+        )
+        _mod.AgentHandler._handle_remote_provider_apply(disable_again)
+
+        state = json.loads((root / "routing-state.json").read_text(encoding="utf-8"))
+        assert configure.response_code == 200
+        assert disable_once.response_code == 200
+        assert disable_again.response_code == 200
+        assert state["enabled"] is False
+        assert "resume" not in state
+        assert profile.exists()
+        assert deactivations == [True, True]
+
+    def test_apply_disable_restores_local_when_enabled_route_cannot_be_saved(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        restored = []
+        monkeypatch.setattr(
+            _mod,
+            "_deactivate_remote_provider_route",
+            lambda: restored.append(True) or {
+                "active": False,
+                "restored": True,
+                "proven": True,
+            },
+        )
+        root = tmp_path / "remote-provider"
+        root.mkdir(parents=True)
+        (root / "routing-state.json").write_text(
+            json.dumps({
+                "schema": _mod._REMOTE_PROVIDER_ROUTING_STATE_SCHEMA,
+                "enabled": True,
+                "mode": "cloud",
+                "provider": None,
+            }),
+            encoding="utf-8",
+        )
+
+        disable = _FakeHandler(json.dumps({"action": "disable"}).encode("utf-8"))
+        _mod.AgentHandler._handle_remote_provider_apply(disable)
+
+        state = json.loads((root / "routing-state.json").read_text(encoding="utf-8"))
+        assert disable.response_code == 200
+        assert state["enabled"] is False
+        assert "resume" not in state
+        assert restored == [True]
+
+    def test_apply_disable_retains_prior_resume_when_profile_rewrite_fails(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        self._patch_successful_probe(monkeypatch)
+        monkeypatch.setattr(
+            _mod,
+            "_activate_remote_provider_route",
+            lambda route: {"active": True, "proven": True},
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_deactivate_remote_provider_route",
+            lambda: {"active": False, "restored": True, "proven": True},
+        )
+        configure = _FakeHandler(
+            json.dumps(self._configure_payload()).encode("utf-8")
+        )
+        _mod.AgentHandler._handle_remote_provider_apply(configure)
+        disable_once = _FakeHandler(json.dumps({"action": "disable"}).encode("utf-8"))
+        _mod.AgentHandler._handle_remote_provider_apply(disable_once)
+        root = tmp_path / "remote-provider"
+        paused_state = json.loads(
+            (root / "routing-state.json").read_text(encoding="utf-8")
+        )
+        original_resume = paused_state["resume"]
+        enable = _FakeHandler(json.dumps({"action": "enable"}).encode("utf-8"))
+        _mod.AgentHandler._handle_remote_provider_apply(enable)
+        enabled_state = json.loads(
+            (root / "routing-state.json").read_text(encoding="utf-8")
+        )
+        assert enabled_state["resume"] == original_resume
+
+        monkeypatch.setattr(
+            _mod,
+            "_write_remote_provider_profile",
+            lambda _route: (_ for _ in ()).throw(RuntimeError("simulated write failure")),
+        )
+        disable_again = _FakeHandler(
+            json.dumps({"action": "disable"}).encode("utf-8")
+        )
+        _mod.AgentHandler._handle_remote_provider_apply(disable_again)
+
+        state = json.loads((root / "routing-state.json").read_text(encoding="utf-8"))
+        assert configure.response_code == 200
+        assert disable_once.response_code == 200
+        assert enable.response_code == 200
+        assert disable_again.response_code == 200
+        assert state["enabled"] is False
+        assert state["resume"] == original_resume
 
     def test_apply_remove_deletes_route_state_and_secrets(
         self,
@@ -2739,6 +4506,11 @@ class TestRemoteProviderLifecycle:
         tmp_path,
     ):
         monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(
+            _mod,
+            "_deactivate_remote_provider_route",
+            lambda: {"active": False, "restored": False, "reason": "not_activated"},
+        )
         root = tmp_path / "remote-provider"
         secret_dir = root / "secrets"
         secret_dir.mkdir(parents=True)
@@ -2746,6 +4518,7 @@ class TestRemoteProviderLifecycle:
             json.dumps({"schema": "ods.remote-routing-state.v1", "enabled": True}),
             encoding="utf-8",
         )
+        (root / "provider-profile.json").write_text("saved-profile\n", encoding="utf-8")
         for filename in ("provider-api-key", "peer-token", "ssh-identity", "known_hosts"):
             (secret_dir / filename).write_text(f"{filename}\n", encoding="utf-8")
         handler = _FakeHandler(json.dumps({"action": "remove"}).encode("utf-8"))
@@ -2754,6 +4527,7 @@ class TestRemoteProviderLifecycle:
 
         assert handler.response_code == 200
         assert not (root / "routing-state.json").exists()
+        assert not (root / "provider-profile.json").exists()
         assert not (secret_dir / "provider-api-key").exists()
         assert not (secret_dir / "peer-token").exists()
         assert not (secret_dir / "ssh-identity").exists()
@@ -2775,6 +4549,8 @@ class TestRemoteProviderLifecycle:
             "provider": {"baseUrl": "https://old.example.test/v1"},
         }
         (root / "routing-state.json").write_text(json.dumps(old_state), encoding="utf-8")
+        activation_public = root / "activation-public.json"
+        activation_public.write_text("known-good-activation\n", encoding="utf-8")
         secret_path.write_text("old-provider-token\n", encoding="utf-8")
         real_atomic_write = _mod._atomic_write_text
         failed_once = {"value": False}
@@ -2796,8 +4572,412 @@ class TestRemoteProviderLifecycle:
         assert handler.response_code == 500
         assert body["rollback"] == {"attempted": True, "ok": True}
         assert state == old_state
+        assert activation_public.read_text(encoding="utf-8") == "known-good-activation\n"
         assert secret_path.read_text(encoding="utf-8") == "old-provider-token\n"
+        if os.name != "nt":
+            assert stat.S_IMODE(secret_path.stat().st_mode) == 0o640
         assert "unit-test-provider-token" not in dumped
+
+    def test_managed_pixel_runtime_recovers_concrete_gateway_model(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        install_dir = tmp_path / "ods"
+        onboarding = install_dir / "data" / "pixel" / "onboarding.json"
+        onboarding.parent.mkdir(parents=True)
+        onboarding.write_text(
+            json.dumps(
+                {
+                    "modelProvider": "ods-gateway",
+                    "modelId": "ods/current",
+                    "modelName": "ODS Current (org/qwen+tools:remote)",
+                    "modelContextWindow": 131072,
+                    "modelMaxTokens": 8192,
+                    "modelReasoning": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        onboarding.chmod(0o600)
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(
+            _mod,
+            "_ods_managed_pixel_identity",
+            lambda: ("pixel-owner", tmp_path / "home"),
+        )
+        real_snapshot = _mod._snapshot_text_file
+        monkeypatch.setattr(
+            _mod,
+            "_snapshot_text_file",
+            lambda path: {
+                **real_snapshot(path),
+                "mode": 0o600,
+            },
+        )
+
+        assert _mod._managed_pixel_runtime_contract() == {
+            "model": "org/qwen+tools:remote",
+            "contextLength": 131072,
+            "maxTokens": 8192,
+            "reasoning": True,
+        }
+
+        value = json.loads(onboarding.read_text(encoding="utf-8"))
+        value["modelRouteFingerprint"] = "a" * 64
+        onboarding.write_text(json.dumps(value), encoding="utf-8")
+        assert _mod._managed_pixel_runtime_contract()["routeFingerprint"] == "a" * 64
+        value["modelRouteFingerprint"] = "credential-bearing-invalid-identity"
+        onboarding.write_text(json.dumps(value), encoding="utf-8")
+        with pytest.raises(RuntimeError, match="runtime contract"):
+            _mod._managed_pixel_runtime_contract()
+        value.pop("modelRouteFingerprint")
+        onboarding.write_text(json.dumps(value), encoding="utf-8")
+
+        value = json.loads(onboarding.read_text(encoding="utf-8"))
+        value["modelName"] = "ODS Current (forged) trailing"
+        onboarding.write_text(json.dumps(value), encoding="utf-8")
+        onboarding.chmod(0o600)
+        with pytest.raises(RuntimeError, match="gateway model identity"):
+            _mod._managed_pixel_runtime_contract()
+
+    def test_activation_state_rejects_incomplete_previous_contract(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(_mod, "DATA_DIR", tmp_path)
+        path = tmp_path / "remote-provider" / "activation-state.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": "ods.remote-provider-activation-state.v1",
+                    "phase": "active",
+                    "previous": {"odsMode": "local"},
+                    "remote": {
+                        "model": "org/qwen:remote",
+                        "contextLength": 32768,
+                        "maxTokens": 4096,
+                        "reasoning": False,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+
+        with pytest.raises(RuntimeError, match="contract is invalid"):
+            _mod._read_remote_provider_activation_state()
+
+    def test_reconciliation_passes_opaque_route_identity_and_explicitly_clears_local(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        monkeypatch.setattr(_mod, "_ods_managed_pixel_identity", lambda: ("owner", tmp_path / "home"))
+        monkeypatch.setattr(_mod, "load_env", lambda _: {})
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        runtime = {"model": "same-model", "contextLength": 32768, "maxTokens": 4096, "reasoning": False}
+        assert _mod._reconcile_managed_pixel_contract({**runtime, "routeFingerprint": "a" * 64}) == "reconciled"
+        assert calls[-1][-2:] == ["a" * 64, "unknown"]
+        assert 'target_route_fingerprint="$8"' in calls[-1][2]
+        assert _mod._reconcile_managed_pixel_contract(runtime) == "reconciled"
+        assert calls[-1][-2:] == ["", "unknown"]
+        with pytest.raises(RuntimeError, match="route identity"):
+            _mod._reconcile_managed_pixel_contract({**runtime, "routeFingerprint": "a" * 64 + "\n"})
+        assert len(calls) == 2
+
+    def test_active_remote_pixel_runtime_requires_current_proven_custody_join(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        runtime = {
+            "model": "remote-owner-model",
+            "contextLength": 131072,
+            "maxTokens": 16384,
+            "reasoning": False,
+        }
+        route = {
+            "provider": {
+                "transport": "ssh",
+                "baseUrl": "http://127.0.0.1:18080/v1",
+                **runtime,
+            },
+            "status": {
+                "proven": True,
+                "lastProbe": {
+                    "schema": _mod._REMOTE_PROVIDER_PROBE_RECEIPT_SCHEMA,
+                    "ok": True,
+                    "verifiedAt": "2026-08-31T16:19:55Z",
+                    "endpoint": "/v1/models",
+                    "httpStatus": 200,
+                    "modelCount": 1,
+                    "resolution": {"ok": True, "addressCount": 0},
+                },
+            },
+        }
+        activation = {
+            "phase": "active",
+            "remote": runtime,
+            "routeFingerprint": _mod._remote_provider_route_fingerprint(route),
+        }
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path / "ods")
+        monkeypatch.setattr(
+            _mod, "_read_remote_provider_route_state_for_update", lambda: route,
+        )
+        monkeypatch.setattr(
+            _mod, "_read_remote_provider_activation_state", lambda: activation,
+        )
+        monkeypatch.setattr(
+            _mod,
+            "load_env",
+            lambda _path: {"ODS_MODE": "cloud", "LLM_API_URL": "http://litellm:4000"},
+        )
+        monkeypatch.setattr(_mod, "_managed_pixel_runtime_contract", lambda: runtime)
+
+        assert _mod._active_remote_provider_pixel_runtime() == runtime
+
+        monkeypatch.setattr(_mod, "_managed_pixel_runtime_contract", lambda: {**runtime, "imageInput": "unknown"})
+        assert _mod._active_remote_provider_pixel_runtime() == runtime
+        monkeypatch.setattr(_mod, "_managed_pixel_runtime_contract", lambda: {**runtime, "imageInput": "supported"})
+        assert _mod._active_remote_provider_pixel_runtime() is None
+        monkeypatch.setattr(_mod, "_managed_pixel_runtime_contract", lambda: runtime)
+
+        runtime["routeFingerprint"] = _mod._remote_provider_route_fingerprint(route)
+        assert _mod._active_remote_provider_pixel_runtime() == runtime
+        monkeypatch.setattr(_mod, "_managed_pixel_runtime_contract", lambda: {
+            **runtime, "routeFingerprint": "f" * 64,
+        })
+        assert _mod._active_remote_provider_pixel_runtime() is None
+        monkeypatch.setattr(_mod, "_managed_pixel_runtime_contract", lambda: runtime)
+
+        activation["routeFingerprint"] = "0" * 64
+        assert _mod._active_remote_provider_pixel_runtime() is None
+        activation["routeFingerprint"] = _mod._remote_provider_route_fingerprint(route)
+
+        monkeypatch.setattr(
+            _mod,
+            "_managed_pixel_runtime_contract",
+            lambda: {**runtime, "maxTokens": 8192},
+        )
+        assert _mod._active_remote_provider_pixel_runtime() is None
+        monkeypatch.setattr(_mod, "_managed_pixel_runtime_contract", lambda: runtime)
+
+        monkeypatch.setattr(
+            _mod,
+            "load_env",
+            lambda _path: {"ODS_MODE": "local", "LLM_API_URL": "http://llama-server:8080"},
+        )
+        assert _mod._active_remote_provider_pixel_runtime() is None
+        monkeypatch.setattr(
+            _mod,
+            "load_env",
+            lambda _path: {"ODS_MODE": "cloud", "LLM_API_URL": "http://litellm:4000"},
+        )
+
+        route["status"]["proven"] = False
+        assert _mod._active_remote_provider_pixel_runtime() is None
+
+    def test_consumer_activation_and_deactivation_restore_exact_prior_route(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        install_dir = tmp_path / "ods"
+        data_dir = install_dir / "data"
+        cloud_path = install_dir / "config" / "litellm" / "cloud.yaml"
+        cloud_path.parent.mkdir(parents=True)
+        data_dir.mkdir(parents=True)
+        env_path = install_dir / ".env"
+        original_env = (
+            "ODS_MODE=local\n"
+            "LLM_API_URL=http://llama-server:8080\n"
+            "LITELLM_KEY=unit-test-litellm-key\n"
+        )
+        original_cloud = "model_list:\n  - model_name: previous-cloud\n"
+        env_path.write_text(original_env, encoding="utf-8")
+        cloud_path.write_text(original_cloud, encoding="utf-8")
+        env_path.chmod(0o600)
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "DATA_DIR", data_dir)
+
+        local_pixel = {
+            "model": "qwen-local",
+            "contextLength": 65536,
+            "maxTokens": 4096,
+            "reasoning": False,
+        }
+        remote_pixel = {
+            "model": "qwen/remote:latest",
+            "contextLength": 32768,
+            "maxTokens": 4096,
+            "reasoning": False,
+            "imageInput": "unknown",
+        }
+        current_pixel = {"value": local_pixel}
+        reconciled = []
+        verified = []
+        monkeypatch.setattr(
+            _mod, "_managed_pixel_runtime_contract", lambda: current_pixel["value"]
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_capture_container_state",
+            lambda _name: {"exists": True, "running": True},
+        )
+        monkeypatch.setattr(_mod, "_restart_existing_container", lambda *a, **k: True)
+        monkeypatch.setattr(_mod, "_restore_container_state", lambda *a, **k: True)
+        monkeypatch.setattr(_mod, "_wait_for_container_health", lambda _name: None)
+        monkeypatch.setattr(
+            _mod,
+            "_verify_litellm_route",
+            lambda env, *, model="default": verified.append((env["ODS_MODE"], model)),
+        )
+
+        def fake_render(route, env):
+            assert route["provider"]["model"] == "qwen/remote:latest"
+            assert env["ODS_MODE"] == "cloud"
+            cloud_path.write_text("model_list:\n  - model_name: ods/current\n", encoding="utf-8")
+
+        def fake_reconcile(contract):
+            reconciled.append(contract)
+            current_pixel["value"] = contract
+            return "reconciled"
+
+        monkeypatch.setattr(_mod, "_render_remote_provider_cloud_config", fake_render)
+        monkeypatch.setattr(_mod, "_reconcile_managed_pixel_contract", fake_reconcile)
+        private_writes = []
+        real_private_write = _mod._write_remote_provider_activation_state
+        real_public_write = _mod._write_remote_provider_activation_public
+
+        def track_private(value):
+            private_writes.append(("private", value["phase"]))
+            real_private_write(value)
+
+        def track_public(value):
+            private_writes.append(("public", value["proven"]))
+            real_public_write(value)
+
+        monkeypatch.setattr(_mod, "_write_remote_provider_activation_state", track_private)
+        monkeypatch.setattr(_mod, "_write_remote_provider_activation_public", track_public)
+        route = self._configure_payload()
+        plan = _mod._plan_remote_provider_lifecycle_operation(route)
+
+        remote_pixel["routeFingerprint"] = _mod._remote_provider_route_fingerprint(plan["route"])
+        activation = _mod._activate_remote_provider_route(plan["route"])
+
+        assert activation["active"] is True
+        assert activation["proven"] is True
+        assert _mod.load_env(env_path)["ODS_MODE"] == "cloud"
+        assert _mod.load_env(env_path)["LLM_API_URL"] == "http://litellm:4000"
+        assert cloud_path.read_text(encoding="utf-8") == (
+            "model_list:\n  - model_name: ods/current\n"
+        )
+        assert reconciled[-1] == remote_pixel
+        assert verified[-1] == ("cloud", "ods/current")
+        public = json.loads(
+            (data_dir / "remote-provider" / "activation-public.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert public["active"] is True
+        assert public["model"] == "qwen/remote:latest"
+        assert "unit-test-litellm-key" not in json.dumps(public)
+        assert private_writes[:3] == [
+            ("private", "staging"),
+            ("private", "active"),
+            ("public", True),
+        ]
+
+        current = _mod._verify_current_remote_provider_consumers(plan["route"], remote_pixel)
+        assert current["unchanged"] is True
+        assert current["pixel"] == "reconciled"
+        assert current_pixel["value"] == remote_pixel
+
+        # A different provider serving the same model must leave the fast path,
+        # and failed reconciliation must restore the exact previous identity.
+        second_route = json.loads(json.dumps(plan["route"]))
+        second_route["provider"]["baseUrl"] = "https://other-provider.example/v1"
+        second_runtime = _mod._remote_provider_runtime_contract(second_route)
+        assert second_runtime["routeFingerprint"] != remote_pixel["routeFingerprint"]
+        assert _mod._verify_current_remote_provider_consumers(second_route, second_runtime) is None
+        private_before = (data_dir / "remote-provider" / "activation-state.json").read_bytes()
+
+        def fail_new_route(contract):
+            fake_reconcile(contract)
+            if contract.get("routeFingerprint") == second_runtime["routeFingerprint"]:
+                raise RuntimeError("simulated native reconciliation failure")
+
+        monkeypatch.setattr(_mod, "_reconcile_managed_pixel_contract", fail_new_route)
+        with pytest.raises(RuntimeError, match="simulated native reconciliation failure"):
+            _mod._activate_remote_provider_route(second_route)
+        assert current_pixel["value"] == remote_pixel
+        assert (data_dir / "remote-provider" / "activation-state.json").read_bytes() == private_before
+        monkeypatch.setattr(_mod, "_reconcile_managed_pixel_contract", fake_reconcile)
+
+        deactivation = _mod._deactivate_remote_provider_route()
+
+        assert deactivation["restored"] is True
+        assert env_path.read_text(encoding="utf-8") == original_env
+        assert cloud_path.read_text(encoding="utf-8") == original_cloud
+        assert reconciled[-1] == local_pixel
+        assert verified[-1] == ("local", "ods/current")
+        assert not (data_dir / "remote-provider" / "activation-state.json").exists()
+        assert not (data_dir / "remote-provider" / "activation-public.json").exists()
+
+    def test_consumer_activation_failure_restores_config_and_never_claims_ready(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        install_dir = tmp_path / "ods"
+        data_dir = install_dir / "data"
+        cloud_path = install_dir / "config" / "litellm" / "cloud.yaml"
+        cloud_path.parent.mkdir(parents=True)
+        data_dir.mkdir(parents=True)
+        env_path = install_dir / ".env"
+        original_env = "ODS_MODE=local\nLLM_API_URL=http://llama-server:8080\n"
+        original_cloud = "known-good-cloud\n"
+        env_path.write_text(original_env, encoding="utf-8")
+        cloud_path.write_text(original_cloud, encoding="utf-8")
+        env_path.chmod(0o600)
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "DATA_DIR", data_dir)
+        monkeypatch.setattr(_mod, "_managed_pixel_runtime_contract", lambda: None)
+        monkeypatch.setattr(
+            _mod,
+            "_capture_container_state",
+            lambda _name: {"exists": True, "running": True},
+        )
+        monkeypatch.setattr(_mod, "_restart_existing_container", lambda *a, **k: True)
+        monkeypatch.setattr(_mod, "_restore_container_state", lambda *a, **k: True)
+        monkeypatch.setattr(_mod, "_wait_for_container_health", lambda _name: None)
+        monkeypatch.setattr(
+            _mod,
+            "_render_remote_provider_cloud_config",
+            lambda route, env: cloud_path.write_text("candidate-cloud\n", encoding="utf-8"),
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_verify_litellm_route",
+            lambda env, *, model="default": (_ for _ in ()).throw(
+                RuntimeError("simulated consumer proof failure")
+            ) if env.get("ODS_MODE") == "cloud" else None,
+        )
+        plan = _mod._plan_remote_provider_lifecycle_operation(self._configure_payload())
+
+        with pytest.raises(RuntimeError, match="simulated consumer proof failure"):
+            _mod._activate_remote_provider_route(plan["route"])
+
+        assert env_path.read_text(encoding="utf-8") == original_env
+        assert cloud_path.read_text(encoding="utf-8") == original_cloud
+        assert not (data_dir / "remote-provider" / "activation-state.json").exists()
+        assert not (data_dir / "remote-provider" / "activation-public.json").exists()
 
 
 class TestTailscaleStatus:
@@ -3072,6 +5252,63 @@ def _make_body(raw_text: str, backup: bool = True) -> bytes:
     return json.dumps({"raw_text": raw_text, "backup": backup}).encode("utf-8")
 
 
+class TestExtensionConfiguration:
+    def setup_recipe(self, env_update_env, keys=('DEMO_PASSWORD',)):
+        import yaml
+        install, data = env_update_env
+        directory = data / 'extensions-library' / 'demo'
+        directory.mkdir(parents=True)
+        (directory / 'manifest.yaml').write_text(yaml.safe_dump({'service': {'id': 'demo',
+            'env_vars': [{'key': key, 'required': True, 'secret': True} for key in keys]}}))
+        return install, data
+
+    def send(self, values):
+        handler = _FakeHandler(json.dumps({'service_id': 'demo', 'values': values}).encode())
+        _mod.AgentHandler._handle_extension_configure(handler)
+        return handler
+
+    def test_save_preserves_host_values_and_does_not_return_secret(self, env_update_env):
+        install, data = self.setup_recipe(env_update_env)
+        password = 'private $name # test " quote \\ end'
+        handler = self.send({'DEMO_PASSWORD': password})
+        assert handler.response_code == 200
+        assert _mod.load_env(install / '.env')['DEMO_PASSWORD'] == password
+        assert _mod.load_env(install / '.env')['ODS_AGENT_KEY'] == 'existing'
+        assert password not in handler.wfile.getvalue().decode()
+        assert list((data / 'config-backups').iterdir())
+
+    def test_never_rotates_existing_secret_even_when_other_fields_are_empty(self, env_update_env):
+        install, _ = self.setup_recipe(env_update_env, ('DEMO_PASSWORD', 'DEMO_KEY'))
+        previous = 'ODS_AGENT_KEY=existing\nexport DEMO_PASSWORD=original\nDEMO_KEY=\n'
+        (install / '.env').write_text(previous)
+        handler = self.send({'DEMO_PASSWORD': 'replacement', 'DEMO_KEY': 'new'})
+        assert handler.response_code == 409
+        assert (install / '.env').read_text() == previous
+
+    @pytest.mark.parametrize('values', [{'ODS_AGENT_KEY': 'replacement'}, {'DEMO_PASSWORD': 'bad\nNEXT=value'},
+                                      {'DEMO_PASSWORD': 10}, {'DEMO_PASSWORD': ''}])
+    def test_invalid_patch_leaves_environment_unchanged(self, env_update_env, values):
+        install, _ = self.setup_recipe(env_update_env, ('DEMO_PASSWORD', 'ODS_AGENT_KEY'))
+        before = (install / '.env').read_bytes()
+        assert self.send(values).response_code == 400
+        assert (install / '.env').read_bytes() == before
+
+    def test_broken_installed_manifest_cannot_fall_back_to_library(self, env_update_env):
+        install, data = self.setup_recipe(env_update_env)
+        (data / 'user-extensions/demo').mkdir(parents=True)
+        assert self.send({'DEMO_PASSWORD': 'secret'}).response_code == 400
+        assert 'DEMO_PASSWORD' not in _mod.load_env(install / '.env')
+
+    def test_configuration_serializes_with_model_activation(self, env_update_env):
+        install, _ = self.setup_recipe(env_update_env)
+        assert _mod._model_activate_lock.acquire(blocking=False)
+        try:
+            assert self.send({'DEMO_PASSWORD': 'secret'}).response_code == 409
+        finally:
+            _mod._model_activate_lock.release()
+        assert 'DEMO_PASSWORD' not in _mod.load_env(install / '.env')
+
+
 class TestHandleEnvUpdate:
 
     def test_happy_path_writes_file_and_returns_backup(self, env_update_env):
@@ -3125,6 +5362,59 @@ class TestHandleEnvUpdate:
             "ODS_AGENT_KEY=second\n"
         )
 
+    def test_backups_keep_only_the_newest_copies(self, env_update_env):
+        install_dir, data_dir = env_update_env
+        backups = data_dir / "config-backups"
+        backups.mkdir(parents=True)
+        old = [backups / f".env.backup.202601{day:02d}-120000.fixture{day}" for day in range(1, 26)]
+        for path in old:
+            path.write_text("OLD_SECRET=value\n", encoding="utf-8")
+        unrelated = [backups / "notes.txt", backups / ".env.backup.manual"]
+        for path in unrelated:
+            path.write_text("owner file\n", encoding="utf-8")
+
+        handler = _FakeHandler(_make_body("ODS_AGENT_KEY=newvalue\n"))
+        _mod.AgentHandler._handle_env_update(handler)
+
+        assert handler.response_code == 200
+        created = data_dir.parent / handler.parse_response()["backup_path"]
+        kept = sorted(path.name for path in backups.glob(".env.backup.2*"))
+        assert len(kept) == _mod.ENV_BACKUP_RETENTION
+        assert created.name in kept
+        # The 19 newest fixtures survive; the oldest six are pruned.
+        assert kept[:-1] == sorted(path.name for path in old[-(_mod.ENV_BACKUP_RETENTION - 1):])
+        assert all(path.exists() for path in unrelated)
+
+    @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
+    def test_backup_pruning_ignores_links(self, env_update_env):
+        install_dir, data_dir = env_update_env
+        backups = data_dir / "config-backups"
+        backups.mkdir(parents=True)
+        target = data_dir / "outside.env"
+        target.write_text("KEEP=1\n", encoding="utf-8")
+        link = backups / ".env.backup.20200101-000000.link"
+        link.symlink_to(target)
+        for day in range(1, 26):
+            (backups / f".env.backup.202601{day:02d}-120000.fixture{day}").write_text("x\n", encoding="utf-8")
+
+        _mod.AgentHandler._handle_env_update(_FakeHandler(_make_body("ODS_AGENT_KEY=newvalue\n")))
+
+        assert link.is_symlink() and target.read_text(encoding="utf-8") == "KEEP=1\n"
+
+    def test_pruning_failure_keeps_the_save_successful(self, env_update_env, monkeypatch):
+        install_dir, data_dir = env_update_env
+
+        def fail(*_args, **_kwargs):
+            raise OSError("read-only backup directory")
+
+        monkeypatch.setattr(_mod, "_prune_env_backups", fail)
+        handler = _FakeHandler(_make_body("ODS_AGENT_KEY=newvalue\n"))
+        _mod.AgentHandler._handle_env_update(handler)
+
+        assert handler.response_code == 200
+        assert (data_dir.parent / handler.parse_response()["backup_path"]).exists()
+        assert "ODS_AGENT_KEY=newvalue" in (install_dir / ".env").read_text(encoding="utf-8")
+
     def test_proxy_enabled_forces_auth_and_reports_saved_value(self, env_update_env):
         install_dir, _ = env_update_env
         proxy_dir = _mod.EXTENSIONS_DIR / "ods-proxy"
@@ -3144,6 +5434,32 @@ class TestHandleEnvUpdate:
         response = handler.parse_response()
         assert response["enforced_values"] == {"WEBUI_AUTH": "true"}
         assert "raw_text" not in response
+
+    @pytest.mark.parametrize("bind", ["0.0.0.0", "192.168.1.20", '"0.0.0.0"'])
+    def test_network_bind_forces_auth_without_proxy(self, env_update_env, bind):
+        install_dir, _ = env_update_env
+        body = _make_body(f"ODS_AGENT_KEY=newvalue\nBIND_ADDRESS={bind}\nWEBUI_AUTH=false\n")
+        handler = _FakeHandler(body)
+
+        _mod.AgentHandler._handle_env_update(handler)
+
+        assert handler.response_code == 200
+        env_text = (install_dir / ".env").read_text(encoding="utf-8")
+        assert env_text.count("WEBUI_AUTH=true") == 1
+        assert "WEBUI_AUTH=false" not in env_text
+        assert handler.parse_response()["enforced_values"] == {"WEBUI_AUTH": "true"}
+
+    @pytest.mark.parametrize("bind", ["127.0.0.1", "::1", "localhost", ""])
+    def test_loopback_bind_keeps_local_auth_choice(self, env_update_env, bind):
+        install_dir, _ = env_update_env
+        body = _make_body(f"ODS_AGENT_KEY=newvalue\nBIND_ADDRESS={bind}\nWEBUI_AUTH=false\n")
+        handler = _FakeHandler(body)
+
+        _mod.AgentHandler._handle_env_update(handler)
+
+        assert handler.response_code == 200
+        assert "WEBUI_AUTH=false" in (install_dir / ".env").read_text(encoding="utf-8")
+        assert handler.parse_response()["enforced_values"] == {}
 
     def test_413_oversize_body(self, env_update_env):
         # Construct headers claiming body is too large; rfile content is irrelevant.
@@ -3348,6 +5664,269 @@ class TestModelActivationOwnership:
         assert response["activeOperation"] == "model_activation"
         assert response["activeTarget"] == "target-a"
         assert response["activeModelId"] == "target-a"
+
+    def test_model_status_projects_only_active_agent_viability(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir = tmp_path / "ods"
+        state_path = install_dir / "data" / "model-state.json"
+        state_path.parent.mkdir(parents=True)
+        state = _mod._switchboard_state.initial_state()
+        state["seq"] = 1
+        state["routeSeq"] = 1
+        state["desired"] = {"catalogId": "chat-only"}
+        state["active"] = {
+            "routeSeq": 1,
+            "catalogId": "chat-only",
+            "runtimeModelId": "chat-only.gguf",
+            "publicModel": "ods/current",
+            "backend": {
+                "kind": "llama-server",
+                "endpointId": "llama-server-default",
+                "nativeRoute": None,
+            },
+            "contextLength": 32768,
+            "capabilities": {
+                "chat": True,
+                "tools": False,
+                "vision": False,
+                "agentViable": False,
+            },
+            "verifiedAt": "2026-08-31T13:53:16Z",
+            "proof": {"identity": "chat-only.gguf", "completion": True},
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
+
+        handler = _FakeHandler(b"")
+        _mod.AgentHandler._handle_model_status(handler)
+
+        assert handler.response_code == 200
+        response = handler.parse_response()
+        assert response == {
+            "status": "idle", "activeAgentViable": False,
+            "modelTransactionPending": False,
+        }
+        assert "runtimeModelId" not in response
+        assert "capabilities" not in response
+
+    def test_model_status_projects_active_remote_runtime_over_local_rollback(
+        self, tmp_path, monkeypatch,
+    ):
+        runtime = {
+            "model": "remote-owner-model",
+            "contextLength": 131072,
+            "maxTokens": 16384,
+            "reasoning": False,
+        }
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path / "ods")
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
+        monkeypatch.setattr(
+            _mod,
+            "_active_remote_provider_pixel_runtime",
+            lambda: runtime,
+        )
+
+        handler = _FakeHandler(b"")
+        _mod.AgentHandler._handle_model_status(handler)
+
+        assert handler.response_code == 200
+        assert handler.parse_response() == {
+            "status": "idle",
+            "activeAgentViable": True,
+            "activeRuntime": {"source": "remote-provider", **runtime},
+            "modelTransactionPending": False,
+        }
+
+    def test_model_status_applies_new_pixel_specific_revocation(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir = tmp_path / "ods"
+        state_path = install_dir / "data" / "model-state.json"
+        state_path.parent.mkdir(parents=True)
+        (install_dir / "config").mkdir()
+        (install_dir / "config" / "model-library.json").write_text(
+            json.dumps({
+                "models": [{
+                    "id": "stale-qualified",
+                    "gguf_file": "model.gguf",
+                    "gguf_url": "https://huggingface.co/example/model.gguf",
+                    "app_compatibility": {
+                        "pixel_agent": {"status": "not_agent_viable"},
+                    },
+                }],
+            }),
+            encoding="utf-8",
+        )
+        state = _mod._switchboard_state.initial_state()
+        state["seq"] = 1
+        state["routeSeq"] = 1
+        state["desired"] = {"catalogId": "stale-qualified"}
+        state["active"] = {
+            "routeSeq": 1,
+            "catalogId": "stale-qualified",
+            "runtimeModelId": "model.gguf",
+            "publicModel": "ods/current",
+            "backend": {
+                "kind": "llama-server",
+                "endpointId": "llama-server-default",
+                "nativeRoute": None,
+            },
+            "contextLength": 65536,
+            "capabilities": {
+                "chat": True,
+                "tools": False,
+                "vision": False,
+                "agentViable": True,
+            },
+            "verifiedAt": "2026-08-31T13:53:16Z",
+            "proof": {"identity": "model.gguf", "completion": True},
+        }
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
+
+        handler = _FakeHandler(b"")
+        _mod.AgentHandler._handle_model_status(handler)
+
+        assert handler.response_code == 200
+        assert handler.parse_response()["activeAgentViable"] is False
+
+    def test_pixel_agent_viability_is_distinct_from_generic_chat_viability(self):
+        generic = {"app_compatibility": {"agent_viability": {"status": "verified"}}}
+        revoked = {
+            "app_compatibility": {
+                "agent_viability": {"status": "verified"},
+                "pixel_agent": {"status": "not_agent_viable"},
+            },
+        }
+        assert _mod._model_agent_viable(generic, 65536) is True
+        assert _mod._model_agent_viable(revoked, 65536) is False
+
+    def test_switchboard_route_requires_reproof_when_context_changes(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir = tmp_path / "ods"
+        (install_dir / "data").mkdir(parents=True)
+        (install_dir / "config").mkdir()
+        model = {
+            "id": "same-model",
+            "gguf_file": "same-model.gguf",
+            "llm_model_name": "same-model",
+            "gguf_url": "https://huggingface.co/example/same-model.gguf",
+        }
+        (install_dir / "config" / "model-library.json").write_text(
+            json.dumps({"models": [model]}),
+            encoding="utf-8",
+        )
+        (install_dir / ".env").write_text(
+            "ODS_MODE=local\n"
+            "GPU_BACKEND=cpu\n"
+            "GGUF_FILE=same-model.gguf\n"
+            "LLM_MODEL=same-model\n"
+            "CTX_SIZE=65536\n",
+            encoding="utf-8",
+        )
+        state_path = install_dir / "data" / "model-state.json"
+        _mod._switchboard_state.record_verified_route(
+            state_path,
+            catalog_id="same-model",
+            runtime_model_id="same-model.gguf",
+            backend_kind="llama-server",
+            endpoint_id="llama-server-default",
+            context_length=32768,
+            capabilities={
+                "chat": True,
+                "tools": False,
+                "vision": False,
+                "agentViable": False,
+            },
+            proof_identity="same-model.gguf",
+        )
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+
+        assert _mod._switchboard_state_needs_current_env_verification(state_path) is True
+        payload = {"status": "idle"}
+        _mod._project_switchboard_agent_viability(payload)
+        assert payload == {"status": "idle", "modelTransactionPending": False}
+
+    @pytest.mark.parametrize("agent_viable", [True, False])
+    @pytest.mark.parametrize("backend", ["llama-server"])
+    # ODS_MODE=lemonade stays a readable local alias for one release.
+    @pytest.mark.parametrize("mode", ["local", "hybrid", "lemonade"])
+    def test_model_status_projects_verified_local_identity_without_onboarding(
+        self, tmp_path, monkeypatch, agent_viable, backend, mode,
+    ):
+        install_dir = tmp_path / "ods"
+        install_dir.mkdir()
+        env = (
+            f"ODS_MODE={mode}\nGPU_BACKEND=cpu\nLLM_MODEL=same-model\n"
+            "GGUF_FILE=same-model.gguf\nCTX_SIZE=65536\n"
+        )
+        (install_dir / ".env").write_text(env, encoding="utf-8")
+        state_path = install_dir / "data" / "model-state.json"
+        _mod._switchboard_state.record_verified_route(
+            state_path, catalog_id="same-model", runtime_model_id="same-model.gguf",
+            backend_kind=backend, endpoint_id=f"{backend}-default",
+            context_length=65536,
+            capabilities={"chat": True, "tools": False, "vision": False,
+                          "agentViable": agent_viable},
+            proof_identity="same-model.gguf",
+        )
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "_active_remote_provider_pixel_runtime", lambda: None)
+        payload = {"status": "idle"}
+        _mod._project_switchboard_agent_viability(payload)
+        assert payload["activeRuntime"] == {
+            "source": "local-switchboard", "model": "same-model.gguf",
+            "contextLength": 65536,
+        }
+        assert payload["activeAgentViable"] is agent_viable
+
+        # Missing proof and a cloud transition must not expose a local rollback
+        # route as Pixel's active runtime. This is a display rule, not admission.
+        (install_dir / ".env").write_text(env.replace(f"ODS_MODE={mode}", "ODS_MODE=cloud"), encoding="utf-8")
+        payload = {}
+        _mod._project_switchboard_agent_viability(payload)
+        assert "activeRuntime" not in payload
+        (install_dir / ".env").write_text(env, encoding="utf-8")
+        doc = json.loads(state_path.read_text(encoding="utf-8"))
+        doc["active"]["proof"]["completion"] = False
+        state_path.write_text(json.dumps(doc), encoding="utf-8")
+        payload = {}
+        _mod._project_switchboard_agent_viability(payload)
+        assert "activeRuntime" not in payload
+
+    def test_model_status_never_projects_a_legacy_lemonade_route(self, tmp_path, monkeypatch):
+        install_dir = tmp_path / "ods"
+        install_dir.mkdir()
+        (install_dir / ".env").write_text(
+            "ODS_MODE=lemonade\nGPU_BACKEND=amd\nLLM_BACKEND=lemonade\nLLM_MODEL=same-model\n"
+            "GGUF_FILE=same-model.gguf\nLEMONADE_MODEL=extra.same-model.gguf\nCTX_SIZE=65536\n",
+            encoding="utf-8",
+        )
+        state_path = install_dir / "data" / "model-state.json"
+        doc = _mod._switchboard_state.record_verified_route(
+            state_path, catalog_id="same-model", runtime_model_id="same-model.gguf",
+            backend_kind="llama-server", endpoint_id="llama-server-default",
+            context_length=65536,
+            capabilities={"chat": True, "tools": False, "vision": False, "agentViable": True},
+            proof_identity="same-model.gguf",
+        )
+        # A record written before round F: verified, but for Lemonade's id.
+        doc["active"]["backend"] = {"kind": "lemonade", "endpointId": "lemonade-default",
+                                    "nativeRoute": "extra.same-model.gguf"}
+        doc["active"]["runtimeModelId"] = "extra.same-model.gguf"
+        doc["active"]["proof"]["identity"] = "extra.same-model.gguf"
+        state_path.write_text(json.dumps(doc), encoding="utf-8")
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "_active_remote_provider_pixel_runtime", lambda: None)
+
+        assert _mod._switchboard_state_needs_current_env_verification(state_path) is True
+        payload = {"status": "idle"}
+        _mod._project_switchboard_agent_viability(payload)
+        assert "activeRuntime" not in payload and "activeAgentViable" not in payload
 
     def test_non_activation_lock_owner_reports_unknown_target(self, monkeypatch):
         monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
@@ -3674,6 +6253,10 @@ class TestModelActivationModeAndMacosBridge:
         def fake_run(cmd, **_kwargs):
             if cmd and cmd[0] == "curl":
                 events.append(("validate-runtime", cmd[-1]))
+                if str(cmd[-1]).endswith("/health"):
+                    return subprocess.CompletedProcess(
+                        cmd, 0, stdout=json.dumps({"status": "ok"}), stderr="",
+                    )
                 if str(cmd[-1]).endswith("/props"):
                     return subprocess.CompletedProcess(
                         cmd,
@@ -3703,6 +6286,13 @@ class TestModelActivationModeAndMacosBridge:
         monkeypatch.setattr(_mod, "_stop_macos_native_llama_server", record_stop)
         monkeypatch.setattr(_mod, "_configure_macos_llm_bridge", record_bridge)
         monkeypatch.setattr(_mod, "_launch_native_llama_server", record_launch)
+        # This fixture covers the native model bridge, not an installed
+        # OpenCode service. The generic subprocess stub must not manufacture
+        # a running service and trigger a real localhost health request.
+        monkeypatch.setattr(
+            _mod, "_capture_managed_opencode_state",
+            lambda: {"system": "Darwin", "active": False},
+        )
         monkeypatch.setattr(_mod, "_chat_completion_ready", lambda *_args, **_kwargs: True)
         monkeypatch.setattr(_mod.subprocess, "run", fake_run)
         handler = _FakeHandler(b"")
@@ -3722,7 +6312,11 @@ class TestModelActivationModeAndMacosBridge:
             ("stop-old-direct-listener", ".llama-server.pid"),
             ("recreate-loopback-bridge", "192.168.106.1"),
             ("launch-loopback-listener", "llama-server", ".llama-server.pid"),
+            ("validate-runtime", "http://127.0.0.1:9090/health"),
+        ]
+        assert events[5:7] == [
             ("validate-runtime", "http://127.0.0.1:9090/v1/models"),
+            ("validate-runtime", "http://127.0.0.1:9090/props"),
         ]
 
     def test_bridge_adapter_invokes_installed_shared_manager(self, tmp_path, monkeypatch):
@@ -3820,10 +6414,96 @@ class TestModelActivationModeAndMacosBridge:
                 tmp_path / "llama.pid",
             )
 
+    def test_native_restart_uses_shared_launchagent_manager(self, tmp_path, monkeypatch):
+        install_dir = tmp_path / "ods"
+        service_script = (
+            install_dir / "installers" / "macos" / "lib" / "native-llama-service.sh"
+        )
+        service_script.parent.mkdir(parents=True)
+        service_script.write_text("#!/bin/bash\n", encoding="utf-8")
+        llama_bin = install_dir / "bin" / "llama-server"
+        llama_bin.parent.mkdir(parents=True)
+        llama_bin.write_bytes(b"binary")
+        env_path = install_dir / ".env"
+        env_path.write_text(
+            "GGUF_FILE=model.gguf\n"
+            "CTX_SIZE=4096\n"
+            "BIND_ADDRESS=127.0.0.1\n",
+            encoding="utf-8",
+        )
+        pid_file = install_dir / "data" / ".llama-server.pid"
+        calls = []
 
-class TestModelActivationLemonadePersistence:
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            if cmd[:3] == ["/bin/bash", str(service_script), "start"]:
+                pid_file.parent.mkdir(parents=True, exist_ok=True)
+                pid_file.write_text("4321\n", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    def test_activation_never_persists_blank_lemonade_model_during_restore(
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(_mod, "_find_usable_bash", lambda: "/bin/bash")
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            _mod.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("native macOS launch must remain under LaunchAgent custody")
+            ),
+        )
+
+        _mod._stop_macos_native_llama_server(pid_file)
+        _mod._launch_native_llama_server(
+            env_path,
+            llama_bin,
+            install_dir / "data" / "llama.log",
+            pid_file,
+        )
+
+        assert calls[0][0] == [
+            "/bin/bash",
+            str(service_script),
+            "stop",
+            str(install_dir),
+            str(llama_bin),
+            str(pid_file),
+        ]
+        assert calls[1][0][:6] == [
+            "/bin/bash",
+            str(service_script),
+            "start",
+            str(install_dir),
+            str(llama_bin),
+            str(pid_file),
+        ]
+        assert calls[1][0][6:] == [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8080",
+            "--model",
+            str(install_dir / "data" / "models" / "model.gguf"),
+            "--alias",
+            "model.gguf",
+            "--ctx-size",
+            "4096",
+            "--n-gpu-layers",
+            "auto",
+            "--parallel",
+            "1",
+            "--metrics",
+            # No tuning helper in this install: the reasoning format arrives
+            # through its fallback instead of --reasoning (b9014).
+            "--reasoning-format",
+            "none",
+        ]
+        assert pid_file.read_text(encoding="utf-8").strip() == "4321"
+
+
+class TestModelActivationRetiredKeys:
+
+    def test_activation_never_rewrites_the_retired_lemonade_model_key(
         self,
         tmp_path,
         monkeypatch,
@@ -3870,11 +6550,6 @@ class TestModelActivationLemonadePersistence:
         monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
         monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
         monkeypatch.setattr(
-            _mod,
-            "_resolve_lemonade_model_id",
-            lambda _env, gguf_file, **_kwargs: f"extra.{gguf_file}",
-        )
-        monkeypatch.setattr(
             _mod, "_compose_restart_llama_server", fake_compose_restart
         )
         monkeypatch.setattr(
@@ -3907,50 +6582,29 @@ class TestModelActivationLemonadePersistence:
         assert observed_envs
         pending_env = observed_envs[0]
         assert pending_env["GGUF_FILE"] == "new-model.gguf"
-        assert pending_env["LEMONADE_MODEL"] == "extra.new-model.gguf"
+        # The installer migration owns retired keys; the agent never
+        # rewrites one or derives a route from it.
+        assert pending_env["LEMONADE_MODEL"] == "extra.old-model.gguf"
+        assert _mod.load_env(env_path)["GGUF_FILE"] == "old-model.gguf"
 
 
 class TestModelActivationRuntimeIdentity:
 
     @pytest.mark.parametrize(
-        ("loaded", "expected"),
+        ("body", "expected"),
         [
-            ("extra.target-model.gguf", True),
-            ("target-model.gguf", True),
-            ("extra.other-model.gguf", False),
-            (False, False),
-            ("", False),
-            (None, False),
+            ('{"status":"ok"}', "ok"),
+            ('{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}', "loading"),
+            ('{"error":{"code":500,"message":"crashed"}}', "error"),
+            ('{"status":"loading"}', "error"),
+            ("[]", "error"),
+            ("not json", "error"),
+            ("", "error"),
         ],
     )
-    def test_lemonade_requires_exact_nonempty_target(self, loaded, expected):
-        body = json.dumps({"status": "ok", "model_loaded": loaded})
-        assert _mod._check_lemonade_health(body, "target-model.gguf") is expected
-
-    def test_lemonade_rejects_target_when_health_is_not_ok(self):
-        body = json.dumps({
-            "status": "loading",
-            "model_loaded": "extra.target-model.gguf",
-        })
-        assert _mod._check_lemonade_health(body, "target-model.gguf") is False
-
-    @pytest.mark.parametrize(
-        ("loaded", "expected"),
-        [
-            ("extra.target-model.gguf", True),
-            (False, False),
-            ("", False),
-            (None, False),
-        ],
-    )
-    def test_generic_lemonade_health_rejects_false_and_empty_identity(
-        self,
-        loaded,
-        expected,
-    ):
-        assert _mod._check_lemonade_health(
-            json.dumps({"status": "ok", "model_loaded": loaded})
-        ) is expected
+    def test_runtime_health_maps_llama_server_states(self, monkeypatch, body, expected):
+        monkeypatch.setattr(_mod, "_runtime_http", lambda _env, path, **_kwargs: body)
+        assert _mod._runtime_health({}) == expected
 
     @pytest.mark.parametrize(
         ("runtime_id", "status", "expected"),
@@ -4352,8 +7006,90 @@ class TestPrecreateDataDirs:
         assert not (ext_dir / "named_vol").exists()
         assert not (install_dir / "named_vol").exists()
 
+    def test_creates_dirs_from_the_selected_gpu_overlays(self, tmp_path, monkeypatch):
+        """ComfyUI declares its mounts only in compose.<gpu>.yaml (Tower3 2026-10-04)."""
+        pytest.importorskip("yaml")
+        builtin_root = tmp_path / "builtin"
+        install_dir = tmp_path / "install"
+        install_dir.mkdir()
+        ext_dir = builtin_root / "comfyui"
+        ext_dir.mkdir(parents=True)
+        (ext_dir / "compose.yaml").write_text(
+            "services:\n  comfyui:\n    image: test:latest\n", encoding="utf-8")
+        for name, mount in (("compose.nvidia.yaml", "./data/comfyui/models:/models"),
+                            ("compose.amd.yaml", "./data/comfyui/amd-only:/x"),
+                            ("compose.multigpu-nvidia.yaml", "./data/comfyui/multi:/y"),
+                            ("compose.local.yaml", "./data/comfyui/local:/z")):
+            (ext_dir / name).write_text(
+                f"services:\n  comfyui:\n    volumes:\n      - {mount}\n", encoding="utf-8")
+
+        monkeypatch.setattr(_mod, "EXTENSIONS_DIR", builtin_root)
+        monkeypatch.setattr(_mod, "USER_EXTENSIONS_DIR", tmp_path / "user")
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "GPU_BACKEND", "nvidia")
+        monkeypatch.setattr(_mod, "GPU_COUNT", "1")
+
+        _mod._precreate_data_dirs("comfyui")
+
+        data = install_dir / "data" / "comfyui"
+        assert (data / "models").is_dir()
+        assert (data / "local").is_dir()
+        assert not (data / "amd-only").exists()
+        assert not (data / "multi").exists()
+
+        monkeypatch.setattr(_mod, "GPU_COUNT", "2")
+        _mod._precreate_data_dirs("comfyui")
+        assert (data / "multi").is_dir()
+
 
 class TestRootlessDataOwnershipRepair:
+    def test_whisper_uses_rootful_or_rootless_cache_preparation(self, tmp_path, monkeypatch):
+        helper = tmp_path / "lib" / "rootless-ownership.sh"
+        helper.parent.mkdir()
+        helper.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        calls = []
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod, "_find_usable_bash", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            _mod.subprocess, "run",
+            lambda cmd, **kwargs: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""),
+        )
+
+        _mod._repair_rootless_data_ownership("whisper")
+
+        assert calls == [[
+            "/bin/bash", "-c",
+            'source "$1"; ods_prepare_whisper_cache_ownership "$2"',
+            "ods-whisper-cache", str(helper), str(tmp_path),
+        ]]
+
+    @pytest.mark.parametrize("service_id", ["ape", "token-spy"])
+    def test_fixed_uid_state_uses_rootful_or_rootless_preparation(
+        self, tmp_path, monkeypatch, service_id,
+    ):
+        helper = tmp_path / "lib" / "rootless-ownership.sh"
+        helper.parent.mkdir()
+        helper.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        calls = []
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod, "_find_usable_bash", lambda: "/bin/bash")
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        _mod._repair_rootless_data_ownership(service_id)
+
+        assert calls == [[
+            "/bin/bash", "-c",
+            'source "$1"; ods_prepare_service_state_ownership "$2" "$3"',
+            "ods-service-state", str(helper), str(tmp_path), service_id,
+        ]]
+
     def test_runs_targeted_helper_for_builtin_linux_service(
         self, tmp_path, monkeypatch,
     ):
@@ -4406,6 +7142,8 @@ class TestRootlessDataOwnershipRepair:
     def test_failure_prevents_compose_start(self, monkeypatch):
         compose_calls = []
         monkeypatch.setattr(_mod, "resolve_compose_flags", lambda: ["-f", "base.yml"])
+        monkeypatch.setattr(_mod, "_prepare_hermes_route_for_start", lambda: (True, ""))
+        monkeypatch.setattr(_mod, "_prepare_hermes_persona_for_start", lambda: (True, ""))
         monkeypatch.setattr(_mod, "_precreate_data_dirs", lambda _sid: None)
         monkeypatch.setattr(
             _mod,
@@ -4429,6 +7167,17 @@ class TestProxyAuthStart:
     def test_auth_is_persisted_and_applied_before_proxy_start(
         self, tmp_path, monkeypatch,
     ):
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        shutil.copyfile(_agent_path.parents[1] / "scripts" / "extension-selection.py",
+                        scripts / "extension-selection.py")
+        (tmp_path / "data").mkdir()
+        extension_root = tmp_path / "extensions" / "services"
+        proxy_dir = extension_root / "ods-proxy"
+        proxy_dir.mkdir(parents=True)
+        (proxy_dir / "compose.yaml").write_text(
+            "services:\n  ods-proxy:\n    image: example:latest\n", encoding="utf-8",
+        )
         env_path = tmp_path / ".env"
         env_path.write_text(
             "BIND_ADDRESS=127.0.0.1\nWEBUI_AUTH=false\nWEBUI_AUTH=false\n",
@@ -4437,6 +7186,10 @@ class TestProxyAuthStart:
         calls = []
 
         monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        monkeypatch.setattr(_mod, "EXTENSIONS_DIR", extension_root)
+        monkeypatch.setattr(_mod, "USER_EXTENSIONS_DIR", tmp_path / "data" / "user-extensions")
+        if sys.platform == "win32":
+            monkeypatch.delitem(sys.modules, "fcntl", raising=False)
         monkeypatch.setattr(
             _mod, "resolve_compose_flags", lambda: ["-f", "base.yml"],
         )
@@ -4758,14 +7511,19 @@ class TestEnableRetry:
 
         monkeypatch.setattr(_mod, "docker_compose_action",
                             lambda sid, act: (True, ""))
-        ticks = iter([0, 0, 2])
-        monkeypatch.setattr(_mod.time, "monotonic", lambda: next(ticks, 2))
+        # Body and startup deadlines observe the same monotonic clock. Keep
+        # reads side-effect free and advance time with the container probe,
+        # so adding deadline observations cannot exhaust a finite tick list.
+        now = [0.0]
+        monkeypatch.setattr(_mod.time, "monotonic", lambda: now[0])
         monkeypatch.setattr(_mod.time, "sleep", lambda *_args: None)
 
         inspect_calls = []
 
         def fake_run(cmd, *args, **kwargs):
             inspect_calls.append(cmd)
+            if cmd[:3] == ["docker", "inspect", "--format"]:
+                now[0] += 2.0
             return subprocess.CompletedProcess(args=cmd, returncode=0,
                                                stdout="exited|boom", stderr="")
 
@@ -4993,6 +7751,13 @@ class TestInstallStatePollBehavior:
         user_root = tmp_path / "user-extensions"
         builtin_root = tmp_path / "builtin-empty"
         install_dir.mkdir()
+        scripts = install_dir / "scripts"
+        scripts.mkdir()
+        shutil.copyfile(_agent_path.parents[1] / "scripts" / "extension-selection.py",
+                        scripts / "extension-selection.py")
+        (install_dir / "data").mkdir()
+        if sys.platform == "win32":
+            monkeypatch.delitem(sys.modules, "fcntl", raising=False)
         data_dir.mkdir()
         user_root.mkdir()
         builtin_root.mkdir()
@@ -5008,6 +7773,12 @@ class TestInstallStatePollBehavior:
             startup_timeout=startup_timeout,
             container_name=container_name,
         )
+        # The start path now requires a selected regular marker while the
+        # host graph lock is held. Keep this suite focused on state polling.
+        (ext_dir / "compose.yaml").write_text(
+            f"services:\n  {sid}:\n    image: example:latest\n", encoding="utf-8",
+        )
+        monkeypatch.setattr(_mod, "_precreate_data_dirs", lambda _sid: None)
 
         monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
         monkeypatch.setattr(_mod, "DATA_DIR", data_dir)
@@ -5078,6 +7849,9 @@ class TestInstallStatePollBehavior:
         Compose ``pull`` and ``up`` always succeed (rc=0).
         Returns a ``calls`` list (each entry: ``{'argv': [...], 'kwargs': {...}}``).
         """
+        # Keep this install-state fixture independent of native Windows's
+        # platform probe, which itself uses subprocess to execute `ver`.
+        monkeypatch.setattr(_mod.platform, 'system', lambda: 'Linux')
         calls = []
         responses = list(inspect_responses)
 
@@ -5089,6 +7863,12 @@ class TestInstallStatePollBehavior:
 
         def fake_run(argv, **kwargs):
             calls.append({"argv": list(argv), "kwargs": dict(kwargs)})
+
+            # The failure diagnostic's state and log reads: nothing to add.
+            if list(argv[:3]) == ["docker", "inspect", "--format"] and argv[3] == "{{json .State}}":
+                return _CP(0, "{}", "")
+            if list(argv[:2]) == ["docker", "logs"]:
+                return _CP(0, "", "")
 
             # docker inspect ... -> consume next scripted response
             if (len(argv) >= 2 and argv[0] == "docker" and argv[1] == "inspect"):
@@ -5106,6 +7886,8 @@ class TestInstallStatePollBehavior:
 
             # docker compose ... -> always success.
             if (len(argv) >= 2 and argv[0] == "docker" and argv[1] == "compose"):
+                if argv[-3:] == ['config', '--format', 'json']:
+                    return _CP(0, json.dumps({'services': {'fakesvc': {'image': 'example/fake:1'}}}))
                 return _CP(0, "", "")
 
             # Anything else: refuse so the test fails loudly rather than
@@ -5569,6 +8351,39 @@ class TestModelDeleteSafety:
         monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
         return install_dir, models_dir
 
+    @pytest.mark.parametrize('managed', [False, True])
+    def test_registered_external_store_does_not_grant_deletion(self, tmp_path, monkeypatch, managed):
+        install, _ = self._setup(tmp_path, monkeypatch)
+        external = tmp_path / 'LM Studio models'
+        external.mkdir()
+        target = external / 'external.gguf'
+        target.write_bytes(b'external model')
+        (install / 'data/model-stores.json').write_text(json.dumps({'schemaVersion': 1, 'stores': [
+            {'id': 'lm-studio', 'hostPath': str(external), 'containerPath': '/model-stores/lm-studio'}]}))
+        monkeypatch.setattr(_mod, '_managed_wsl_runtime', lambda _env:
+                            {'managed': managed, 'plan': {'GgufFile': 'other.gguf'}})
+        monkeypatch.setattr(_mod._wsl_runtime, 'model_store', lambda *_args: tmp_path / 'owned-windows-store')
+        monkeypatch.setattr(_mod, '_live_runtime_has_model',
+                            lambda *_args: pytest.fail('ODS inactivity cannot authorize deleting an external library'))
+        handler = _FakeHandler(json.dumps({'gguf_file': target.name}).encode())
+        _mod.AgentHandler._handle_model_delete(handler)
+        assert handler.response_code == 409
+        assert handler.parse_response()['code'] == 'model_store_read_only'
+        assert target.read_bytes() == b'external model'
+
+    def test_default_model_hardlinked_to_another_library_is_preserved(self, tmp_path, monkeypatch):
+        _install, models = self._setup(tmp_path, monkeypatch)
+        target = models / 'shared.gguf'
+        target.write_bytes(b'shared model')
+        external = tmp_path / 'external.gguf'
+        os.link(target, external)
+        monkeypatch.setattr(_mod, '_live_runtime_has_model', lambda *_args: False)
+        handler = _FakeHandler(json.dumps({'gguf_file': target.name}).encode())
+        _mod.AgentHandler._handle_model_delete(handler)
+        assert handler.response_code == 409
+        assert handler.parse_response()['code'] == 'model_artifact_shared'
+        assert target.read_bytes() == external.read_bytes() == b'shared model'
+
     def test_split_delete_clears_status_naming_deleted_part(self, tmp_path, monkeypatch):
         install_dir, models_dir = self._setup(tmp_path, monkeypatch)
         parts = ["split-00001-of-00002.gguf", "split-00002-of-00002.gguf"]
@@ -5957,7 +8772,9 @@ class TestModelDownloadFileIntegrity:
         _mod.AgentHandler._handle_model_status(handler)
 
         assert handler.response_code == 200
-        assert handler.parse_response() == {"status": "idle"}
+        assert handler.parse_response() == {
+            "status": "idle", "modelTransactionPending": False,
+        }
         assert readiness_calls == []
         assert scheduled == ["model-status"]
         doc = json.loads(state_path.read_text(encoding="utf-8"))
@@ -5997,7 +8814,9 @@ class TestModelDownloadFileIntegrity:
         _mod.AgentHandler._handle_model_status(handler)
 
         assert handler.response_code == 200
-        assert handler.parse_response() == {"status": "idle"}
+        assert handler.parse_response() == {
+            "status": "idle", "modelTransactionPending": False,
+        }
         assert scheduled == ["model-status"]
 
     def test_empty_finished_download_is_failed_not_complete(self, tmp_path, monkeypatch):
@@ -6271,6 +9090,45 @@ class TestModelDownloadFileIntegrity:
         )
         assert valid is False
         assert "size mismatch" in reason
+
+    def test_verified_model_artifact_reuses_unchanged_integrity_proof(
+        self, tmp_path, monkeypatch,
+    ):
+        payload = b"catalog verified model"
+        model_path = tmp_path / "cached-model.gguf"
+        model_path.write_bytes(payload)
+        artifact = {
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+        assert _mod._verify_model_artifact(model_path, artifact) == (True, "")
+
+        def unexpected_hash():
+            raise AssertionError("unchanged artifact should reuse its integrity proof")
+
+        monkeypatch.setattr(_mod.hashlib, "sha256", unexpected_hash)
+        assert _mod._verify_model_artifact(model_path, artifact) == (True, "")
+
+    def test_verified_model_artifact_cache_rejects_same_size_tampering(
+        self, tmp_path,
+    ):
+        payload = b"catalog model A"
+        replacement = b"catalog model B"
+        assert len(payload) == len(replacement)
+        model_path = tmp_path / "tampered-model.gguf"
+        model_path.write_bytes(payload)
+        artifact = {
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+        assert _mod._verify_model_artifact(model_path, artifact) == (True, "")
+        model_path.write_bytes(replacement)
+
+        valid, reason = _mod._verify_model_artifact(model_path, artifact)
+        assert valid is False
+        assert "SHA256 mismatch" in reason
 
     def test_stale_split_status_rejects_missing_second_part(self, tmp_path, monkeypatch):
         first_payload = b"verified first part"
@@ -6677,145 +9535,6 @@ class TestWindowsObservability:
         assert payload["memory_used_mb"] == 9 * 1024
         assert payload["gpus"][0]["memory_type"] == "unified"
 
-    def test_windows_llm_health_survives_optional_stats_failure(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
-        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
-        (tmp_path / ".env").write_text("AMD_INFERENCE_PORT=99999\n")
-        monkeypatch.setattr(_mod, "_windows_llm_status_cache", (0.0, None))
-        requested = []
-
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self, _size=-1):
-                return b'{"status":"ok","model_loaded":"test"}'
-
-        def urlopen(url, timeout):
-            requested_url = url.full_url if hasattr(url, "full_url") else str(url)
-            requested.append(requested_url)
-            if requested_url.endswith("/stats"):
-                raise _mod.urllib_error.URLError("not supported")
-            return Response()
-
-        monkeypatch.setattr(_mod.urllib_request, "urlopen", urlopen)
-
-        payload = _mod._windows_llm_status()
-
-        assert payload["health"]["status"] == "ok"
-        assert payload["stats"] is None
-        assert requested[0] == "http://127.0.0.1:8080/api/v1/health"
-
-    def test_windows_llm_status_redacts_runtime_paths(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
-        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
-        (tmp_path / ".env").write_text(
-            "AMD_INFERENCE_PORT=8080\nLEMONADE_API_KEY=secret-key\n"
-        )
-        monkeypatch.setattr(_mod, "_windows_llm_status_cache", (0.0, None))
-        auth_headers = []
-
-        class Response:
-            def __init__(self, payload):
-                self.payload = payload
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self, _size=-1):
-                return json.dumps(self.payload).encode("utf-8")
-
-        def urlopen(url, timeout):
-            requested_url = url.full_url if hasattr(url, "full_url") else str(url)
-            auth_headers.append(url.get_header("Authorization"))
-            if requested_url.endswith("/health"):
-                return Response({
-                    "status": "ok", "version": "10.0.0",
-                    "model_loaded": r"C:\Users\private\model.gguf",
-                    "all_models_loaded": [{"checkpoint": r"C:\Users\private\model.gguf", "last_use": 123}],
-                })
-            return Response({"output_tokens": 7, "tokens_per_second": 188.49})
-
-        monkeypatch.setattr(_mod.urllib_request, "urlopen", urlopen)
-
-        payload = _mod._windows_llm_status()
-
-        assert payload["health"] == {
-            "status": "ok", "version": "10.0.0", "model_loaded": "model.gguf",
-        }
-        assert set(payload["stats"]) == {
-            "time_to_first_token", "tokens_per_second", "input_tokens",
-            "output_tokens", "prompt_tokens",
-        }
-        assert "private" not in json.dumps(payload)
-        assert auth_headers == ["Bearer secret-key", "Bearer secret-key"]
-
-    def test_windows_llm_stats_exclude_unrelated_health_fields(
-        self, tmp_path, monkeypatch,
-    ):
-        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
-        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
-        (tmp_path / ".env").write_text("AMD_INFERENCE_PORT=8080\n")
-        health_counter = iter((1, 2))
-
-        class Response:
-            def __init__(self, payload):
-                self.payload = payload
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self, _size=-1):
-                return json.dumps(self.payload).encode("utf-8")
-
-        def urlopen(url, timeout):
-            if url.full_url.endswith("/health"):
-                return Response({
-                    "status": "ok", "model_loaded": "model",
-                    "unrelated_health_counter": next(health_counter),
-                })
-            return Response({
-                "output_tokens": 7, "tokens_per_second": 42.0,
-                "last_use": "2026-07-20T22:00:00Z",
-            })
-
-        monkeypatch.setattr(_mod.urllib_request, "urlopen", urlopen)
-        monkeypatch.setattr(_mod, "_windows_llm_status_cache", (0.0, None))
-        first = _mod._windows_llm_status()
-        monkeypatch.setattr(_mod, "_windows_llm_status_cache", (0.0, None))
-        second = _mod._windows_llm_status()
-
-        assert first["stats"] == second["stats"]
-
-    def test_windows_llm_rejects_oversized_runtime_response(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
-        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
-        (tmp_path / ".env").write_text("AMD_INFERENCE_PORT=8080\n")
-        monkeypatch.setattr(_mod, "_windows_llm_status_cache", (0.0, None))
-
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self, size=-1):
-                return b"x" * size
-
-        monkeypatch.setattr(_mod.urllib_request, "urlopen", lambda *args, **kwargs: Response())
-
-        assert _mod._windows_llm_status() is None
-
 
 class TestDockerServiceHealthSnapshot:
 
@@ -6861,7 +9580,11 @@ class TestObservabilityWire:
         monkeypatch.setattr(_mod, "_windows_gpu_metrics", lambda: {
             "schema_version": "ods.host-gpu-metrics.v1", "name": "GPU",
         })
-        monkeypatch.setattr(_mod, "_windows_llm_status", lambda: {
+        monkeypatch.setattr(_mod, "_darwin_system_metrics", lambda: {
+            "schema_version": "ods.host-system-metrics.v1", "platform": "Darwin",
+        })
+        monkeypatch.setattr(_mod, "_host_llm_runtime", lambda _env: "windows-loopback")
+        monkeypatch.setattr(_mod, "_host_llm_status", lambda: {
             "schema_version": "ods.host-llm-status.v1", "health": {"status": "ok"},
         })
         monkeypatch.setattr(_mod, "_docker_service_health_snapshot", lambda: {
@@ -6879,6 +9602,7 @@ class TestObservabilityWire:
 
             expected = {
                 "/v1/gpu/metrics": "ods.host-gpu-metrics.v1",
+                "/v1/system/metrics": "ods.host-system-metrics.v1",
                 "/v1/llm/status": "ods.host-llm-status.v1",
                 "/v1/service/health": "ods.host-service-health.v1",
             }
@@ -6895,3 +9619,390 @@ class TestObservabilityWire:
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+@pytest.fixture
+def install_operation_host(tmp_path, monkeypatch):
+    monkeypatch.setattr(_mod, 'DATA_DIR', tmp_path)
+    monkeypatch.setattr(_mod, 'check_auth', lambda handler: True)
+    monkeypatch.setattr(_mod, 'validate_service_id', lambda handler, body: body['service_id'])
+    monkeypatch.setattr(_mod, 'resolve_compose_flags', lambda: [])
+    monkeypatch.setattr(_mod, '_find_ext_dir', lambda service: None)
+    responses, launches = [], []
+    monkeypatch.setattr(_mod, 'json_response', lambda handler, status, body: responses.append((status, body)))
+    class Worker:
+        def __init__(self, target, **kwargs): self.target = target
+        def start(self):
+            launches.append(True)
+            self.target()
+    monkeypatch.setattr(_mod.threading, 'Thread', Worker)
+    def invoke(operation_id, setup=False):
+        monkeypatch.setattr(_mod, 'read_json_body', lambda handler: {
+            'service_id': 'operation-test', 'operation_id': operation_id, 'run_setup_hook': setup})
+        _mod.AgentHandler._handle_install(object())
+    return invoke, responses, launches
+
+
+def test_install_operation_replay_observes_exact_failed_attempt(install_operation_host):
+    invoke, responses, launches = install_operation_host
+    operation_id = 'a' * 32
+    invoke(operation_id)
+    assert responses[-1][0] == 202
+    assert responses[-1][1]['operation_id'] == operation_id
+    record = _mod._read_install_operation('operation-test', operation_id)
+    assert record['state'] == 'failed'
+    invoke(operation_id)
+    assert responses[-1][1]['operation']['state'] == 'failed'
+    assert len(launches) == 1
+    invoke(operation_id, setup=True)
+    assert responses[-1][0] == 409
+    assert len(launches) == 1
+    invoke('b' * 32)
+    assert len(launches) == 2  # New attempt only after a terminal observation.
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX directory durability barrier')
+def test_install_operation_directory_sync_failure_blocks_worker(install_operation_host, monkeypatch):
+    invoke, responses, launches = install_operation_host
+    real_fsync = os.fsync
+    directory_attempts = []
+
+    def fail_directory_sync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_attempts.append(fd)
+            raise OSError('directory sync failed')
+        return real_fsync(fd)
+
+    monkeypatch.setattr(_mod.os, 'fsync', fail_directory_sync)
+    invoke('d' * 32)
+    assert directory_attempts
+    assert responses[-1][0] == 409
+    assert not launches
+
+
+@pytest.mark.parametrize('terminal_state', ['failed', 'succeeded'])
+def test_install_result_is_not_terminal_until_worker_exits(tmp_path, monkeypatch, terminal_state):
+    monkeypatch.setattr(_mod, 'DATA_DIR', tmp_path)
+    identity = ('operation-test', 'b' * 32)
+    live = {identity}
+    monkeypatch.setattr(_mod, '_install_operation_live', live)
+    _mod._save_install_operation({'service_id': identity[0], 'operation_id': identity[1],
+        'run_setup_hook': False, 'state': terminal_state, 'exit_verified': True})
+    observed = _mod._read_install_operation(*identity)
+    assert observed['state'] == 'running'
+    assert observed['exit_verified'] is False
+    # Observation does not erase the durable result; worker release exposes it.
+    live.clear()
+    assert _mod._read_install_operation(*identity)['state'] == terminal_state
+
+
+def test_orphaned_install_is_uncertain_and_blocks_new_attempt(install_operation_host):
+    invoke, responses, launches = install_operation_host
+    _mod._save_install_operation({'service_id': 'operation-test', 'operation_id': 'c' * 32,
+        'run_setup_hook': False, 'state': 'running'})
+    invoke('c' * 32)
+    assert responses[-1][1]['operation']['state'] == 'uncertain'
+    invoke('d' * 32)
+    assert responses[-1][0] == 409
+    assert not launches
+
+
+def test_install_disconnect_does_not_replay_or_release_worker_twice(install_operation_host, monkeypatch):
+    invoke, responses, launches = install_operation_host
+    responder = _mod.json_response
+    monkeypatch.setattr(_mod, 'json_response', lambda *args: (_ for _ in ()).throw(BrokenPipeError()))
+    with pytest.raises(BrokenPipeError): invoke('e' * 32)
+    assert _mod._read_install_operation('operation-test', 'e' * 32)['state'] == 'failed'
+    monkeypatch.setattr(_mod, 'json_response', responder)
+    invoke('e' * 32)
+    assert len(launches) == 1
+
+
+def test_install_timeout_does_not_authorize_replay(install_operation_host, monkeypatch):
+    invoke, responses, launches = install_operation_host
+    def timeout(): raise subprocess.TimeoutExpired(['docker'], 1)
+    monkeypatch.setattr(_mod, 'resolve_compose_flags', timeout)
+    invoke('f' * 32)
+    assert _mod._read_install_operation('operation-test', 'f' * 32)['state'] == 'uncertain'
+    invoke('a' * 32)
+    assert responses[-1][0] == 409
+    assert len(launches) == 1
+
+
+def test_install_operation_http_observation_is_authenticated_and_bound(tmp_path, monkeypatch):
+    import urllib.error
+    import urllib.request
+    from http.server import HTTPServer
+    monkeypatch.setattr(_mod, 'DATA_DIR', tmp_path)
+    monkeypatch.setattr(_mod, 'AGENT_API_KEY', 'operation-test-key')
+    _mod._save_install_operation({'service_id': 'wire-demo', 'operation_id': 'a' * 32,
+        'run_setup_hook': False, 'state': 'succeeded', 'exit_verified': True})
+    server = HTTPServer(('127.0.0.1', 0), _mod.AgentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f'http://127.0.0.1:{server.server_port}/v1/extension/operation?service_id=wire-demo&operation_id=' + 'a' * 32
+    try:
+        with pytest.raises(urllib.error.HTTPError) as denied:
+            urllib.request.urlopen(url, timeout=2)
+        assert denied.value.code == 401
+        headers = {'Authorization': 'Bearer operation-test-key'}
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=2) as response:
+            assert json.load(response)['operation']['state'] == 'succeeded'
+        with pytest.raises(urllib.error.HTTPError) as missing:
+            urllib.request.urlopen(urllib.request.Request(url.replace('wire-demo', 'other-demo'), headers=headers), timeout=2)
+        assert missing.value.code == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+class TestDarwinSystemMetrics:
+    def test_native_sample_and_missing_sensors(self, monkeypatch):
+        fixture = json.loads((Path(__file__).parent / "fixtures/mac-native-telemetry.json").read_text())
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(_mod, "_darwin_metrics_cached", (0, None))
+        commands = []
+        def run(args, **kwargs):
+            commands.append(args)
+            assert 0 < kwargs["timeout"] <= 2
+            name = Path(args[0]).name
+            key = {"top": "top", "vm_stat": "vm_stat", "ioreg": "ioreg"}.get(name)
+            if name == "sysctl": key = "memory" if args[-1] == "hw.memsize" else "chip"
+            return types.SimpleNamespace(returncode=0, stdout=fixture[key])
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        data = _mod._darwin_system_metrics()
+        assert data["cpu"] == {"percent": 7.6, "temp_c": None, "scope": "host", "source": "macos-top"}
+        assert data["ram"]["total_gb"] == 16
+        assert data["ram"]["used_gb"] == 13.1
+        assert data["gpu"]["utilization_percent"] == 99
+        assert data["gpu"]["memory_used_mb"] == 8428
+        assert data["gpu"]["temperature_c"] is None
+        assert _mod._darwin_system_metrics() is data
+        assert len(commands) == 5
+        # Failure is not zero usage, nor a fabricated thermal reading.
+        monkeypatch.setattr(_mod, "_darwin_metrics_cached", (0, None))
+        monkeypatch.setattr(_mod.subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(subprocess.TimeoutExpired(a[0], 4)))
+        failed = _mod._darwin_system_metrics()
+        assert failed["cpu"]["percent"] is None
+        assert failed["ram"]["used_gb"] is None
+        assert failed["gpu"]["utilization_percent"] is None
+
+    def test_other_hosts_and_auth_do_not_probe(self, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod.subprocess, "run", lambda *a, **kw: pytest.fail("must not execute"))
+        assert _mod._darwin_system_metrics() is None
+        monkeypatch.setattr(_mod, "check_auth", lambda h: False)
+        monkeypatch.setattr(_mod, "_darwin_system_metrics", lambda: pytest.fail("unauthorized probe"))
+        _mod.AgentHandler._handle_system_metrics(object())
+
+    def test_system_endpoint_unavailable(self, monkeypatch):
+        responses = []
+        monkeypatch.setattr(_mod, "check_auth", lambda h: True)
+        monkeypatch.setattr(_mod, "_darwin_system_metrics", lambda: None)
+        monkeypatch.setattr(_mod, "json_response", lambda h, status, data: responses.append(status))
+        _mod.AgentHandler._handle_system_metrics(object())
+        assert responses == [503]
+
+
+def test_darwin_system_metrics_has_one_total_command_budget(monkeypatch):
+    monkeypatch.setattr(_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(_mod, "_darwin_metrics_cached", (0, None))
+    now = [100.0]
+    monkeypatch.setattr(_mod.time, "monotonic", lambda: now[0])
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        now[0] += kwargs["timeout"]
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+    monkeypatch.setattr(_mod.subprocess, "run", run)
+    data = _mod._darwin_system_metrics()
+    assert len(calls) == 2
+    assert now[0] == 104
+    assert data["cpu"]["percent"] is None
+    assert data["ram"]["used_gb"] is None
+
+
+class TestWslNativeSystemMetrics:
+    @pytest.fixture
+    def native(self, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod.platform, "release", lambda: "6.6.114-microsoft-standard-WSL2")
+        monkeypatch.setattr(_mod, "_wsl_metrics_cached", (0, None))
+        monkeypatch.setattr(_mod, "_wsl_metrics_interop", None)
+        monkeypatch.setattr(_mod, "_wsl_interop_identity", lambda p: (1, 42) if p == "/run/WSL/42_interop" else None)
+        monkeypatch.setenv("WSL_INTEROP", "/run/WSL/42_interop")
+        monkeypatch.setattr(_mod.os, "scandir", lambda p: nullcontext(iter([])))
+        monkeypatch.setattr(_mod.Path, "is_file", lambda p: True)
+        return json.loads((Path(__file__).parent / "fixtures/wsl-windows-native-telemetry.json").read_text())
+
+    def test_real_bound_adapter_and_one_shared_snapshot(self, monkeypatch, native):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            assert args[0] == "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+            assert args[1:5] == ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]
+            assert 0 < kwargs["timeout"] <= 8
+            assert kwargs["env"]["WSL_INTEROP"] == "/run/WSL/42_interop"
+            assert "shell" not in kwargs
+            assert _mod.base64.b64decode(args[5]).decode("utf-16-le") == _mod._WSL_SENSOR_POWERSHELL
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(native))
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        result = _mod._wsl_system_metrics()
+        assert result["cpu"]["percent"] == 86 and result["cpu"]["scope"] == "host"
+        assert result["ram"]["total_gb"] == 95.8
+        row = result["gpus"][0]
+        assert row["name"] == "AMD Radeon(TM) 8060S Graphics"
+        assert row["memory_total_mb"] == 32768 and row["memory_used_mb"] == 25566
+        assert row["utilization_percent"] == 24 and row["temperature_c"] is None
+        assert row["memory_scope"] == "dedicated"
+        assert result["sampledAt"]
+        assert _mod._wsl_system_metrics() is result and len(calls) == 1
+
+    @pytest.mark.parametrize("response", ["null", "[]", "not-json", '{"gpus":false}'])
+    def test_malformed_output_is_unavailable(self, monkeypatch, native, response):
+        monkeypatch.setattr(_mod.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=response))
+        result = _mod._wsl_system_metrics()
+        assert result["cpu"]["percent"] is None and result["gpus"] == []
+
+    def test_timeout_is_bounded_and_cached(self, monkeypatch, native):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        result = _mod._wsl_system_metrics()
+        assert result["sampledAt"] is None
+        assert result["cpu"]["percent"] is None
+        assert _mod._wsl_system_metrics() is result and len(calls) == 1
+
+    def test_interop_absent_does_not_install_or_launch_anything(self, monkeypatch, native):
+        monkeypatch.setattr(_mod.Path, "is_file", lambda p: False)
+        monkeypatch.setattr(_mod.subprocess, "run", lambda *a, **kw: pytest.fail("must not launch"))
+        assert _mod._wsl_system_metrics() is None
+
+
+class TestWslServiceInterop:
+    @pytest.fixture
+    def sockets(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_wsl_metrics_interop", None)
+        monkeypatch.delenv("WSL_INTEROP", raising=False)
+        rows = {
+            "/run": types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/run/WSL": types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            "/run/WSL/2_interop": types.SimpleNamespace(st_mode=stat.S_IFSOCK | 0o777, st_uid=0, st_dev=1, st_ino=2),
+            "/run/WSL/1973_interop": types.SimpleNamespace(st_mode=stat.S_IFSOCK | 0o777, st_uid=0, st_dev=1, st_ino=1973),
+        }
+        def lstat(path):
+            try:
+                return rows[str(path).replace('\\', '/')]
+            except KeyError:
+                raise FileNotFoundError(str(path))
+        monkeypatch.setattr(_mod.Path, "lstat", lstat)
+        def entries(path):
+            assert path == "/run/WSL"
+            return nullcontext(iter(types.SimpleNamespace(path=name, name=name.rsplit('/', 1)[-1])
+                                    for name in rows if name.endswith('_interop')))
+        monkeypatch.setattr(_mod.os, "scandir", entries)
+        return rows
+
+    @pytest.mark.parametrize("path", [None, "", "/tmp/1973_interop", "/run/WSL/../1973_interop", "/run/WSL/01_interop", "/run/WSL/1973_interop/other"])
+    def test_rejects_noncanonical_socket_paths(self, sockets, path):
+        assert _mod._wsl_interop_identity(path) is None
+
+    @pytest.mark.parametrize("path,change", [
+        ("/run", {"st_mode": stat.S_IFLNK | 0o777}),
+        ("/run/WSL", {"st_mode": stat.S_IFDIR | 0o775}),
+        ("/run/WSL", {"st_uid": 1000}),
+        ("/run/WSL/1973_interop", {"st_mode": stat.S_IFLNK | 0o777}),
+        ("/run/WSL/1973_interop", {"st_mode": stat.S_IFREG | 0o600}),
+        ("/run/WSL/1973_interop", {"st_uid": 1000}),
+    ])
+    def test_rejects_untrusted_custody(self, sockets, path, change):
+        for key, value in change.items():
+            setattr(sockets[path], key, value)
+        assert _mod._wsl_interop_identity("/run/WSL/1973_interop") is None
+
+    def test_service_discovers_working_root_socket_and_reuses_it(self, monkeypatch, sockets):
+        calls = []
+        def run(command, **kwargs):
+            calls.append(kwargs)
+            okay = kwargs['env']['WSL_INTEROP'].endswith('/1973_interop')
+            return types.SimpleNamespace(returncode=0 if okay else 1, stdout='{}', stderr='' if okay else 'Invalid argument')
+        monkeypatch.setattr(_mod.subprocess, 'run', run)
+        assert _mod._wsl_sensor_run(['powershell.exe']).returncode == 0
+        assert [row['env']['WSL_INTEROP'] for row in calls] == ['/run/WSL/2_interop', '/run/WSL/1973_interop']
+        assert _mod._wsl_sensor_run(['powershell.exe']).returncode == 0
+        assert calls[-1]['env']['WSL_INTEROP'] == '/run/WSL/1973_interop'
+        assert len(calls) == 3
+        assert 'WSL_INTEROP' not in os.environ
+
+    def test_stale_cached_socket_is_revalidated(self, monkeypatch, sockets):
+        monkeypatch.setattr(_mod, '_wsl_metrics_interop', ('/run/WSL/1973_interop', (1, 1973)))
+        sockets['/run/WSL/1973_interop'].st_mode = stat.S_IFLNK | 0o777
+        calls = []
+        monkeypatch.setattr(_mod.subprocess, 'run', lambda command, **kw: (calls.append(kw['env']['WSL_INTEROP']) or types.SimpleNamespace(returncode=0)))
+        _mod._wsl_sensor_run(['powershell.exe'])
+        assert calls == ['/run/WSL/2_interop']
+
+    def test_failed_sensors_do_not_trigger_more_windows_processes(self, monkeypatch, sockets):
+        calls = []
+        monkeypatch.setattr(_mod.subprocess, 'run', lambda command, **kw: (calls.append(command) or types.SimpleNamespace(returncode=1, stderr='CIM provider unavailable')))
+        assert _mod._wsl_sensor_run(['powershell.exe']).returncode == 1
+        assert len(calls) == 1
+
+    def test_hung_sessions_share_eight_second_budget(self, monkeypatch, sockets):
+        now = [100.0]
+        monkeypatch.setattr(_mod.time, 'monotonic', lambda: now[0])
+        calls = []
+        def run(command, **kwargs):
+            calls.append(kwargs['timeout'])
+            now[0] += kwargs['timeout']
+            raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+        monkeypatch.setattr(_mod.subprocess, 'run', run)
+        with pytest.raises(OSError, match='No usable trusted'):
+            _mod._wsl_sensor_run(['powershell.exe'])
+        assert calls == [4, 4]
+        assert now[0] == 108
+
+    def test_no_trusted_socket_never_executes(self, monkeypatch, sockets):
+        sockets['/run/WSL'].st_mode = stat.S_IFDIR | 0o777
+        monkeypatch.setenv('WSL_INTEROP', '/tmp/untrusted_interop')
+        monkeypatch.setattr(_mod.subprocess, 'run', lambda *a, **kw: pytest.fail('must not execute'))
+        with pytest.raises(OSError, match='No usable trusted'):
+            _mod._wsl_sensor_run(['powershell.exe'])
+
+    def test_failed_launches_are_limited_to_three_sessions(self, monkeypatch, sockets):
+        for number in range(3, 12):
+            sockets[f'/run/WSL/{number}_interop'] = types.SimpleNamespace(
+                st_mode=stat.S_IFSOCK | 0o777, st_uid=0, st_dev=1, st_ino=number)
+        calls = []
+        monkeypatch.setattr(_mod.subprocess, 'run', lambda command, **kw: (
+            calls.append(kw['env']['WSL_INTEROP']) or types.SimpleNamespace(returncode=1, stderr='Invalid argument')))
+        with pytest.raises(OSError, match='No usable trusted'):
+            _mod._wsl_sensor_run(['powershell.exe'])
+        assert calls == ['/run/WSL/2_interop', '/run/WSL/3_interop', '/run/WSL/4_interop']
+
+    def test_replaced_cached_inode_is_not_preferred(self, monkeypatch, sockets):
+        monkeypatch.setattr(_mod, '_wsl_metrics_interop', ('/run/WSL/1973_interop', (1, 999)))
+        calls = []
+        monkeypatch.setattr(_mod.subprocess, 'run', lambda command, **kw: (
+            calls.append(kw['env']['WSL_INTEROP']) or types.SimpleNamespace(returncode=0)))
+        _mod._wsl_sensor_run(['powershell.exe'])
+        assert calls == ['/run/WSL/2_interop']
+
+    def test_hung_cached_socket_clears_cache_and_uses_alternate(self, monkeypatch, sockets):
+        monkeypatch.setattr(_mod, '_wsl_metrics_interop', ('/run/WSL/1973_interop', (1, 1973)))
+        now = [100.0]
+        monkeypatch.setattr(_mod.time, 'monotonic', lambda: now[0])
+        calls = []
+        def run(command, **kwargs):
+            calls.append(kwargs['env']['WSL_INTEROP'])
+            if len(calls) == 1:
+                now[0] += kwargs['timeout']
+                raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+            assert kwargs['timeout'] == 4
+            return types.SimpleNamespace(returncode=0)
+        monkeypatch.setattr(_mod.subprocess, 'run', run)
+        _mod._wsl_sensor_run(['powershell.exe'])
+        assert calls == ['/run/WSL/1973_interop', '/run/WSL/2_interop']
+        assert _mod._wsl_metrics_interop == ('/run/WSL/2_interop', (1, 2))

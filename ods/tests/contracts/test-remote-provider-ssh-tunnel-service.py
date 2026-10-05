@@ -194,9 +194,22 @@ def test_compose_service_is_internal_only_and_hardened() -> None:
     for port in ('"18090"', '"18091"', '"18092"'):
         assert_true(port in block, f"service must expose internal port {port}")
     assert_true("ports:" not in block, "service must not bind a host port")
+    # Its SSH forwards are plain TCP with no caller check (GHSA-4rpc).
+    assert_true(
+        "    networks:\n      - remote-provider\n      - remote-provider-outbound\n" in block,
+        "tunnel must join only the remote-provider networks",
+    )
+    assert_true("      - default\n" not in block, "tunnel must not join ods-network")
     assert_true("cap_drop:" in block and "- ALL" in block, "service must drop capabilities")
+    assert_true(
+        '"${REMOTE_PROVIDER_DATA_GID:-1000}"' in block,
+        "service must receive the host data group for mode-0640 secret reads",
+    )
     assert_true("read_only: true" in block, "service filesystem must be read-only")
-    assert_true("/state:ro" in block, "service must mount ODS state read-only")
+    assert_true(
+        "${ODS_DATA_DIR:-./data}/remote-provider:/state/remote-provider:ro" in block,
+        "service must mount only remote-provider state read-only",
+    )
     assert_true("ODS_REMOTE_PROVIDER_SECRET_DIR=/state/remote-provider/secrets" in block, "service must use secret custody directory")
     for key in PUBLIC_SSH_SECRET_ENV:
         assert_true(key not in block, f"service must not source public SSH secret env {key}")
