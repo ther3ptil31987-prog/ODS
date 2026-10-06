@@ -49,7 +49,7 @@ import {isQuestionAnswer, parseQuestionsFrame, questionMetadata} from '../lib/pi
 import PixelTurnNavigation from '../components/PixelTurnNavigation'
 import PixelSnapshotChanges from '../components/PixelSnapshotChanges'
 import PortalDeliveredArtifacts from '../components/PortalDeliveredArtifacts'
-import { deliveredArtifactMetadata, parseDeliveredArtifactsFrame } from '../lib/pixelDeliveredArtifacts'
+import { deliveredArtifactDisplayText, deliveredArtifactMetadata, parseDeliveredArtifactsFrame } from '../lib/pixelDeliveredArtifacts'
 import PortalWorkspace from '../components/PortalWorkspace'
 import { parseTaskActivity, parseTaskActivityFrame } from '../lib/pixelTaskActivity'
 import MetalMetricIcon from '../components/MetalMetricIcon'
@@ -1705,7 +1705,9 @@ export default function Pixel({ systemStatus = null }) {
         )}
         {messages.map((message, index) => {
           if (isQuestionAnswer(messages,index)) return null
-          const displayedContent=message.role==='assistant' ? publicationDisplayText(message.content,message.publication) : message.content
+          const publicationContent=message.role==='assistant' ? publicationDisplayText(message.content,message.publication) : message.content
+          const displayedContent=message.role==='assistant' && message.status==='done'
+            ? deliveredArtifactDisplayText(publicationContent,message.artifacts) : publicationContent
           return (
           <div key={index} data-pixel-message-index={index} tabIndex={-1} data-pixel-response={message.role === 'assistant' ? '' : undefined} className={`mx-auto flex min-w-0 w-full max-w-5xl ${message.role === 'user' ? 'justify-end gap-2' : 'justify-start'}`}>
             {message.role === 'assistant' && <PixelMascot state={pixelReplyPose(message, sending && index === messages.length - 1)} settled={message.status !== 'streaming'} className="pixel-reply-character" />}

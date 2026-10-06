@@ -4598,6 +4598,22 @@ function currentOwnerIntentText(messages, prompt = undefined) {
     : currentText;
 }
 
+// This selects prompt guidance only; it grants no tool or publication authority.
+export function userMessageRequestsWorkspaceDocumentDelivery(messages, prompt = undefined) {
+  const text = currentOwnerIntentText(messages, prompt);
+  if (!text || ownerForbidsTools(text)) return false;
+  const lane = ownerLaneText(text);
+  if (/\b(?:https?:\/\/|www\.)/i.test(lane)) return false;
+  if (/^\s*(?:please\s+)?(?:how\b|what\b|why\b|where\b|when\b|explain\b|describe\b|tell\s+me\s+(?:how|about)\b|is\b|are\b|does\b)/i.test(lane)) return false;
+  const positive = lane.split(/[!?;\n]+|\.(?=\s|$)/).filter(clause =>
+    !/\b(?:do\s+not|don['’]t|never|must\s+not|should\s+not|without)\s+(?:download|deliver|attach|publish)\b/i.test(clause)
+  ).join(' ');
+  return /\b(?:download(?:able)?|attach(?:ment)?|deliver(?:y)?)\b/i.test(positive) &&
+    (/\.(?:md|markdown|txt|csv|tsv|json|pdf|zip|rar|docx|xlsx|pptx)\b/i.test(positive) ||
+      (/\b(?:documents?|files?|archives?)\b/i.test(positive) &&
+        !/\b(?:images?|photos?|audio|video|websites?|webpages?|html)\b|\.(?:png|jpe?g|gif|svg|mp3|mp4|wav|webm|html?)\b/i.test(positive)));
+}
+
 function ownerLaneText(text) {
   // Classify only current owner prose. Embedded examples cannot opt a workspace
   // turn into extension work; identifiers quoted as operands remain usable.
@@ -5895,12 +5911,13 @@ function workspacePreviewInstructionText(text, {preserveFileTargets = false} = {
   let projected = text
     .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, " ")
     .replace(/^[ \t]*>[^\n]*/gm, " ");
-  // An explicit payload can be delimited or one unquoted sentence. Preserve
-  // independent instructions after its closing quote or sentence boundary.
+  // An explicit payload can be delimited or one unquoted sentence, with or
+  // without a colon. Preserve independent instructions after its closing
+  // quote, sentence boundary, or a conjunction introducing another action.
   // Undelimited multi-sentence prose remains ambiguous; this is not a parser
   // for every way an owner can express a task.
   projected = projected.replace(
-    /\b(?:containing|with\s+(?:the\s+)?(?:contents?|text))\s*(?:exactly\s*)?:\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[^\n]*?(?=[!?;\n]|\.(?=\s|$)|$))/gi,
+    /\b(?:containing|with\s+(?:the\s+)?(?:contents?|text))(?:\s+exactly)?(?:\s*:\s*|\s+)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[^\n]*?(?=\b(?:and(?:\s+then)?|then|but|instead)\s+(?:build|create|develop|design|generate|implement|make|write|publish|republish|preview|serve)\b|[!?;\n]|\.(?=\s|$)|$))/gi,
     " "
   );
   const quotedTarget = (value) =>
@@ -6251,18 +6268,20 @@ function directBasicSiteCreation(text) {
     .replace(/^\s*>[^\n]*/gm, " ").replace(/"[^"\n]*"|`[^`\n]*`/g, " ")
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   let creation = false;
+  // A short subject such as "reading-list" can modify the site noun.
+  // Stack, source, and input prerequisites are still checked by the caller.
   const clauses = prose.split(/[!?;\n]+|\.(?=\s|$)/).filter(clause => clause.trim());
   for (const clause of clauses) {
     const request = clause.trim().replace(/^please[,\s]+/i, "")
       .replace(/^(?:can|could|would)\s+you\s+(?:please\s+)?/i, "")
       .replace(/^por\s+favor[,\s]+/i, "");
-    const match = request.match(/^(?:build|create|make|design|generate)\s+(?:(?:me|us)\s+)?(?:a|an)\s+(?:new\s+)?(?:(?:polished|responsive|accessible|clean|modern|small)[,\s]+){0,4}(?:basic|simple|one[- ]page|single[- ]page)[,\s]+(?:(?:polished|responsive|accessible|clean|modern|small|one[- ]page|single[- ]page)[,\s]+){0,4}(?:website|site|web\s*page|landing\s+page)\b/i)
+    const match = request.match(/^(?:build|create|make|design|generate)\s+(?:(?:me|us)\s+)?(?:a|an)\s+(?:new\s+)?(?:(?:polished|responsive|accessible|clean|modern|small)[,\s]+){0,4}(?:basic|simple|one[- ]page|single[- ]page)[,\s]+(?:(?:polished|responsive|accessible|clean|modern|small|one[- ]page|single[- ]page)[,\s]+){0,4}(?:[a-z][a-z0-9-]*\s+){0,3}(?:website|site|web\s*page|landing\s+page)\b/i)
       ?? request.match(/^(?:crie|criar|faca|fazer|construa|construir)\s+(?:para\s+mim\s+)?(?:um|uma)\s+(?:(?:novo|nova)\s+)?(?:site|website|pagina\s+web|landing\s+page)\s+(?:simples|basico|basica|de\s+uma\s+pagina)\b/i);
     if (match) {
       const tail = request.slice(match[0].length).trim();
       // A bare noun after "website" may be the real object (crawler, content
       // analyzer, or an unknown future tool). Do not force HTML by guessing.
-      if (tail && !/^(?:[,:(]|(?:for|with|without|in|on|about|from|using|via|leveraging|and|then|that|which|to|called|named|para|com|sem|em|e)\b)/i.test(tail)) return false;
+      if (tail && !/^(?:[,:(]|(?:for|with|without|in|on|about|from|using|via|leveraging|and|then|that|which|where|to|called|named|para|com|sem|em|e)\b)/i.test(tail)) return false;
       creation = true;
     } else if (!/^(?:(?:and|then|now|e|depois)\s+)?(?:publish|preview|show|display|serve|publique|mostre)\b/i.test(request)) {
       // Unknown additional instructions can contain prerequisites. Preserve
@@ -6282,7 +6301,7 @@ export function workspacePreviewMode(messages, prompt = undefined) {
   // work and a real build. The deterministic entry-file fast path is only for
   // a fresh static artifact where those steps add failure modes, not value.
   const frameworkOrBuild =
-    /\b(?:angular|astro|bun|gatsby|jsx|next(?:\.js)?|node(?:\.js)?|npm|nuxt|parcel|pnpm|react|remix|rollup|svelte|tsx|typescript|vite|vue|webpack|yarn)\b/i.test(text) ||
+    /\b(?:angular|astro|blazor|bun|django|express|fastapi|flask|gatsby|jsx|laravel|next(?:\.js)?|node(?:\.js)?|npm|nuxt|parcel|phoenix|pnpm|qwik|rails|react|remix|rollup|solid(?:start)?|svelte|tsx|typescript|vite|vue|webpack|yarn)\b/i.test(text) ||
     /\b(?:build\s+command|build\s+output|compile|dependencies|package\.json|source\s+tree)\b/i.test(text);
   const existingProject =
     /\b(?:existing|current|previous|prior|already[- ]created|updated|revised|corrected|repair|fix|debug|migrate|upgrade|rename|move)\b/i.test(text) ||
@@ -7402,6 +7421,7 @@ export function createToolLoopGuard({
         workspaceVerificationRequested: false,
         workspacePreviewRequired: false,
         workspacePreviewForbidden: false,
+        workspaceDocumentDeliveryRequested: false,
         workspacePreviewMode: undefined,
         workspacePreviewAuthorshipRequired: false,
         workspacePreviewModelAuthored: false,
@@ -8155,6 +8175,10 @@ export function createToolLoopGuard({
         ? pendingParams.id.split(":").at(-1)
         : toolName;
     if (pendingSelectedName === WORKSPACE_PREVIEW_TOOL) {
+      if (state?.workspaceDocumentDeliveryRequested && !state.workspacePreviewRequired) {
+        return {block:true, blockReason:
+          'The owner requested a downloadable document. Do not call pixel_ods_workspace_preview for documents. Call tool_call with id pixel_ods_workspace_artifact and args {"relativePath":"<exact existing workspace-relative document path>"} instead.'};
+      }
       if (!state?.ownerIntentObserved || state.workspacePreviewForbidden) {
         return {
           block: true,
@@ -9669,6 +9693,7 @@ export function createToolLoopGuard({
       if (currentUserText(event?.messages, event?.prompt)) {
         state.ownerIntentObserved = true;
         state.workspacePreviewForbidden = ownerForbidsWorkspacePreview(event?.messages, event?.prompt);
+        state.workspaceDocumentDeliveryRequested = userMessageRequestsWorkspaceDocumentDelivery(event?.messages, event?.prompt);
         const previousPreview = typeof sessionId === "string" && sessionId
           ? sessionPreviews.get(sessionId)
           : undefined;
@@ -10591,7 +10616,12 @@ export function createToolLoopGuard({
     // reject an unexpected success receipt instead of accepting publication.
     const declinedPreviewError = state.ownerIntentObserved &&
       state.workspacePreviewForbidden && previewEvent?.result?.isError === true;
-    if (previewEvent && !declinedPreviewError) {
+    // A rejected website tool cannot create a website-delivery obligation for
+    // a document-only request. Unexpected successes still follow receipt checks.
+    const documentPreviewError = state.ownerIntentObserved &&
+      state.workspaceDocumentDeliveryRequested && !state.workspacePreviewRequired &&
+      previewEvent?.result?.isError === true;
+    if (previewEvent && !declinedPreviewError && !documentPreviewError) {
       state.workspacePreviewAttempted = true;
       const requestedDirectory = normalizeWorkspaceFilePath(
         previewEvent?.params?.relativeDirectory

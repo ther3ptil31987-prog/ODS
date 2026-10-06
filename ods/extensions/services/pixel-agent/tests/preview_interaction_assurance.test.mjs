@@ -176,6 +176,25 @@ test('visibility gate only requests checks supported by the installed capability
   }
 });
 
+test('static page contents beside form controls do not request show/hide inspection',()=>{
+  const prompt='Create a tiny reading-list webpage in a new Playground/fleet-reading-list folder. It should show the title Fleet Reading List, a text box for a book title, and an Add book button that adds the title to the visible list. Save it as index.html, publish a workspace preview, and give me the preview link. Keep everything local; no external services.';
+  for (const text of [prompt,
+    'Show a heading and a Submit button.',
+    'Add a visible list and a button that appends a book.',
+    'Show the title, a contact form, and a Submit button.',
+    'Add a Submit button and show the page title.',
+  ]) assert.equal(requestsVisibilityInteraction(text), false, text);
+  const {guard}=setup({prompt});
+  assert.equal(guard.verificationForRun('run').status,'passed');
+  assert.doesNotMatch(guard.verificationForRun('run').text,/show\/hide interaction/);
+  for (const text of [
+    'Show a title and a contact form with a button that reveals hidden help.',
+    'Add a book button and a button that shows the details.',
+    'A click makes the details visible.',
+    'Show the details when the button is clicked.',
+  ]) assert.equal(requestsVisibilityInteraction(text), true, text);
+});
+
 test('initial control-state corrections do not imply a new visibility transition',()=>{
   for (const text of [
     'First, wireframe is off initially, but its Show wireframe button starts with aria-pressed=true; initialise it to match the actual state.',

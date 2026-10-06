@@ -26,7 +26,14 @@ export function requestsVisibilityInteraction(text) {
       /\b(?:button|toggle|link|tab|switch)\s*,?\s*(?:(?:named|called|labelled|labeled)\s*)?$/i.test(clause.slice(0, offset)) ||
       /^\s*,?\s*(?:button|toggle|link|tab|switch)\b/i.test(clause.slice(offset + name.length)) ? ' ' : name)
       .replace(/\b(?:its|their|the|this|that|a|an|my|your|our)\s+(?:show|hide|reveal|expand|collapse)(?:[ \t]+[\p{L}\p{N}_-]+){0,4}[ \t]+(?:button|toggle|link|tab|switch)(?=[ \t]+(?:starts?|begins?|defaults?)\b)/giu, ' control ') : clause;
-    return /\b(?:shows?|hides?|hidden|reveals?|expands?|collapses?|visible|visibility)\b/i.test(bare);
+    if (/\b(?:hides?|hidden|reveals?|expands?|collapses?|visibility)\b/i.test(bare)) return true;
+    // Static page contents can be shown or visible beside a form control.
+    // Bind those ambiguous words to the control's action or show-control name.
+    return /\bclick(?:s|ed|ing)?\b[^.!?;\n]{0,100}\bshows?\b/i.test(bare) ||
+      /\b(?:buttons?|toggles?)\b(?:(?!\band\b)[^,.!?;\n]){0,80}\bshows?\b/i.test(bare) ||
+      /\bshows?\b[^,.!?;\n]{0,80}\b(?:with|using|via|when|after|on)\b[^.!?;\n]{0,40}\b(?:buttons?|toggles?|click(?:s|ed|ing)?)\b/i.test(bare) ||
+      /\bshow(?:[ \t]+(?!and\b)[\p{L}\p{N}_-]+){0,4}["”»’']?[ \t]+(?:buttons?|toggles?)\b/iu.test(bare) ||
+      /\b(?:makes?|becomes?|turns?)\b[^.!?;\n]{0,40}\b(?:in)?visible\b/i.test(bare);
   });
 }
 

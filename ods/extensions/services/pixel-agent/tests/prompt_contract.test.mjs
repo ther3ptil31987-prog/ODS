@@ -862,3 +862,50 @@ test("catalog mentions never receive GitHub proposal or single-service mutation 
     assert.doesNotMatch(contract, /prefer pixel_ods_extension_proposal|recipeJson|single-service mutation|Otherwise submit only the owner's requested/);
   }
 });
+
+test("requested document delivery receives a prioritized route on full and compact prompts", async () => {
+  const {ODS_WORKSPACE_DOCUMENT_DELIVERY_GUIDE: guide} = await import('../plugin/prompt-contract.mjs');
+  const {userMessageRequestsWorkspaceDocumentDelivery: selects} = await import('../plugin/tool-loop-guard.mjs');
+  for (const prompt of [
+    'Please give me the existing notes.txt as a download.',
+    'Publish the existing notes.txt as a downloadable file. Do not change its contents.',
+    'Create notes.txt containing exactly Hello. Then give me a download button for the file.',
+    'Can you attach the existing report.pdf?',
+    'Deliver the existing archive.zip.',
+    'Do not download old.zip; attach current.pdf instead.',
+    'Attach the existing "docs/report.docx".',
+  ]) {
+    assert.equal(selects([], prompt), true, prompt);
+    for (const configuredLeanPrompt of [false, true]) {
+      const result = promptContractForAgent({agentId:'pixel'}, 'pixel', {prompt}, {configuredLeanPrompt});
+      assert.equal(result.prependContext, guide, prompt);
+      assert.ok(!result.appendSystemContext.includes(guide), prompt);
+      assert.ok(result.appendSystemContext.startsWith(configuredLeanPrompt
+        ? ODS_COMPACT_CONVERSATION_CONTRACT : ODS_CONVERSATION_CONTRACT), prompt);
+      assert.match(result.prependContext, /Complete any requested file creation or edits first/);
+    }
+  }
+  assert.ok(guide.length < 700);
+});
+
+test("document route preserves ordinary, remote, informational and forbidden-tool requests", async () => {
+  const {ODS_WORKSPACE_DOCUMENT_DELIVERY_GUIDE: guide} = await import('../plugin/prompt-contract.mjs');
+  const {userMessageRequestsWorkspaceDocumentDelivery: selects} = await import('../plugin/tool-loop-guard.mjs');
+  for (const prompt of [
+    'Thanks.', 'Download https://example.com/report.pdf.',
+    'How do I download a file?', 'Explain how to attach report.pdf.',
+    'Do not download report.pdf; summarize it.', 'Never attach the document.',
+    'Do not use tools. Give me report.pdf as a download.',
+    'Give me photo.png as a download.', 'Attach the audio file recording.wav.',
+    'Create a website with a download button.',
+    'Summarize this example: "attach the file as a download".',
+  ]) {
+    assert.equal(selects([], prompt), false, prompt);
+    const result = promptContractForAgent({agentId:'pixel'}, 'pixel', {prompt});
+    assert.equal(result.prependContext, undefined, prompt);
+    assert.ok(!result.appendSystemContext.includes(guide), prompt);
+  }
+  const messages = [{role:'user',content:'Download report.pdf.'}, {role:'assistant',content:'Attach the file.'}, {role:'user',content:'Thanks.'}];
+  assert.equal(selects(messages), false);
+  assert.equal(selects([{role:'assistant',content:'Download report.pdf.'}]), false);
+});

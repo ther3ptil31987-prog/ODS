@@ -347,6 +347,19 @@ _ods_pixel_source_transition_required() {
     [[ "$state" =~ ^(ready|installing|deactivating)$ \
         && "$source_ref" =~ ^[0-9a-f]{40}$ ]] || return 2
     [[ "$state" == deactivating || "$source_ref" != "$requested_ref" ]] && return 0
+    # An interrupted bootstrap has not installed a release or access
+    # coordinator yet. There is no authority baseline to migrate. Keep the
+    # ordinary source-copy path only for the exact inert initial state.
+    if [[ "$state" == installing \
+        && ! -e /var/lib/ods-pixel-access && ! -L /var/lib/ods-pixel-access \
+        && ! -e /etc/ods/pixel-access.json && ! -L /etc/ods/pixel-access.json \
+        && ! -e /usr/local/libexec/ods-pixel-access && ! -L /usr/local/libexec/ods-pixel-access \
+        && ! -e /etc/systemd/system/openclaw-gateway.service \
+        && ! -L /etc/systemd/system/openclaw-gateway.service ]] \
+        && PIXEL_SOURCE_REF="$requested_ref" _ods_pixel_initial_unconfigured_marker "$owner" "$home" \
+            "$INSTALL_DIR/data/pixel/source-$source_ref"; then
+        return 1
+    fi
     # The Pixel pin alone does not identify the ODS host integration. Preserve
     # its installed source until cleanup can validate privileged mirrors, even
     # when an upgrade retains the same developer Pixel checkout.
@@ -2669,8 +2682,8 @@ _ods_pixel_initial_unconfigured_marker() {
     [[ -f "$home/.config/ods/pixel-managed.json" && ! -L "$home/.config/ods/pixel-managed.json" ]] || return 1
     ods_pixel_run_as_owner "$owner" "$home" python3 - \
         "$home/.config/ods/pixel-managed.json" "$home/.openclaw/openclaw.json" \
-        "${INSTALL_DIR:?}" "$home" "${PIXEL_SOURCE_REF:?}" <<'PY'
-import json, os, pathlib, re, sys
+        "${INSTALL_DIR:?}" "$home" "${PIXEL_SOURCE_REF:?}" "${3:-}" <<'PY'
+import json, os, pathlib, re, stat, sys
 marker = json.load(open(sys.argv[1]))
 initial = (
     set(marker) == {"schema_version", "manager", "state", "initial_active_state",
@@ -2682,11 +2695,44 @@ initial = (
     and re.fullmatch(r"[0-9a-f]{40}", marker["pixel_source_ref"])
     and marker["pixel_source_ref"] == sys.argv[5]
 )
-raise SystemExit(0 if initial and not os.path.lexists(sys.argv[2]) and not any(
+if not initial or any(
     os.path.lexists(pathlib.Path(sys.argv[4]) / ".local/share/pixel" / name)
     for name in ("current", "runtime-attestation.json", ".ods-uninstall-current",
                  ".ods-uninstall-runtime-attestation")
-) else 1)
+):
+    raise SystemExit(1)
+config_path = pathlib.Path(sys.argv[2])
+if not os.path.lexists(config_path):
+    raise SystemExit(0)
+# A cancelled first bootstrap can leave only plugin-enable entries, before
+# configure/apply has created any gateway, agent, workspace or access mode.
+# Accept this exact inert shape, never an arbitrary partial configuration.
+fd = os.open(config_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+with os.fdopen(fd, 'rb') as handle:
+    info = os.fstat(handle.fileno())
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_nlink != 1 or info.st_mode & 0o077 or info.st_size > 65536):
+        raise SystemExit(1)
+    config = json.load(handle)
+if not sys.argv[6]:
+    raise SystemExit(1)
+manifest = json.loads((pathlib.Path(sys.argv[6]) / 'RELEASE-MANIFEST.json').read_text())
+plugins = config.get('plugins') if isinstance(config, dict) else None
+meta = config.get('meta') if isinstance(config, dict) else None
+if (set(config) != {'plugins', 'meta'} or not isinstance(plugins, dict)
+        or set(plugins) != {'entries'} or not isinstance(meta, dict)
+        or set(meta) != {'lastTouchedVersion', 'lastTouchedAt'}
+        or meta['lastTouchedVersion'] != manifest['openclaw']
+        or not isinstance(meta['lastTouchedAt'], str)
+        or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', meta['lastTouchedAt'])):
+    raise SystemExit(1)
+entries = plugins['entries']
+if (not isinstance(entries, dict) or not entries
+        or not set(entries) <= {'discord', 'searxng', 'llama-cpp'}
+        or any(not isinstance(value, dict) or set(value) != {'enabled'}
+               or value['enabled'] is not True for value in entries.values())):
+    raise SystemExit(1)
+raise SystemExit(0)
 PY
 }
 
@@ -3059,6 +3105,17 @@ finally:
     if os.path.exists(temporary):
         os.unlink(temporary)
 PY
+}
+
+# Docker Desktop can retain this shared tag after its Ubuntu distribution was
+# removed. This is distinct from an inactive release directory on this host.
+# Never reinterpret another UID's image as our candidate or retire its tag.
+_ods_pixel_shared_sandbox_conflict() {
+    local owner="$1" home="$2" apply_log="$3"
+    ods_pixel_run_as_owner "$owner" "$home" grep -Fxq \
+        -e '[pixel] ERROR: Shared live sandbox tag exists without an active Pixel release and is not valid for the reviewed candidate' \
+        -e '[pixel] ERROR: Shared live sandbox tag exists without an active Pixel release and does not match the reviewed candidate' \
+        -- "$apply_log"
 }
 
 # Pixel deliberately preserves a release that was rolled back after live
@@ -4514,7 +4571,7 @@ PY
 _ods_pixel_write_onboarding() {
     local owner="$1" home="$2" answers="$3" openclaw_bin="$4" plugin_path="$5" plugin_digest="$6"
     local web_search_provider="${7:-searxng}" parallel_path="${8:-}" parallel_digest="${9:-}"
-    local context="${MAX_CONTEXT:-16384}" max_tokens reasoning=false
+    local context="${MAX_CONTEXT:-16384}" max_tokens reasoning=default
     local gateway_alias gateway_label runtime_model model_gateway_port="${PIXEL_MODEL_RELAY_PORT:-4006}" pixel_gateway_port gateway_key="${PIXEL_MODEL_RELAY_KEY:-}"
     local gateway_key_file write_status=0
     if [[ "$context" =~ ^[0-9]+$ && "$context" -ge 4096 ]]; then
@@ -4527,13 +4584,6 @@ _ods_pixel_write_onboarding() {
         ai_bad "Pixel received an invalid model context budget."
         return 1
     }
-    # This field controls the active OpenClaw reasoning path, not merely the
-    # model family's theoretical capability. Keep the default no-think setting
-    # false even for reasoning-capable models; an explicit operator setting
-    # enables it and is reconciled transactionally on model swaps.
-    if [[ ! "${LLAMA_REASONING:-off}" =~ ^(off|none|false|0)$ ]]; then
-        reasoning=true
-    fi
     gateway_alias="$(_ods_pixel_gateway_model_alias)" || {
         ai_bad "Pixel received an unsupported ODS model Switchboard mode."
         return 1
@@ -4541,6 +4591,24 @@ _ods_pixel_write_onboarding() {
     gateway_label="Default"
     [[ "$gateway_alias" == "ods/current" ]] && gateway_label="Current"
     runtime_model="$(_ods_pixel_runtime_model_identity)" || return 1
+    # This field controls the active OpenClaw reasoning path, not merely the
+    # model family's theoretical capability. An explicit operator setting
+    # (including an empty value) always wins. When unset, the renderer decides:
+    # a local built-in Qwen3.5-2B bootstrap route defaults to reasoning on so
+    # the Portal can complete simple tasks without tool loops; every other
+    # route keeps the historical no-think default. The renderer preserves a
+    # previously validated reasoning preference for the same model route.
+    if [[ -n "${LLAMA_REASONING+x}" ]]; then
+        if [[ "${LLAMA_REASONING:-off}" =~ ^(off|none|false|0)$ ]]; then
+            reasoning=false
+        else
+            reasoning=true
+        fi
+    elif [[ -z "${EXTERNAL_LLM_URL:-}" ]]; then
+        case "$(printf '%s' "$runtime_model" | tr '[:upper:]' '[:lower:]')" in
+            qwen3.5-2b|qwen3.5-2b-q4_k_m.gguf) reasoning=bootstrap ;;
+        esac
+    fi
     if [[ ! "$model_gateway_port" =~ ^[0-9]+$ ]] || (( model_gateway_port < 1 || model_gateway_port > 65535 )); then
         ai_bad "Pixel requires a valid loopback model relay port."
         return 1
@@ -5183,6 +5251,7 @@ ods_pixel_install_default_agent() {
         && -f "$plugin_root/host/openclaw-yield-usage.json" \
         && -f "$plugin_root/host/openclaw-compaction-empty.json" \
         && -f "$plugin_root/host/openclaw-compaction-no-work.json" \
+        && -f "$plugin_root/host/openclaw-subagent-admission.json" \
         && -f "$plugin_root/host/openclaw-hook-provenance.json" \
         && -f "$plugin_root/host/openclaw-run-id-redaction.json" \
         && -f "$plugin_root/host/pixel-ops-broker-ods.conf" \
@@ -5266,15 +5335,11 @@ ods_pixel_install_default_agent() {
             return 1
         fi
     fi
-    # Only a proven first install may reprove before bootstrap creates its
-    # initial config. Retained and partial releases must resume their durable
+    # Only a proven first bootstrap (empty or plugin-only) has no access mode
+    # to reprove. Retained and partial releases must resume their durable
     # transition below before access-mode reproof, as they did previously.
     if [[ -z "${ODS_PIXEL_SOURCE_TRANSACTION:-}" ]] \
-        && _ods_pixel_initial_unconfigured_marker "$owner" "$home" >>"$pixel_log" 2>&1; then
-        if ! _ods_pixel_reprove_access_marker_if_needed "$owner" "$home" "" >>"$pixel_log" 2>&1; then
-            ai_bad "Pixel's initial access marker could not be verified before bootstrap. See $pixel_log."
-            return 1
-        fi
+        && _ods_pixel_initial_unconfigured_marker "$owner" "$home" "$pixel_root" >>"$pixel_log" 2>&1; then
         initial_access_reproved=true
     fi
     if ! ods_pixel_run_as_owner "$owner" "$home" "$pixel_root/pixel" bootstrap --apply >>"$pixel_log" 2>&1; then
@@ -5517,6 +5582,12 @@ ods_pixel_install_default_agent() {
                 ods_pixel_run_as_owner "$owner" "$home" cat "$apply_attempt" >>"$pixel_log" 2>&1 || return 1
             else
                 ods_pixel_run_as_owner "$owner" "$home" cat "$apply_attempt" >>"$pixel_log" 2>&1 || return 1
+                if _ods_pixel_shared_sandbox_conflict "$owner" "$home" "$apply_attempt"; then
+                    ai_bad "Pixel found a shared Docker sandbox image that does not match this installation. Recreating Ubuntu does not clear Docker Desktop images; the Linux UID may have changed."
+                    ai "No shared image tag was changed. Check the exact image and every installation using this Docker engine before recovery."
+                    ai "After retiring the old installation, run in Ubuntu: bash \"$INSTALL_DIR/scripts/recover-retired-pixel-sandbox.sh\". It preserves the old image and requires your confirmation. Apply evidence: $apply_attempt"
+                    return 1
+                fi
                 if _ods_pixel_retire_inactive_conflicting_release \
                     "$owner" "$home" "$pixel_root" "$apply_attempt" >>"$pixel_log" 2>&1; then
                     ai "Archived an exact, inactive ODS-owned Pixel release that conflicted with the current reviewed plan; retrying once..."
@@ -5591,7 +5662,7 @@ ods_pixel_install_default_agent() {
         --restore-foreign "$home/.openclaw/ods-runtime-patches" \
         --known tool-recovery completion-recovery image-envelope compaction-export \
             compaction-idle compaction-resume read-range tool-result-projection \
-            diagnostic-stream-writes command-attempt-warning compaction-budget context-usage yield-usage compaction-empty compaction-no-work hook-provenance run-id-redaction sandbox-mkdir-bridge sandbox-mkdir-secure \
+            diagnostic-stream-writes command-attempt-warning compaction-budget context-usage yield-usage compaction-empty compaction-no-work subagent-admission hook-provenance run-id-redaction sandbox-mkdir-bridge sandbox-mkdir-secure \
         >>"$pixel_log" 2>&1; then
         ai_bad "Pixel could not restore OpenClaw runtime patches left by another ODS build. See $pixel_log."
         return 1
@@ -5731,6 +5802,15 @@ ods_pixel_install_default_agent() {
         --state-dir "$home/.openclaw/ods-runtime-patches/run-id-redaction" \
         >>"$pixel_log" 2>&1; then
         ai_bad "Pixel's run identity redaction repair could not verify its package bytes. See $pixel_log."
+        return 1
+    fi
+    # Child announcements must enter admission even while an owner turn is active.
+    if ! ods_pixel_run_as_owner "$owner" "$home" python3 \
+        "$plugin_root/host/openclaw_tool_recovery.py" \
+        --openclaw-bin "$openclaw_bin" --subagent-admission \
+        --state-dir "$home/.openclaw/ods-runtime-patches/subagent-admission" \
+        >>"$pixel_log" 2>&1; then
+        ai_bad "Pixel's subagent admission repair could not verify its package bytes. See $pixel_log."
         return 1
     fi
     # Preserve trusted inter-session provenance in native prompt-hook contexts.

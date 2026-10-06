@@ -13,15 +13,19 @@ support an elevated UAC-disabled session; it requests elevation separately for
 Windows prerequisites.
 
 ```powershell
-$ProgressPreference = "SilentlyContinue"
-$odsSrc = Join-Path $env:TEMP ("ods-install-" + [guid]::NewGuid().ToString("N"))
-$odsZip = Join-Path $odsSrc "ods-main.zip"
-New-Item -ItemType Directory -Path $odsSrc | Out-Null
-Invoke-WebRequest "https://github.com/Osmantic/ODS/archive/refs/heads/main.zip" -OutFile $odsZip
-Expand-Archive -LiteralPath $odsZip -DestinationPath $odsSrc -Force
-cd (Get-ChildItem -LiteralPath $odsSrc -Directory | Select-Object -First 1).FullName
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\install.ps1
+& {
+    $ErrorActionPreference = 'Stop'
+    $ProgressPreference = 'SilentlyContinue'
+    $odsSrc = Join-Path $env:TEMP ('ods-install-' + [guid]::NewGuid().ToString('N'))
+    $odsZip = Join-Path $odsSrc 'ods-main.zip'
+    New-Item -ItemType Directory -Path $odsSrc | Out-Null
+    Invoke-WebRequest -UseBasicParsing 'https://github.com/Osmantic/ODS/archive/refs/heads/main.zip' -OutFile $odsZip
+    Expand-Archive -LiteralPath $odsZip -DestinationPath $odsSrc
+    $odsEntry = Join-Path $odsSrc 'ODS-main\install.ps1'
+    if (-not (Test-Path -LiteralPath $odsEntry -PathType Leaf)) { throw 'The downloaded archive does not contain the ODS installer.' }
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+    & $odsEntry
+}
 ```
 
 Pixel uses source bundled in public Osmantic/ODS, not a private repository.
@@ -230,6 +234,49 @@ To remove a native installation completely before switching (containers, Docker 
 cd $env:USERPROFILE\ods
 .\ods.ps1 uninstall --force
 ```
+
+## Retained Pixel sandbox after recreating Ubuntu
+
+Removing an Ubuntu distribution does not remove images from Docker Desktop.
+If Pixel reports `Shared live sandbox tag exists without an active Pixel release`,
+the shared `openclaw-sandbox:bookworm-slim` tag can still belong to the previous
+installation. For example, its sandbox can be built for UID 1000 while the new
+Ubuntu account is UID 1001. A matching Pixel version alone is insufficient.
+This is separate from the `unsafe-inspection-docker` executable-permissions error.
+
+In the new Ubuntu terminal, run this recovery helper from your installation
+folder (replace `~/ods` if you chose another folder):
+
+```bash
+bash ~/ods/scripts/recover-retired-pixel-sandbox.sh
+```
+
+The helper shows the Docker engine, exact image, Pixel version, old UID and
+current UID, then checks all containers using that image, including stopped
+containers. It refuses an active local Pixel release, invalid image labels,
+Docker failures, consumers, or changed identities. Run it as your Ubuntu
+account, without `sudo`.
+
+No listed containers does not prove that another WSL installation has stopped
+using this shared tag. Check those installations too. Type `RETIRED` only after
+you have confirmed that **all old installations using the tag are retired** and
+that no Docker/Pixel installation or recovery runs in parallel. Pressing Enter
+or providing no input stops without changing any tags. If another installation
+still uses the tag, retain it and use a separate Docker engine for the new
+deployment, or retire the old deployment through its own uninstall.
+
+After confirmation, the helper preserves the old image under
+`pixel-sandbox-retained:sha256-<complete-image-id>`, rechecks the engine, image,
+retention tag and consumers, and removes **only the old shared tag**. Docker
+has no atomic compare-and-remove operation for shared tags, so other
+installation work must remain stopped until the helper exits. It does not
+remove the image by ID, prune images/volumes, reset Docker Desktop, or retag
+Pixel's new candidate.
+
+When the helper reports success, rerun the same ODS installation command.
+Pixel validates and activates the new account's candidate itself. If recovery
+stops, read its reason and inspect the current state; do not retry with force
+or edit UID labels.
 
 ## Uninstall WSL ODS
 
