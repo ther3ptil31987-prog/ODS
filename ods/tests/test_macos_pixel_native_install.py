@@ -15,6 +15,57 @@ module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(module)
 
 
+@pytest.mark.parametrize('code,detail', [
+    ('native-compose-health-timeout', 'pixel-native-ingress, pixel-workspace-preview, pixel-edge'),
+    ('compose-security-policy-missing', 'scripts/compose-cache-policy.py'),
+])
+def test_main_reports_allowlisted_activation_failures(monkeypatch, capsys, code, detail):
+    def fail(**kwargs):
+        raise ValueError(code)
+    monkeypatch.setattr(module, 'install', fail)
+    monkeypatch.setattr(module.sys, 'argv', ['pixel-native-install.py',
+        '--install-dir', '/unused', '--ods-source', '/unused'])
+    assert module.main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    assert 'Native Pixel installation stopped (ValueError).' in captured.err
+    assert '[' + code + ']' in captured.err
+    assert detail in captured.err
+    assert 'do not reset receipts or repeat activation automatically' in captured.err
+
+
+@pytest.mark.parametrize('error', [
+    ValueError('secret-canary-value'),
+    ValueError('native-compose-health-timeout secret-canary-near-match'),
+    OSError('secret-canary-path'),
+    KeyError('secret-canary-key'),
+    subprocess.CalledProcessError(1, ['secret-canary-argument'],
+        output='secret-canary-output', stderr='secret-canary-stderr'),
+])
+def test_main_does_not_disclose_unknown_exception_details(monkeypatch, capsys, error):
+    def fail(**kwargs):
+        raise error
+    monkeypatch.setattr(module, 'install', fail)
+    monkeypatch.setattr(module.sys, 'argv', ['pixel-native-install.py',
+        '--install-dir', '/unused', '--ods-source', '/unused'])
+    assert module.main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    assert 'secret-canary' not in captured.err
+    assert '[' not in captured.err
+    assert 'Check prerequisites and private preparation/activation receipts' in captured.err
+
+
+def test_main_keeps_preflight_guidance(monkeypatch, capsys):
+    def fail(*args, **kwargs):
+        raise ValueError('native-apple-silicon-owner-required')
+    monkeypatch.setattr(module, 'preflight', fail)
+    monkeypatch.setattr(module.sys, 'argv', ['pixel-native-install.py',
+        '--install-dir', '/unused', '--preflight-only'])
+    assert module.main() == 1
+    assert '[native-apple-silicon-owner-required] Run as the signed-in owner' in capsys.readouterr().err
+
+
 @pytest.mark.parametrize('fault', [None, 'root', 'intel', 'linux', 'existing', 'partial', 'relative'])
 def test_preflight_never_mutates_existing_installations(tmp_path, monkeypatch, fault):
     monkeypatch.setattr(module.sys, 'platform', 'linux' if fault == 'linux' else 'darwin')
