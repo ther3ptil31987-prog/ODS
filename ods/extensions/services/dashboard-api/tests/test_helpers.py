@@ -773,6 +773,87 @@ class TestGetAllServices:
         assert probed == ([] if expected == "not_deployed" else ["open-webui"])
 
     @pytest.mark.asyncio
+    async def test_open_webui_switched_off_reads_not_deployed_when_env_file_is_unreadable(self, monkeypatch, tmp_path):
+        # DGX Station: the install owner is UID 1001 and the API runs as 1000, so
+        # the 0600 .env is unreadable and the overview read "8/9 core services online".
+        # The switch then comes from the process environment Compose passes.
+        import config
+        monkeypatch.setattr(config, "INSTALL_DIR", str(tmp_path))
+        config._reset_env_permission_state()
+        env_file = tmp_path / ".env"
+        env_file.write_text("ENABLE_OPEN_WEBUI=true\n", encoding="utf-8")
+        read_text = Path.read_text
+
+        def denied(path, *args, **kwargs):
+            if path == env_file:
+                raise PermissionError("Simulated EACCES on .env")
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", denied)
+        monkeypatch.setenv("ENABLE_OPEN_WEBUI", "false")
+        monkeypatch.setattr("helpers.load_extension_manifests", lambda *args, **kwargs: ({}, [], []))
+        monkeypatch.setattr("helpers.SERVICES", {"open-webui": {
+            "name": "Open WebUI (Chat)", "port": 8080, "external_port": 3000, "health": "/health", "host": "open-webui"}})
+        probed: list[str] = []
+
+        async def fake_health(sid, cfg):
+            probed.append(sid)
+            return ServiceStatus(id=sid, name=cfg["name"], port=cfg["port"],
+                                 external_port=cfg["external_port"], status="down")
+
+        monkeypatch.setattr("helpers.check_service_health", fake_health)
+        monkeypatch.setattr("helpers.request_agent_json", AsyncMock(side_effect=ValueError("no agent")))
+        result = await get_all_services()
+        assert [item.status for item in result] == ["not_deployed"]
+        assert probed == []
+        assert config.get_env_file_read_error() is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("selected", "expected", "probes"), [
+        (True, "healthy", ["open-webui"]), (False, "not_deployed", []),
+    ])
+    async def test_open_webui_follows_the_owner_choice_when_env_file_is_unreadable(
+        self, monkeypatch, tmp_path, selected, expected, probes,
+    ):
+        # Workstation06 (2026-10-27): a Library add set ENABLE_OPEN_WEBUI=true in
+        # the owner's .env and started a healthy container, but this API kept the
+        # false Compose started it with and read "not deployed".
+        import config
+        monkeypatch.setattr(config, "INSTALL_DIR", str(tmp_path))
+        config._reset_env_permission_state()
+        env_file = tmp_path / ".env"
+        env_file.write_text("ENABLE_OPEN_WEBUI=true\n", encoding="utf-8")
+        read_text = Path.read_text
+
+        def denied(path, *args, **kwargs):
+            if path == env_file:
+                raise PermissionError("Simulated EACCES on .env")
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", denied)
+        monkeypatch.setenv("ENABLE_OPEN_WEBUI", "false")
+        monkeypatch.setattr("helpers.load_extension_manifests", lambda *args, **kwargs: ({}, [], []))
+        monkeypatch.setattr("helpers.SERVICES", {"open-webui": {
+            "name": "Open WebUI (Chat)", "port": 8080, "external_port": 3000, "health": "/health", "host": "open-webui"}})
+        probed: list[str] = []
+
+        async def fake_health(sid, cfg):
+            probed.append(sid)
+            return ServiceStatus(id=sid, name=cfg["name"], port=cfg["port"],
+                                 external_port=cfg["external_port"], status="healthy")
+
+        async def agent(method, path, **kwargs):
+            if path == "/v1/webui/selection":
+                return {"enabled": selected, "supported": True}
+            raise ValueError("no service snapshot")
+
+        monkeypatch.setattr("helpers.check_service_health", fake_health)
+        monkeypatch.setattr("helpers.request_agent_json", agent)
+        result = await get_all_services()
+        assert [item.status for item in result] == [expected]
+        assert probed == probes
+
+    @pytest.mark.asyncio
     async def test_empty_services_returns_empty(self, monkeypatch):
         monkeypatch.setattr("helpers.load_extension_manifests", lambda *args, **kwargs: ({}, [], []))
         monkeypatch.setattr("helpers.SERVICES", {})
@@ -1330,6 +1411,28 @@ class TestGetHttpxClient:
 
 class TestServicesCache:
 
+    @pytest.mark.asyncio
+    async def test_owner_refresh_rejects_an_older_background_poll(self, monkeypatch):
+        """A poll begun before WebUI Add must not restore its stale snapshot."""
+        import helpers
+        monkeypatch.setattr(helpers, "SERVICES", {"open-webui": {
+            "name": "Open WebUI", "host": "open-webui", "port": 8080,
+            "external_port": 3000, "health": "/health", "type": "docker",
+        }})
+        monkeypatch.setattr(helpers, "_services_cache", None)
+        monkeypatch.setattr(helpers, "_services_cache_revision", 0, raising=False)
+        stale = ServiceStatus(id="open-webui", name="Open WebUI", port=8080,
+                              external_port=3000, status="not_deployed")
+        fresh = ServiceStatus(id="open-webui", name="Open WebUI", port=8080,
+                              external_port=3000, status="healthy")
+        set_services_cache([stale])
+        poll_revision = helpers.get_services_cache_revision()
+        monkeypatch.setattr(helpers, "check_service_health", AsyncMock(return_value=fresh))
+
+        await helpers.refresh_cached_service_status("open-webui")
+        assert set_services_cache([stale], expected_revision=poll_revision) is False
+        assert get_cached_services()[0].status == "healthy"
+
     def test_set_and_get(self, monkeypatch):
         import helpers
         monkeypatch.setattr(helpers, "_services_cache", None)
@@ -1401,6 +1504,35 @@ class TestGetLifetimeTokens:
 
 class TestCheckServiceHealthSystemd:
 
+    _PIXEL_INGRESS = {
+        "name": "Pixel Agent (host ingress)", "port": 0, "external_port": 0, "health": "/health",
+        "host": "localhost", "type": "host-systemd", "socket_only": True,
+    }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("edge_status", "expected"), [(200, "healthy"), (503, "unknown")])
+    async def test_socket_only_pixel_ingress_follows_pixel_edge(self, mock_aiohttp_session, monkeypatch,
+                                                                 edge_status, expected):
+        # Workstation06: the ingress listens only on a Unix socket, so its row read
+        # "Not Deployed" while Portal worked. Pixel Edge's /health requires that socket.
+        session = mock_aiohttp_session(status=edge_status)
+        monkeypatch.setattr("helpers._get_aio_session", AsyncMock(return_value=session))
+        monkeypatch.setattr("helpers.SERVICES", {"pixel-edge": {
+            "name": "Pixel Edge", "port": 9595, "external_port": 9595, "health": "/health", "host": "pixel-edge"}})
+        agent = AsyncMock(side_effect=AssertionError("no host port probe for a socket-only service"))
+        monkeypatch.setattr("helpers.request_agent_json", agent)
+
+        result = await check_service_health("pixel-agent", self._PIXEL_INGRESS)
+        assert result.status == expected
+        assert result.id == "pixel-agent"
+        assert result.name == "Pixel Agent (host ingress)"
+
+    @pytest.mark.asyncio
+    async def test_socket_only_pixel_ingress_without_pixel_edge_is_not_deployed(self, monkeypatch):
+        monkeypatch.setattr("helpers.SERVICES", {})
+        result = await check_service_health("pixel-agent", self._PIXEL_INGRESS)
+        assert result.status == "not_deployed"
+
     @pytest.mark.asyncio
     async def test_host_systemd_returns_healthy_when_host_agent_proves_port(self, monkeypatch):
         async def fake_request(method, path, *, params, timeout):
@@ -1454,6 +1586,57 @@ class TestGetModelInfoErrors:
                 raise OSError("permission denied")
             return orig_open(path, *a, **kw)
         monkeypatch.setattr(builtins, "open", failing_open)
+        assert get_model_info() is None
+
+    @staticmethod
+    def _deny_env(monkeypatch):
+        import builtins
+        orig_open = builtins.open
+
+        def denied(path, *a, **kw):
+            if str(path).endswith(".env"):
+                raise PermissionError(13, "Permission denied", str(path))
+            return orig_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", denied)
+
+    def test_private_owner_env_uses_the_owner_host_agent(self, install_dir, monkeypatch):
+        """Workstation06 (owner UID 1001): every status poll logged the
+        refusal and the Dashboard header showed no configured model."""
+        import helpers
+
+        (install_dir / ".env").write_text('LLM_MODEL=stale-process-model\n')
+        self._deny_env(monkeypatch)
+        calls = []
+
+        def owner(method, path, *, timeout):
+            calls.append((method, path, timeout))
+            return {"configuredMode": "local", "effectiveMode": "local", "configuredModel": {
+                "llmModel": "qwen3.6-35b-a3b", "ggufFile": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+                "contextSize": 131072}}
+
+        monkeypatch.setattr(helpers, "request_agent_json_sync", owner)
+        info = get_model_info()
+        assert (info.name, info.context_length, info.quantization) == ("qwen3.6-35b-a3b", 131072, "GGUF")
+        assert calls == [("GET", "/v1/model/config", 5)]
+
+    @pytest.mark.parametrize("answer", [
+        "unavailable", None, {"configuredMode": "local"}, {"configuredModel": None},
+        {"configuredModel": {"llmModel": None, "ggufFile": None, "contextSize": None}},
+    ])
+    def test_private_owner_env_without_an_owner_model_has_none(self, install_dir, monkeypatch, answer):
+        import helpers
+        from host_agent_client import AgentUnavailable
+
+        (install_dir / ".env").write_text('LLM_MODEL=stale-process-model\n')
+        self._deny_env(monkeypatch)
+
+        def owner(method, path, *, timeout):
+            if answer == "unavailable":
+                raise AgentUnavailable("host agent unavailable")
+            return answer
+
+        monkeypatch.setattr(helpers, "request_agent_json_sync", owner)
         assert get_model_info() is None
 
 
@@ -1753,13 +1936,68 @@ def test_valid_sample_repairs_a_polluted_existing_average(data_dir):
         240.5,
     )
 
-    repaired = json.loads(helpers._PERF_FILE.read_text())["samples"][key]
+    samples = json.loads(helpers._PERF_FILE.read_text())["samples"]
+    assert samples[key]["tokens_per_second"] == 527_885.7
+    configured_key = helpers._performance_key(
+        "lemonade", "AMD Radeon RX 9070 XT", "qwen3.5-2b", flags={},
+    )
+    repaired = samples[configured_key]
     assert repaired["tokens_per_second"] == 240.5
     assert repaired["last_tokens_per_second"] == 240.5
     assert repaired["sample_count"] == 1
 
 
 class TestServiceHealthReconciliation:
+
+    @pytest.fixture(autouse=True)
+    def reset_probe_history(self, monkeypatch):
+        import helpers
+        monkeypatch.setattr(helpers, "_last_probe_success", {})
+        monkeypatch.setattr(helpers, "_first_probe_seen", {}, raising=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("started_at", [0.0, 1000.0])
+    async def test_startup_timeout_grace_expires_without_a_success(self, monkeypatch, started_at):
+        import helpers
+
+        services = {"dashboard": {
+            "name": "Dashboard", "port": 3001, "external_port": 3001,
+            "type": "docker", "container_name": "ods-dashboard",
+        }}
+        monkeypatch.setattr(helpers, "SERVICES", services)
+        clock = {"now": started_at}
+        monkeypatch.setattr(helpers, "_probe_clock", lambda: clock["now"])
+        probe_status = {"value": "degraded"}
+
+        async def probe(service_id, config):
+            return ServiceStatus(
+                id=service_id, name=config["name"], port=config["port"],
+                external_port=config["external_port"], status=probe_status["value"],
+            )
+
+        monkeypatch.setattr(helpers, "check_service_health", probe)
+        monkeypatch.setattr(helpers, "request_agent_json", AsyncMock(return_value={
+            "schema_version": "ods.host-service-health.v1",
+            "containers": [{"service_id": "dashboard", "container_name": "ods-dashboard",
+                            "state": "running", "health": "healthy"}],
+        }))
+
+        # Repeated Docker-only successes must not extend the startup window.
+        for elapsed in (0.0, 30.0, helpers._TIMEOUT_OVERRIDE_GRACE_S):
+            clock["now"] = started_at + elapsed
+            assert (await helpers.get_all_services())[0].status == "healthy"
+        for elapsed in (helpers._TIMEOUT_OVERRIDE_GRACE_S + 0.001, 3600.0):
+            clock["now"] = started_at + elapsed
+            assert (await helpers.get_all_services())[0].status == "degraded"
+
+        # A genuine application recovery starts a new, bounded transient grace.
+        probe_status["value"] = "healthy"
+        assert (await helpers.get_all_services())[0].status == "healthy"
+        probe_status["value"] = "degraded"
+        clock["now"] += 10.0
+        assert (await helpers.get_all_services())[0].status == "healthy"
+        clock["now"] += helpers._TIMEOUT_OVERRIDE_GRACE_S
+        assert (await helpers.get_all_services())[0].status == "degraded"
 
     @pytest.mark.asyncio
     async def test_docker_health_repairs_only_transient_timeout(self, monkeypatch):
@@ -1776,6 +2014,7 @@ class TestServiceHealthReconciliation:
             },
         }
         monkeypatch.setattr(helpers, "SERVICES", services)
+        monkeypatch.setattr(helpers, "_last_probe_success", {})
 
         async def probe(service_id, config):
             return ServiceStatus(
@@ -1797,6 +2036,42 @@ class TestServiceHealthReconciliation:
         statuses = {status.id: status.status for status in await helpers.get_all_services()}
 
         assert statuses == {"dashboard": "healthy", "open-webui": "unhealthy"}
+
+    @pytest.mark.asyncio
+    async def test_persistent_probe_timeout_is_not_masked_by_docker_healthcheck(self, monkeypatch):
+        import helpers
+
+        services = {"llama-server": {
+            "name": "LLM", "port": 8080, "external_port": 8080,
+            "type": "docker", "container_name": "ods-llama-server",
+        }}
+        monkeypatch.setattr(helpers, "SERVICES", services)
+        monkeypatch.setattr(helpers, "_last_probe_success", {})
+        monkeypatch.setattr(helpers, "LLM_BACKEND", "llama")
+        monkeypatch.setattr(helpers, "_host_native_llm", lambda: False)
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(helpers, "_probe_clock", lambda: clock["now"])
+        probe_status = {"value": "healthy"}
+
+        async def probe(service_id, config):
+            return ServiceStatus(
+                id=service_id, name=config["name"], port=config["port"],
+                external_port=config["external_port"], status=probe_status["value"],
+            )
+
+        monkeypatch.setattr(helpers, "check_service_health", probe)
+        monkeypatch.setattr(helpers, "request_agent_json", AsyncMock(return_value={
+            "schema_version": "ods.host-service-health.v1",
+            "containers": [{"service_id": "llama-server", "container_name": "ods-llama-server",
+                            "state": "running", "health": "healthy"}],
+        }))
+
+        assert (await helpers.get_all_services())[0].status == "healthy"
+        probe_status["value"] = "degraded"
+        clock["now"] += 10
+        assert (await helpers.get_all_services())[0].status == "healthy"
+        clock["now"] += helpers._TIMEOUT_OVERRIDE_GRACE_S
+        assert (await helpers.get_all_services())[0].status == "degraded"
 
     @pytest.mark.asyncio
     async def test_all_healthy_path_does_not_call_host_agent(self, monkeypatch):

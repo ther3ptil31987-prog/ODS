@@ -21,6 +21,9 @@ function Resolve-WindowsODSPort {
     .SYNOPSIS
         Resolve a Windows installer port from an explicit process override,
         persisted .env state, or the platform default.
+    .PARAMETER RequireValidProcessOverride
+        Reject a present process value that Compose cannot use as a decimal
+        port, rather than falling back while Compose still inherits that value.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -30,11 +33,24 @@ function Resolve-WindowsODSPort {
         [int]$DefaultPort,
 
         [hashtable]$ExistingEnv,
-        [string]$InstallDir = ""
+        [string]$InstallDir = "",
+        [switch]$RequireValidProcessOverride
     )
 
     $candidates = New-Object 'System.Collections.Generic.List[string]'
     $processValue = [Environment]::GetEnvironmentVariable($Name)
+    if ($RequireValidProcessOverride -and
+        [Environment]::GetEnvironmentVariables("Process").Contains($Name)) {
+        # Compose inherits process values ahead of --env-file, including empty
+        # values. A fallback here would check/write a different port from the
+        # one Compose consumes. Keep the legacy WebUI/Whisper contract opt-out.
+        $processPort = 0
+        if ($processValue -cnotmatch '\A[0-9]+\z' -or
+            -not [int]::TryParse($processValue, [ref]$processPort) -or
+            $processPort -lt 1 -or $processPort -gt 65535) {
+            throw "$Name process override must be a decimal port from 1 to 65535. Remove the environment variable to use the retained .env value or default."
+        }
+    }
     if (-not [string]::IsNullOrWhiteSpace($processValue)) {
         [void]$candidates.Add($processValue)
     }
@@ -203,6 +219,106 @@ function ConvertTo-ODSDotenvValue {
     return "'" + $text + "'"
 }
 
+# Settings ODS tells the owner to put in .env that no installer writes: the
+# dashboard's n8n API key (routers/workflows.py), the Hugging Face token for
+# gated downloads (routers/models.py), the Intel Arc image override
+# (docker-compose.arc.yml), Open WebUI's speech settings (tts/README.md) and
+# whether apps use measured model profiles (ODS_MODEL_PROFILES,
+# docs/MODEL-MANAGEMENT.md) and the opt-out from the dashboard's GitHub
+# release check (DISABLE_UPDATE_CHECK, FAQ.md).
+# Same list as ODS_OWNER_ENV_KEYS in installers/lib/extension-env-carry.sh.
+# Installer-managed keys must not be listed: an old value would override the
+# installer's new choice.
+$script:ODS_OWNER_ENV_KEYS = @(
+    "N8N_API_KEY"
+    "HF_TOKEN"
+    "LLAMA_ARC_IMAGE"
+    "AUDIO_TTS_ENGINE"
+    "AUDIO_TTS_MODEL"
+    "AUDIO_TTS_VOICE"
+    "AUDIO_TTS_OPENAI_API_BASE_URL"
+    "AUDIO_TTS_OPENAI_API_KEY"
+    "ODS_MODEL_PROFILES"
+    "DISABLE_UPDATE_CHECK"
+)
+
+function Get-ODSCarriedEnvLines {
+    <# Return, for each key the new .env content lacks, its last assignment line
+       in the previous .env, as it is when .env is read. Keys match exactly. #>
+    param(
+        [AllowEmptyCollection()][string[]]$PreviousLines,
+        [AllowEmptyString()][string]$NewContent,
+        [string[]]$Keys
+    )
+    $carried = @()
+    foreach ($key in $Keys) {
+        $prefix = "$key="
+        if ($NewContent -cmatch ("(?m)^" + [regex]::Escape($prefix))) { continue }
+        $last = $null
+        foreach ($line in $PreviousLines) {
+            if ($line.StartsWith($prefix, [StringComparison]::Ordinal)) { $last = $line }
+        }
+        if ($null -ne $last) { $carried += $last }
+    }
+    return $carried
+}
+
+function Get-ODSExtensionEnvKeys {
+    <# Return the env_vars keys declared by installed extension manifests,
+       in manifest order, deduplicated exactly. Mirrors the awk reader in
+       installers/lib/extension-env-carry.sh: keys under any env_vars: block
+       at any indentation, only uppercase [A-Z][A-Z0-9_]* names. #>
+    param([string[]]$ManifestPaths)
+    $keys = New-Object 'System.Collections.Generic.List[string]'
+    $seen = @{}
+    foreach ($manifestPath in $ManifestPaths) {
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { continue }
+        $inEnv = $false
+        $envIndent = 0
+        foreach ($line in @(Get-Content -LiteralPath $manifestPath -Encoding UTF8)) {
+            if ($line -match '^\s*($|#)') { continue }
+            $indent = $line.Length - $line.TrimStart().Length
+            if ($inEnv -and $indent -le $envIndent) { $inEnv = $false }
+            if ($line -match '^\s*env_vars:\s*($|#)') {
+                $inEnv = $true
+                $envIndent = $indent
+                continue
+            }
+            if (-not $inEnv) { continue }
+            if ($line -match '^\s*-\s*key:\s*(.*)$') {
+                $key = $Matches[1] -replace '["''\s]', ''
+                if ($key -cmatch '^[A-Z][A-Z0-9_]*$' -and -not $seen.ContainsKey($key)) {
+                    $seen[$key] = $true
+                    [void]$keys.Add($key)
+                }
+            }
+        }
+    }
+    return $keys.ToArray()
+}
+
+function Get-ODSExtensionManifestPaths {
+    <# Return manifest.yaml paths for direct extension directories of
+       extensions/services and data/user-extensions, in that order.
+       Never recurses into extensions/library; no InstallDir/services root. #>
+    param([string]$InstallDir)
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+    $roots = @(
+        (Join-Path (Join-Path $InstallDir 'extensions') 'services'),
+        (Join-Path (Join-Path $InstallDir 'data') 'user-extensions')
+    )
+    foreach ($rootDir in $roots) {
+        if (-not (Test-Path -LiteralPath $rootDir -PathType Container)) { continue }
+        foreach ($dir in @(Get-ChildItem -LiteralPath $rootDir -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            $manifest = Join-Path $dir.FullName 'manifest.yaml'
+            if (Test-Path -LiteralPath $manifest -PathType Leaf) {
+                [void]$paths.Add($manifest)
+            }
+        }
+    }
+    return $paths.ToArray()
+}
+
 function New-ODSEnv {
     <#
     .SYNOPSIS
@@ -247,9 +363,11 @@ function New-ODSEnv {
 
     # Preserve existing secrets on re-install (mirrors Linux _env_get logic)
     $existingEnv = @{}
+    $previousEnvLines = @()
     $envPath = Join-Path $InstallDir ".env"
     if (Test-Path $envPath) {
-        Get-Content $envPath | ForEach-Object {
+        $previousEnvLines = @(Get-Content $envPath)
+        $previousEnvLines | ForEach-Object {
             if ($_ -match "^([A-Za-z_][A-Za-z0-9_]*)=(.*)$") {
                 $existingEnv[$Matches[1]] = $Matches[2]
             }
@@ -687,6 +805,7 @@ TOGETHER_API_KEY=$(Get-EnvOrNew "TOGETHER_API_KEY" "")
 MINIMAX_API_KEY=$(Get-EnvOrNew "MINIMAX_API_KEY" "")
 
 #=== LLM Settings (llama-server) ===
+TIER=$Tier
 MODEL_PROFILE=$(Get-EnvOrNew "MODEL_PROFILE" "$(if ($TierConfig.ModelProfileRequested) { $TierConfig.ModelProfileRequested } else { "qwen" })")
 LLM_MODEL=$($TierConfig.LlmModel)
 GGUF_FILE=$($TierConfig.GgufFile)
@@ -709,7 +828,7 @@ MODEL_PERFORMANCE_LABEL=$performanceLabel
 GPU_BACKEND=$GpuBackend
 SYSTEM_RAM_GB=$SystemRamGB
 N_GPU_LAYERS=$nGpuLayers
-$(if ($LlamaServerImage) { "LLAMA_SERVER_IMAGE=$LlamaServerImage" } else { "#LLAMA_SERVER_IMAGE=ghcr.io/ggml-org/llama.cpp:server-cuda-b9014@sha256:fcf285820892e7ce3218379634e3590826fc697e8b6745b9392072462e355c4f" })
+$(if ($LlamaServerImage) { "LLAMA_SERVER_IMAGE=$LlamaServerImage" } else { "#LLAMA_SERVER_IMAGE=ghcr.io/ggml-org/llama.cpp:server-cuda-b11429@sha256:883915ea20a4b350e98f7284098f4d400c21e9b366e248d397cd42d90602a84c" })
 $(if ($llamaServerImageFallback) { "LLAMA_SERVER_IMAGE_FALLBACK=$llamaServerImageFallback" } else { "#LLAMA_SERVER_IMAGE_FALLBACK=ghcr.io/ggml-org/llama.cpp:server-cuda-b9014@sha256:fcf285820892e7ce3218379634e3590826fc697e8b6745b9392072462e355c4f" })
 $(if ($llamaServerMemoryLimit) { "LLAMA_SERVER_MEMORY_LIMIT=$llamaServerMemoryLimit" })
 #=== llama.cpp Runtime Tuning ===
@@ -745,23 +864,32 @@ COMFYUI_CPU_LIMIT=$comfyuiCpuLimit
 COMFYUI_CPU_RESERVATION=$comfyuiCpuReservation
 
 #=== Ports ===
+DASHBOARD_PORT=$(Resolve-WindowsODSPort -Name "DASHBOARD_PORT" -DefaultPort 3001 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+DASHBOARD_REMOTE_PORT=$(Resolve-WindowsODSPort -Name "DASHBOARD_REMOTE_PORT" -DefaultPort 3011 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+DASHBOARD_API_PORT=$(Resolve-WindowsODSPort -Name "DASHBOARD_API_PORT" -DefaultPort 3002 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+PERPLEXICA_PORT=$(Resolve-WindowsODSPort -Name "PERPLEXICA_PORT" -DefaultPort 3004 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+EMBEDDINGS_PORT=$(Resolve-WindowsODSPort -Name "EMBEDDINGS_PORT" -DefaultPort 8090 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+SHIELD_PORT=$(Resolve-WindowsODSPort -Name "SHIELD_PORT" -DefaultPort 8085 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+TOKEN_SPY_PORT=$(Resolve-WindowsODSPort -Name "TOKEN_SPY_PORT" -DefaultPort 3005 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+COMFYUI_PORT=$(Resolve-WindowsODSPort -Name "COMFYUI_PORT" -DefaultPort 8188 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+APE_PORT=$(Resolve-WindowsODSPort -Name "APE_PORT" -DefaultPort 7890 -ExistingEnv $existingEnv -RequireValidProcessOverride)
 OLLAMA_PORT=11434
 WEBUI_PORT=$webuiPort
 WHISPER_PORT=$whisperPort
-TTS_PORT=8880
-N8N_PORT=5678
-QDRANT_PORT=6333
-QDRANT_GRPC_PORT=6334
+TTS_PORT=$(Resolve-WindowsODSPort -Name "TTS_PORT" -DefaultPort 8880 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+N8N_PORT=$(Resolve-WindowsODSPort -Name "N8N_PORT" -DefaultPort 5678 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+QDRANT_PORT=$(Resolve-WindowsODSPort -Name "QDRANT_PORT" -DefaultPort 6333 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+QDRANT_GRPC_PORT=$(Resolve-WindowsODSPort -Name "QDRANT_GRPC_PORT" -DefaultPort 6334 -ExistingEnv $existingEnv -RequireValidProcessOverride)
 QDRANT_API_KEY=$qdrantApiKey
-LITELLM_PORT=4000
-SEARXNG_PORT=8888
+LITELLM_PORT=$(Resolve-WindowsODSPort -Name "LITELLM_PORT" -DefaultPort 4000 -ExistingEnv $existingEnv -RequireValidProcessOverride)
+SEARXNG_PORT=$(Resolve-WindowsODSPort -Name "SEARXNG_PORT" -DefaultPort 8888 -ExistingEnv $existingEnv -RequireValidProcessOverride)
 
 #=== Hermes Agent ===
 HERMES_LLM_BASE_URL=$hermesLlmBaseUrl
 HERMES_LLM_API_KEY=$hermesLlmApiKey
 HERMES_LANGUAGE=en
 HERMES_REQUIRE_OWNER_CARD=$(Get-EnvOrNew "HERMES_REQUIRE_OWNER_CARD" $(if ($env:HERMES_REQUIRE_OWNER_CARD) { $env:HERMES_REQUIRE_OWNER_CARD } else { "false" }))
-HERMES_PROXY_PORT=9120
+HERMES_PROXY_PORT=$(Resolve-WindowsODSPort -Name "HERMES_PROXY_PORT" -DefaultPort 9120 -ExistingEnv $existingEnv -RequireValidProcessOverride)
 HERMES_PROXY_UPSTREAM=ods-hermes:9119
 ODS_AUTH_UPSTREAM=ods-dashboard-api:3002
 
@@ -779,7 +907,7 @@ $(if ($windowsAmdHostInference) { "LLAMA_SERVER_API_KEY=$llamaServerApiKey" })
 LIVEKIT_API_KEY=$livekitApiKey
 LIVEKIT_API_SECRET=$livekitSecret
 OPENCODE_SERVER_PASSWORD=$opencodePassword
-OPENCODE_PORT=3003
+OPENCODE_PORT=$(Resolve-WindowsODSPort -Name "OPENCODE_PORT" -DefaultPort 3003 -ExistingEnv $existingEnv -RequireValidProcessOverride)
 TOKEN_SPY_API_KEY=$tokenSpyApiKey
 SEARXNG_SECRET=$searxngSecret
 DIFY_SECRET_KEY=$difySecretKey
@@ -837,10 +965,40 @@ LANGFUSE_INIT_USER_PASSWORD=$langfuseInitUserPassword
     # NOTE: No VIDEO_GID, RENDER_GID, HSA_OVERRIDE_GFX_VERSION on Windows
     # Those are Linux-only for AMD ROCm container device access
 
+    # The template above replaces .env; keep the owner's own settings.
+    $ownerLines = @(Get-ODSCarriedEnvLines -PreviousLines $previousEnvLines `
+        -NewContent $envContent -Keys $script:ODS_OWNER_ENV_KEYS)
+    if ($ownerLines.Count -gt 0) {
+        $nl = $(if ($envContent.Contains("`r`n")) { "`r`n" } else { "`n" })
+        $envContent += "$nl$nl#=== Owner settings (kept from the previous .env) ===$nl" + ($ownerLines -join $nl)
+    }
+
+    # Keep the settings installed extensions own (their manifest env_vars),
+    # as phase 06 does on Linux. New template values win, including empty.
+    $extensionKeys = @(Get-ODSExtensionEnvKeys -ManifestPaths @(Get-ODSExtensionManifestPaths -InstallDir $InstallDir))
+    if ($extensionKeys.Count -gt 0) {
+        $extensionLines = @(Get-ODSCarriedEnvLines -PreviousLines $previousEnvLines `
+            -NewContent $envContent -Keys $extensionKeys)
+        if ($extensionLines.Count -gt 0) {
+            $nl = $(if ($envContent.Contains("`r`n")) { "`r`n" } else { "`n" })
+            $envContent += "$nl$nl#=== Installed extensions (kept from the previous .env) ===$nl" + ($extensionLines -join $nl)
+        }
+    }
+
     $envPath = Join-Path $InstallDir ".env"
     if (Test-Path -LiteralPath $envPath -PathType Container) {
         Remove-Item -LiteralPath $envPath -Recurse -Force
         Write-AIWarn "Removed malformed .env directory from a previous partial install."
+    }
+    # The template above replaces .env; keep the owner's public URLs
+    # (docs/ODS-PROXY.md) as the Linux installer does.
+    if (Test-Path -LiteralPath $envPath -PathType Leaf) {
+        $publicUrlLines = @(Get-ODSPublicUrlEnvLines -NewContent $envContent `
+            -PreviousLines @(Get-Content -LiteralPath $envPath -Encoding UTF8))
+        if ($publicUrlLines.Count -gt 0) {
+            $nl = $(if ($envContent.Contains("`r`n")) { "`r`n" } else { "`n" })
+            $envContent += "$nl$nl#=== Public URLs (kept from the previous .env) ===$nl" + ($publicUrlLines -join $nl)
+        }
     }
     Write-ODSPrivateEnvFile -Path $envPath -Content $envContent
 
@@ -909,6 +1067,34 @@ litellm_settings:
     return @{
         SearxngSecret  = $searxngSecret
     }
+}
+
+function Get-ODSPublicUrlEnvLines {
+    <# Return the owner's public-URL settings (docs/ODS-PROXY.md:
+       ODS_PUBLIC_URL, ODS_SERVICE_PUBLIC_URLS, <SERVICE>_PUBLIC_URL) from the
+       previous .env that the new content lacks, as Linux's
+       ods_carry_public_url_env_keys does: the last assignment of each key, in
+       first-seen order. #>
+    param(
+        [AllowEmptyCollection()][string[]]$PreviousLines,
+        [AllowEmptyString()][string]$NewContent
+    )
+    $order = [System.Collections.Generic.List[string]]::new()
+    $last = @{}
+    foreach ($line in $PreviousLines) {
+        $eq = $line.IndexOf('=')
+        if ($eq -lt 0) { continue }
+        $key = $line.Substring(0, $eq).Trim()
+        if ($key -cnotmatch '^[A-Z][A-Z0-9_]*_PUBLIC_URLS?$') { continue }
+        if (-not $last.ContainsKey($key)) { $order.Add($key) }
+        $last[$key] = $key + $line.Substring($eq)
+    }
+    $carried = @()
+    foreach ($key in $order) {
+        if ($NewContent -cmatch ("(?m)^\s*" + [regex]::Escape($key) + "\s*=")) { continue }
+        $carried += $last[$key]
+    }
+    return $carried
 }
 
 function Get-SearxngDefaultLanguage {

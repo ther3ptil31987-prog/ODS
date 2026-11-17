@@ -5,7 +5,9 @@ import contextlib
 import hashlib
 import json
 import logging
+import mmap
 import os
+import platform
 import re
 import shutil
 import stat
@@ -18,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
+from anyio import from_thread
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -264,21 +267,46 @@ def _cleanup_stale_progress() -> None:
             pass
 
 
+def _store_progress(service_id: str, record: dict) -> None:
+    """Replace a service's progress record, never rewriting it in place.
+
+    The host agent replaces the same records and the Extensions page polls
+    them, so a reader sees the old record or the new one. Where the install
+    owner is not UID 1000 this API cannot write the owner's progress
+    directory, and the refusal turned a failed start into an HTTP 500 that
+    also broke Retry (Workstation06, 2026-10-26). The host agent records the
+    outcome of starts and installs itself, so a refusal is logged instead.
+    """
+    progress_dir = Path(DATA_DIR) / "extension-progress"
+    temporary = None
+    try:
+        progress_dir.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(dir=progress_dir, prefix=f".{service_id}-", suffix=".tmp")
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(record, stream)
+        # mkstemp creates 0600; the host agent reads these records as the owner.
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, progress_dir / f"{service_id}.json")
+        temporary = None
+    except PermissionError as exc:
+        logger.warning("Progress record for %s was not written (%s); the host agent records "
+                       "start and install outcomes itself.", service_id, exc)
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+
+
 def _write_initial_progress(service_id: str) -> None:
     """Write an initial progress file so the UI sees 'installing' immediately."""
-    progress_dir = Path(DATA_DIR) / "extension-progress"
-    progress_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).isoformat()
-    progress = {
+    _store_progress(service_id, {
         "service_id": service_id,
         "status": "pulling",
         "phase_label": "Starting installation...",
         "error": None,
         "started_at": now,
         "updated_at": now,
-    }
-    progress_file = progress_dir / f"{service_id}.json"
-    progress_file.write_text(json.dumps(progress), encoding="utf-8")
+    })
 
 
 def _write_error_progress(service_id: str, error_msg: str) -> None:
@@ -295,8 +323,7 @@ def _write_error_progress(service_id: str, error_msg: str) -> None:
     data["status"] = "error"
     data["error"] = error_msg
     data["updated_at"] = now
-    progress_file.parent.mkdir(parents=True, exist_ok=True)
-    progress_file.write_text(json.dumps(data), encoding="utf-8")
+    _store_progress(service_id, data)
 
 
 def _write_started_progress(service_id: str) -> None:
@@ -314,8 +341,7 @@ def _write_started_progress(service_id: str) -> None:
         return
     progress.update(status="started", phase_label="Service started", error=None,
                     updated_at=datetime.now(timezone.utc).isoformat())
-    progress_file = Path(DATA_DIR) / "extension-progress" / f"{service_id}.json"
-    progress_file.write_text(json.dumps(progress), encoding="utf-8")
+    _store_progress(service_id, progress)
 
 
 def _has_error_progress(service_id: str) -> bool:
@@ -482,6 +508,39 @@ def _gpu_compatible(ext: dict) -> bool:
     return not gpu_backends or "all" in gpu_backends or GPU_BACKEND in gpu_backends
 
 
+# Containers share the host kernel, so this API sees the Docker host's CPU
+# architecture and page size.
+_HOST_ARCH = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine().lower(), platform.machine().lower())
+_HOST_PAGE_SIZE = mmap.PAGESIZE
+
+
+def _host_unsupported_reason(ext: dict) -> str:
+    """Why this host cannot run the entry's image, or "" when it can.
+
+    Some upstream images exist for one CPU architecture, or abort on kernel
+    pages larger than 4 KB; on Workstation06 (arm64, 64 KB pages) they
+    crash-looped after an enable (#8257). Docker Desktop on macOS runs amd64
+    images under Rosetta 2, so architectures do not apply there.
+    """
+    requirements = ext.get("host_requirements")
+    if not isinstance(requirements, dict):
+        return ""
+    name = ext.get("name") or ext.get("id", "This extension")
+    architectures = requirements.get("architectures")
+    if isinstance(architectures, list) and GPU_BACKEND != "apple" and _HOST_ARCH not in architectures:
+        return f"{name}'s image is built for {' and '.join(architectures)} only; this machine is {_HOST_ARCH}."
+    max_page_size = requirements.get("max_page_size")
+    if type(max_page_size) is int and _HOST_PAGE_SIZE > max_page_size:
+        return f"{name}'s image cannot run with this machine's {_HOST_PAGE_SIZE // 1024} KB memory pages."
+    return ""
+
+
+def _service_starting(service) -> bool:
+    """Startup requires declared container health, not a slow/failed HTTP probe."""
+    return (service is not None and service.status in {"down", "degraded"}
+            and getattr(service, "startup_pending", False) is True)
+
+
 def _compute_extension_status(ext: dict, services_by_id: dict) -> str:
     """Compute the runtime status of an extension."""
     ext_id = ext["id"]
@@ -492,7 +551,7 @@ def _compute_extension_status(ext: dict, services_by_id: dict) -> str:
     # A Library built-in this host's backend cannot run (ComfyUI needs AMD or
     # NVIDIA) stays incompatible even though other hosts may add it; its
     # selection and any receipt from a refused attempt are moot here.
-    if ext_id in LIBRARY_MANAGEABLE_BUILTINS and not _gpu_compatible(ext):
+    if ext_id in LIBRARY_MANAGEABLE_BUILTINS and (not _gpu_compatible(ext) or _host_unsupported_reason(ext)):
         return "incompatible"
 
     # Check for in-flight install operations (progress files take priority)
@@ -520,9 +579,10 @@ def _compute_extension_status(ext: dict, services_by_id: dict) -> str:
             # show "installing". If older, the user likely stopped the
             # container afterwards â€” fall through to normal status logic.
             if not _is_stale(progress.get("updated_at", ""), max_age_seconds=300):
-                # Long-running services still need an observed healthy state.
+                # Long-running services still need an observed healthy state;
+                # a crash loop is a failure, not a slow first health check.
                 svc = services_by_id.get(ext_id)
-                if not (svc and svc.status == "healthy"):
+                if not (svc and (svc.status == "healthy" or getattr(svc, "crash_looping", False))):
                     return "installing"
 
     # The process imported SERVICES before a Library action could have
@@ -536,6 +596,8 @@ def _compute_extension_status(ext: dict, services_by_id: dict) -> str:
         svc = services_by_id.get(ext_id)
         if svc and svc.status == "healthy":
             return "enabled"
+        if _service_starting(svc):
+            return "installing"
         if svc and svc.status in {"unhealthy", "degraded"}:
             return "unhealthy"
         return "stopped"
@@ -545,6 +607,8 @@ def _compute_extension_status(ext: dict, services_by_id: dict) -> str:
         svc = services_by_id.get(ext_id)
         if svc and svc.status == "healthy":
             return "enabled"
+        if _service_starting(svc):
+            return "installing"
         return "disabled"
 
     # User-installed extension â€” health-based when compose.yaml exists
@@ -557,6 +621,8 @@ def _compute_extension_status(ext: dict, services_by_id: dict) -> str:
             svc = services_by_id.get(ext_id)
             if svc and svc.status == "healthy":
                 return "enabled"
+            if _service_starting(svc):
+                return "installing"
             # HTTP 4xx/5xx from the health endpoint is the clearest "container
             # is up but broken" signal â€” surface it as "unhealthy" so the UI
             # can prompt a log check. Timeouts / connection refused / DNS
@@ -568,8 +634,8 @@ def _compute_extension_status(ext: dict, services_by_id: dict) -> str:
         if (user_dir / "compose.yaml.disabled").exists():
             return "disabled"
 
-    # GPU incompatibility
-    if not _gpu_compatible(ext):
+    # GPU incompatibility, or an image this host cannot run
+    if not _gpu_compatible(ext) or _host_unsupported_reason(ext):
         return "incompatible"
 
     if ext.get("catalog_source") == "builtin":
@@ -1372,7 +1438,7 @@ def _scan_compose_content(
             if isinstance(port, dict):
                 # Dict-form: {target: 80, published: 8080, host_ip: ...}
                 host_ip = port.get("host_ip", "")
-                if port.get("published") and not _host_part_is_loopback(host_ip):
+                if not _host_part_is_loopback(host_ip):
                     raise HTTPException(
                         status_code=400,
                         detail=(
@@ -1773,6 +1839,54 @@ def _serialize_extension_operation(func):
     return wrapped
 
 
+def _serialize_extension_group_operation(*, include_dependencies: bool):
+    """Own every service an enable/disable may affect, in template lock order."""
+    def decorate(func):
+        @wraps(func)
+        def wrapped(service_id: str, *args, **kwargs):
+            if not _SERVICE_ID_RE.match(service_id):
+                return func(service_id, *args, **kwargs)
+
+            def operation_ids():
+                with _extensions_lock():
+                    pending = [service_id]
+                    try:
+                        pending.extend(_feature_companions(service_id))
+                    except HTTPException:
+                        # The endpoint retains its normal validation response.
+                        pass
+                    visited = set()
+                    while pending:
+                        target = pending.pop()
+                        if target in visited:
+                            continue
+                        visited.add(target)
+                        if include_dependencies:
+                            try:
+                                pending.extend(_read_direct_deps(target))
+                            except HTTPException:
+                                pass
+                    return sorted(visited)
+
+            for _ in range(3):
+                planned = operation_ids()
+                # Never wait on operation locks while holding the graph lock,
+                # or acquire a dependency after holding its unsorted root.
+                with contextlib.ExitStack() as locks:
+                    for target in planned:
+                        locks.enter_context(_extension_operation_lock(target))
+                    if operation_ids() != planned:
+                        continue
+                    return func(service_id, *args, **kwargs)
+            raise HTTPException(
+                status_code=409,
+                detail="Extension dependencies changed; retry the operation",
+            )
+
+        return wrapped
+    return decorate
+
+
 def _extensions_lock_path() -> Path:
     """Use the same canonical lock file as the host selection helper.
 
@@ -1809,20 +1923,28 @@ async def _inspect_non_http_user_services(configs: dict, statuses: dict) -> None
             containers = snapshot["containers"]
     except (AgentClientError, ValueError):
         pass
+    from helpers import container_crash_looping  # noqa: PLC0415 - avoid import cycle
+
     for sid, cfg in candidates.items():
         matches = [item for item in containers if isinstance(item, dict) and item.get("service_id") == sid]
         state = "unknown"
+        startup_pending = False
+        crash_looping = False
         # Ambiguous snapshots cannot establish readiness of this extension.
         if len(matches) == 1:
             item = matches[0]
-            if item.get("state") == "running":
+            if container_crash_looping(item):
+                state, crash_looping = "unhealthy", True
+            elif item.get("state") == "running":
                 state = {"healthy": "healthy", "unhealthy": "unhealthy"}.get(item.get("health"), "degraded")
+                startup_pending = item.get("health") == "starting"
             elif item.get("state") in {"exited", "dead", "removing", "created"}:
                 state = "down"
         statuses[sid] = ServiceStatus(
             id=sid, name=cfg.get("name", sid), port=cfg["port"],
             external_port=cfg.get("external_port", cfg["port"]),
             status=state, response_time_ms=None,
+            startup_pending=startup_pending, crash_looping=crash_looping,
         )
 
 
@@ -1833,32 +1955,23 @@ def _current_extension_catalog():
     return merge_local_catalog(installed, EXTENSIONS_LIBRARY_DIR, schema, proposals_only=True)
 
 
-@router.get("/api/webui/selection")
-async def webui_selection(api_key: str = Depends(verify_api_key)):
-    """Expose the installed base-service choice to its Extensions Library tile."""
+def _webui_selection() -> dict:
+    """Read the host-owned base-service choice for Library and templates."""
     try:
-        result = await asyncio.to_thread(request_agent_json, "GET", "/v1/webui/selection", timeout=5)
+        result = request_agent_json("GET", "/v1/webui/selection", timeout=5)
     except AgentClientError:
         raise HTTPException(status_code=503, detail="Open WebUI selection is unavailable") from None
     if (not isinstance(result, dict) or type(result.get("enabled")) is not bool
             or type(result.get("supported")) is not bool):
         raise HTTPException(status_code=502, detail="Open WebUI selection could not be verified")
-    return JSONResponse({"enabled": result["enabled"], "supported": result["supported"]},
-                        headers={"Cache-Control": "no-store"})
+    return {"enabled": result["enabled"], "supported": result["supported"]}
 
 
-@router.post("/api/webui/selection")
-async def enable_webui_from_library(request: Request, api_key: str = Depends(verify_api_key)):
-    """Add WebUI through its dedicated host-owned selection path."""
+def _enable_webui_selection() -> dict:
+    """Use the same verified host action for individual and template adds."""
     try:
-        payload = await request.json()
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid Open WebUI selection") from None
-    if not isinstance(payload, dict) or set(payload) != {"enabled"} or payload["enabled"] is not True:
-        raise HTTPException(status_code=400, detail="Only adding Open WebUI is supported")
-    try:
-        result = await asyncio.to_thread(request_agent_json, "POST", "/v1/webui/selection",
-                                         payload={"enabled": True}, timeout=900)
+        result = request_agent_json("POST", "/v1/webui/selection",
+                                    payload={"enabled": True}, timeout=900)
     except AgentHTTPError as exc:
         code = exc.status_code
         if code == 501:
@@ -1875,6 +1988,34 @@ async def enable_webui_from_library(request: Request, api_key: str = Depends(ver
     if (not isinstance(result, dict) or result.get("enabled") is not True
             or result.get("action") not in {"enabled", "already_selected"}):
         raise HTTPException(status_code=502, detail="Open WebUI result could not be verified")
+    return {"enabled": True, "action": result["action"]}
+
+
+@router.get("/api/webui/selection")
+async def webui_selection(api_key: str = Depends(verify_api_key)):
+    """Expose the installed base-service choice to its Extensions Library tile."""
+    result = await asyncio.to_thread(_webui_selection)
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/api/webui/selection")
+async def enable_webui_from_library(request: Request, api_key: str = Depends(verify_api_key)):
+    """Add WebUI through its dedicated host-owned selection path."""
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid Open WebUI selection") from None
+    if not isinstance(payload, dict) or set(payload) != {"enabled"} or payload["enabled"] is not True:
+        raise HTTPException(status_code=400, detail="Only adding Open WebUI is supported")
+    result = await asyncio.to_thread(_enable_webui_selection)
+    # The Library immediately refetches catalog and detail after this action.
+    # Refresh this one cached health row now; the background all-service poll
+    # can otherwise leave a successful Add looking disabled until Refresh.
+    from helpers import refresh_cached_service_status
+    try:
+        await refresh_cached_service_status("open-webui")
+    except Exception:  # noqa: BLE001 - the host action already succeeded
+        logger.warning("Could not refresh Open WebUI health after selection", exc_info=True)
     return JSONResponse({"enabled": True, "action": result["action"]},
                         headers={"Cache-Control": "no-store"})
 
@@ -1956,6 +2097,7 @@ async def extensions_catalog(
         enriched = {
             **ext,
             "status": status,
+            "runtime_starting": status == "installing" and _service_starting(services_by_id.get(ext_id)),
             "installable": installable,
             "source": source,
             "has_data": has_data,
@@ -1967,6 +2109,9 @@ async def extensions_catalog(
         }
         if ext_id == "opencode" and ext_id in SERVICES:
             enriched.update(_opencode_catalog_fields(status))
+        unsupported = _host_unsupported_reason(ext)
+        if unsupported:
+            enriched["incompatible_reason"] = unsupported
         llm_contract = _llm_contract_for_extension(ext)
         if llm_contract is not None:
             enriched["llm"] = llm_contract
@@ -2372,7 +2517,18 @@ async def extension_install_next(service_id: str, api_key: str = Depends(verify_
         raise HTTPException(status_code=409, detail="Installation state requires inspection") from exc
 
 
-async def chat_extension_request_context(owner, chat_id, request_id, command, *, include_evidence=False):
+async def rollback_chat_extension_request(owner, chat_id, request_id, preparation):
+    from extension_requests import rollback_prepared_request
+
+    def rollback():
+        with _extensions_lock():
+            rollback_prepared_request(_extensions_lock_path().parent.resolve() / '.extension-requests',
+                                      owner, chat_id, request_id, preparation)
+    await asyncio.to_thread(rollback)
+
+
+async def chat_extension_request_context(owner, chat_id, request_id, command, *, include_evidence=False,
+                                         preparation=None):
     """Register routing before inference; recover it from storage on follow-ups."""
     from extension_requests import (active_chat_request, command_repository, create_request,
                                     model_request_context, cancel_request)
@@ -2389,7 +2545,7 @@ async def chat_extension_request_context(owner, chat_id, request_id, command, *,
                 if directory.is_symlink():
                     raise ValueError('Invalid request storage')
                 directory.mkdir(exist_ok=True)
-                current = create_request(directory, owner, chat_id, request_id, command)
+                current = create_request(directory, owner, chat_id, request_id, command, preparation=preparation)
         else:
             # Ordinary chat must not wait on an installation's global lock.
             # Atomic records are routing hints; proposal submission revalidates
@@ -2402,7 +2558,7 @@ async def chat_extension_request_context(owner, chat_id, request_id, command, *,
                 return None  # Unavailable hints must not break ordinary chat.
             if current and isinstance(command, str) and command.lstrip().startswith('/'):
                 with _extensions_lock():
-                    cancel_request(directory, owner, chat_id, current['requestId'])
+                    cancel_request(directory, owner, chat_id, current['requestId'], preparation=preparation)
                 return None
         if not current or current['state'] != 'pending':
             return None
@@ -3429,6 +3585,8 @@ async def extension_detail(
         "description": ext.get("description", ""),
         "status": status,
         "error_message": error_message,
+        "incompatible_reason": _host_unsupported_reason(ext) or None,
+        "runtime_starting": status == "installing" and _service_starting(services_by_id.get(service_id)),
         "source": source,
         "installable": installable,
         **_qualified_builtin_selection(service_id),
@@ -4675,6 +4833,9 @@ def prepare_extension_images(
     download. Library recipes prepare their images in their own install.
     """
     _validate_service_id(service_id)
+    if service_id == "opencode" and service_id in SERVICES:
+        # A host application with no images: its enable starts the host service.
+        return JSONResponse({"status": "ready", "service_ids": []})
     if service_id == "open-webui":
         plan = ["open-webui"]
     else:
@@ -4685,6 +4846,9 @@ def prepare_extension_images(
                 status_code=409,
                 detail=f"{entry.get('name', service_id)} is not available on this hardware.",
             )
+        unsupported = _host_unsupported_reason(entry)
+        if unsupported:
+            raise HTTPException(status_code=409, detail=unsupported)
         bundled = EXTENSIONS_DIR.resolve()
         if not _resolve_extension_dir(service_id).is_relative_to(bundled):
             raise HTTPException(status_code=400, detail="Only services shipped with ODS prepare images ahead of enabling")
@@ -4712,7 +4876,7 @@ def prepare_extension_images(
 
 
 @router.post("/api/extensions/{service_id}/enable")
-@_serialize_extension_operation
+@_serialize_extension_group_operation(include_dependencies=True)
 def enable_extension(
     service_id: str,
     auto_enable_deps: bool = Query(False),
@@ -4734,6 +4898,9 @@ def enable_extension(
             detail=f"{entry.get('name', service_id)} needs one of these GPU backends: {backends}. "
                    "It is not available on this hardware.",
         )
+    unsupported = _host_unsupported_reason(entry)
+    if unsupported:
+        raise HTTPException(status_code=409, detail=unsupported)
 
     ext_dir = _resolve_extension_dir(service_id)
 
@@ -4889,6 +5056,15 @@ def enable_extension(
             warnings.append(
                 f"{svc_id}: post_start hook failed â€” manual configuration may be needed",
             )
+
+    # FastAPI runs this sync endpoint in an AnyIO worker. Observe on the app
+    # loop, which owns the HTTP clients, while retaining the operation locks.
+    # User recipes are already probed live by catalog/detail.
+    started_builtins = [sid for sid in enabled_services
+                        if sid in LIBRARY_MANAGEABLE_BUILTINS and sid not in failed_services]
+    if started_builtins:
+        from helpers import refresh_cached_builtin_services
+        from_thread.run(refresh_cached_builtin_services, started_builtins)
 
     logger.info("Enabled extension: %s (deps: %s)", service_id,
                 enabled_services[:-1] if len(enabled_services) > 1 else "none")
@@ -5067,7 +5243,7 @@ def _enabled_dependents(service_id: str) -> list[str]:
 
 
 @router.post("/api/extensions/{service_id}/disable")
-@_serialize_extension_operation
+@_serialize_extension_group_operation(include_dependencies=False)
 def disable_extension(service_id: str, include_data_info: bool = Query(True), api_key: str = Depends(verify_api_key)):
     """Disable an enabled extension."""
     _validate_service_id(service_id)
@@ -5115,8 +5291,8 @@ def disable_extension(service_id: str, include_data_info: bool = Query(True), ap
     # time, so companions go first.
     for target in (*companions, service_id):
         _select_extensions_on_host("disable", [target])
-        progress_file = Path(DATA_DIR) / "extension-progress" / f"{target}.json"
-        progress_file.unlink(missing_ok=True)
+        # The host clears its own record; this covers an older host agent.
+        _clear_progress(target)
 
     logger.info("Disabled extension: %s (companions: %s)", service_id, companions or "none")
 
@@ -5232,8 +5408,7 @@ def uninstall_extension(service_id: str, include_data_info: bool = Query(True), 
             shutil.rmtree(backup)
         _invalidate_extension_digest_cache(ext_dir, backup)
 
-        progress_file = Path(DATA_DIR) / "extension-progress" / f"{service_id}.json"
-        progress_file.unlink(missing_ok=True)
+        _clear_progress(service_id)
 
     logger.info("Uninstalled extension: %s (stopped first: %s)", service_id, stopped_before_removal)
     message = "Extension uninstalled. Docker volumes may remain; run 'docker volume ls' to check."
@@ -5311,8 +5486,7 @@ def purge_extension_data(
         # Also clean up the per-service install-progress file so
         # _compute_extension_status does not keep showing a stale "installing"
         # entry after the user purges an extension's data.
-        progress_file = Path(DATA_DIR) / "extension-progress" / f"{service_id}.json"
-        progress_file.unlink(missing_ok=True)
+        _clear_progress(service_id)
 
         return {"id": service_id, "action": "purged", "size_gb_freed": size_gb}
 

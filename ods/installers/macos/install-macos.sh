@@ -164,6 +164,19 @@ while [[ $# -gt 0 ]]; do
         --all)           ALL_FEATURES=true; shift ;;
         --cloud)         CLOUD_MODE=true; shift ;;
         --no-bootstrap)  NO_BOOTSTRAP=true; shift ;;
+        # The vLLM engine needs Linux and an NVIDIA datacenter GPU. macOS
+        # always runs llama.cpp, so llama-server is accepted and changes
+        # nothing (get-ods.sh passes the same options to every installer).
+        --llm-backend)
+            case "${2:-}" in
+                llama-server) shift 2 ;;
+                vllm)
+                    echo "--llm-backend vllm needs Linux with an NVIDIA GPU; macOS runs llama.cpp. Nothing was changed." >&2
+                    echo "Rerun without --llm-backend, or with --llm-backend llama-server." >&2
+                    echo "Need help? Ask on the ODS Discord: https://discord.gg/4ntNp9MAwC" >&2
+                    exit 1 ;;
+                *) echo "--llm-backend requires vllm or llama-server" >&2; exit 1 ;;
+            esac ;;
         # API mode is not in this installer yet; say so and name the way
         # to connect an API after installing, not "Unknown option".
         --external-llm-url|--external-llm-provider|--external-llm-model|--external-llm-key-file|--external-llm-key-env|--no-external-llm|--reuse-external-llm)
@@ -236,6 +249,8 @@ source "${LIB_DIR}/preflight-fs.sh"
 source "${LIB_DIR}/env-generator.sh"
 source "${LIB_DIR}/installed-footprint.sh"
 source "${LIB_DIR}/host-agent-listener.sh"
+source "${LIB_DIR}/host-agent-install.sh"
+source "${LIB_DIR}/post-pixel-install.sh"
 if [[ -f "${SOURCE_ROOT}/installers/lib/compose-failure-report.sh" ]]; then
     source "${SOURCE_ROOT}/installers/lib/compose-failure-report.sh"
 fi
@@ -266,34 +281,6 @@ _close_inherited_fds_for_daemon() {
     done
 }
 
-# Build a launchd-friendly PATH that includes Docker and Homebrew prefixes.
-# launchd does NOT inherit the user's login shell PATH, so any path containing
-# `docker` or `brew`-installed tools must be baked into the plist explicitly.
-# Pass an optional leading directory (e.g. ~/.opencode/bin) as $1.
-_compute_launchd_path() {
-    local extra="${1:-}"
-    local docker_bin="" docker_dir="" brew_prefix=""
-    if command -v docker >/dev/null 2>&1; then
-        docker_bin="$(command -v docker)"
-        docker_dir="$(cd "$(dirname "$docker_bin")" && pwd)"
-    fi
-    if command -v brew >/dev/null 2>&1; then
-        brew_prefix="$(brew --prefix)"
-    fi
-    local entries=()
-    [[ -n "$extra" ]]                && entries+=("$extra")
-    [[ -n "$docker_dir" ]]           && entries+=("$docker_dir")
-    [[ -n "$brew_prefix" ]]          && entries+=("${brew_prefix}/bin")
-    entries+=("/opt/homebrew/bin" "/usr/local/bin" "/usr/bin" "/bin")
-    local seen=":" path_out="" d
-    for d in "${entries[@]}"; do
-        case "$seen" in
-            *":${d}:"*) ;;
-            *) seen="${seen}${d}:"; path_out="${path_out:+${path_out}:}${d}" ;;
-        esac
-    done
-    printf '%s' "$path_out"
-}
 
 _write_macos_cloud_auth_overlay() {
     local overlay_path="$1"
@@ -546,77 +533,36 @@ raise SystemExit(0 if actual and hashlib.sha256(actual.encode()).hexdigest() == 
 HERMES_AUTH_VERIFY_PY
 }
 
-_write_macos_opencode_config() {
-    local config_path="$1" model_name="$2" base_url="$3" api_key="$4" context_length="$5"
-    # OpenCode reads config.json, not opencode.json, so the same document has
-    # to land in both files — matching installers/phases/07-devtools.sh on
-    # Linux and installers/windows/lib/opencode-config.ps1 on Windows.
-    local compat_path
-    compat_path="$(dirname "$config_path")/config.json"
-    mkdir -p "$(dirname "$config_path")"
-    ODS_OPENCODE_MODEL="$model_name" \
-    ODS_OPENCODE_BASE_URL="$base_url" \
-    ODS_OPENCODE_API_KEY="$api_key" \
-    ODS_OPENCODE_CONTEXT="$context_length" \
-        /usr/bin/python3 - "$config_path" "$compat_path" <<'OPENCODE_CONFIG_PY'
-import json
-import os
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-compat_path = Path(sys.argv[2])
-try:
-    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-except (OSError, ValueError):
-    data = {}
-if not isinstance(data, dict):
-    data = {}
-
-model_name = os.environ["ODS_OPENCODE_MODEL"]
-base_url = os.environ["ODS_OPENCODE_BASE_URL"]
-api_key = os.environ["ODS_OPENCODE_API_KEY"]
-context = int(os.environ["ODS_OPENCODE_CONTEXT"])
-if context < 1024:
-    raise SystemExit("OpenCode requires at least 1024 context tokens")
-output_limit = min(32768, context // 4)
-provider_id = "llama-server"
-provider = data.setdefault("provider", {}).setdefault(provider_id, {})
-provider.update({
-    "npm": "@ai-sdk/openai-compatible",
-    "name": "ODS inference",
-    "options": {"baseURL": base_url, "apiKey": api_key},
-    "models": {
-        model_name: {
-            "name": model_name,
-            "limit": {"context": context, "output": output_limit},
-        }
-    },
-})
-data["model"] = f"{provider_id}/{model_name}"
-data.setdefault("$schema", "https://opencode.ai/config.json")
-
-payload = json.dumps(data, indent=2) + "\n"
-
-
-def write_atomic(target):
-    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, target)
-
-
-for target in (path, compat_path):
-    write_atomic(target)
-
-    check = json.loads(target.read_text(encoding="utf-8"))
-    check_provider = check["provider"][provider_id]
-    if check.get("model") != f"{provider_id}/{model_name}":
-        raise SystemExit(f"OpenCode model verification failed for {target.name}")
-    if check_provider["options"] != {"baseURL": base_url, "apiKey": api_key}:
-        raise SystemExit(f"OpenCode route verification failed for {target.name}")
-OPENCODE_CONFIG_PY
+# Copy the finished example projects ODS ships (Elf of Doom) into the owner's
+# native Portal workspace whenever Playground/elf-of-doom is absent and this
+# workspace has never received it, so a deleted or renamed example stays that
+# way. The record of received examples lives in Portal's state folder, which
+# the agent's sandbox never mounts. Portal's sidebar then lists it with the
+# other projects; the installer prints nothing about it. Runs after native
+# activation; a failure never fails the install. The outcome, and a workspace
+# layout the helper never writes into (exit status 3, which stays as the owner
+# made it), go only to the install log. Only a failure warns, with its cause,
+# recovery and help link.
+_macos_add_example_projects() {
+    local install_root status code=0
+    # The native workspace path is built from the resolved install directory,
+    # and the helper refuses any symlinked path component.
+    if ! install_root="$(cd "$INSTALL_DIR" && pwd -P)"; then
+        ai_warn "Portal is ready, but ODS could not add its Elf of Doom example project: it could not open the ODS install folder $INSTALL_DIR. Nothing in your Portal workspace was changed. Ask on Discord if you need help: ${ODS_HELP_DISCORD_URL} (details: $ODS_LOG_FILE)"
+        return 0
+    fi
+    status="$(/usr/bin/python3 -B "$INSTALL_DIR/installers/lib/pixel-example-projects.py" \
+        --workspace "$install_root/data/pixel-native/home/.openclaw/workspace-pixel" \
+        --state-dir "$install_root/data/pixel-native/home/.openclaw" 2>>"$ODS_LOG_FILE")" || code=$?
+    case "$code" in
+        0) printf 'Portal example projects: %s\n' "$status" >>"$ODS_LOG_FILE" ;;
+        3) printf 'Portal example projects not added: %s\n' "$status" >>"$ODS_LOG_FILE" ;;
+        4) ai_warn "Portal is ready, but ODS could not add its Elf of Doom example project: $status Nothing in your Portal workspace was replaced. Ask on Discord if you need help: ${ODS_HELP_DISCORD_URL} (details: $ODS_LOG_FILE)" ;;
+        *) ai_warn "Portal is ready, but ODS could not add its Elf of Doom example project: its copy step stopped unexpectedly (exit $code). Nothing in your Portal workspace was replaced. Ask on Discord with the details from $ODS_LOG_FILE: ${ODS_HELP_DISCORD_URL}" ;;
+    esac
+    return 0
 }
+
 
 _macos_bootstrap_upgrade_pid_is_owned() {
     local pid="$1"
@@ -915,45 +861,6 @@ _macos_stop_install_owned_native_llama() {
     rm -f "$LLAMA_SERVER_PID_FILE" 2>/dev/null || true
 }
 
-_verify_macos_dashboard_host_agent() {
-    local env_file="$1"
-    local container_state bridge_enabled host port api_key attempt
-
-    container_state="$(docker inspect --format '{{.State.Status}}' ods-dashboard-api 2>/dev/null || true)"
-    if [[ "$container_state" != "running" ]]; then
-        ai_err "Dashboard API container is not running (state: ${container_state:-missing})."
-        ai "  Inspect: docker logs ods-dashboard-api"
-        return 1
-    fi
-
-    bridge_enabled="$(read_env_value "$env_file" "ODS_MACOS_HOST_AGENT_BRIDGE_ENABLED")"
-    host="$(read_env_value "$env_file" "ODS_AGENT_HOST")"
-    port="$(read_env_value "$env_file" "ODS_AGENT_PORT")"
-    api_key="$(read_env_value "$env_file" "ODS_AGENT_KEY")"
-    [[ -n "$host" ]] || host="host.docker.internal"
-    [[ "$port" =~ ^[0-9]+$ ]] || port="7710"
-    if [[ -z "$api_key" ]]; then
-        ai_err "Cannot verify the dashboard host-agent path because ODS_AGENT_KEY is empty."
-        return 1
-    fi
-
-    for attempt in $(seq 1 20); do
-        # The key goes through stdin, never argv, which any local user can read.
-        if printf 'Authorization: Bearer %s\n' "$api_key" \
-            | docker exec -i ods-dashboard-api curl -fsS --max-time 2 \
-            -H @- \
-            "http://${host}:${port}/v1/model/status" >/dev/null 2>&1; then
-            ai_ok "Dashboard container reached the authenticated host agent"
-            return 0
-        fi
-        sleep 1
-    done
-
-    ai_err "Dashboard container cannot reach the authenticated host agent at ${host}:${port}."
-    ai "  Host log:   $HOME/Library/Logs/ODS/ods-host-agent.log"
-    [[ "$bridge_enabled" == "true" ]] && ai "  Bridge log: $HOST_AGENT_BRIDGE_LOG"
-    return 1
-}
 
 COLIMA_VM_IP=""
 COLIMA_HOST_IP=""
@@ -1002,6 +909,19 @@ _active_colima_hint_args() {
     if [[ -n "$COLIMA_PROFILE" && "$COLIMA_PROFILE" != "default" ]]; then
         printf ' --profile %s' "$COLIMA_PROFILE"
     fi
+}
+
+# Starting a stopped VM must keep its existing resource budget. Colima stop
+# can remove its Docker context, so an unresolved profile needs owner selection.
+_show_colima_start_hint() {
+    local profile_args
+    COLIMA_PROFILE=""
+    if ! _resolve_active_colima_profile; then
+        ai "Run \`colima list\` and start your existing Colima profile, then re-run this installer."
+        return 0
+    fi
+    profile_args="$(_active_colima_hint_args)"
+    ai "Run \`colima start${profile_args}\` then re-run this installer."
 }
 
 _detect_colima_private_network() {
@@ -1101,75 +1021,13 @@ _configure_macos_llm_bridge() {
     macos_configure_llm_bridge_from_env "${INSTALL_DIR}/.env" "$INSTALL_DIR"
 }
 
-_configure_macos_host_agent_bridge() {
-    local env_file="${INSTALL_DIR}/.env"
-    local enabled listen_host allowed_peer agent_port agent_bind
-    enabled="$(read_env_value "$env_file" "ODS_MACOS_HOST_AGENT_BRIDGE_ENABLED")"
-    listen_host="$(read_env_value "$env_file" "ODS_MACOS_HOST_GATEWAY")"
-    allowed_peer="$(read_env_value "$env_file" "ODS_MACOS_VM_IP")"
-    agent_port="$(read_env_value "$env_file" "ODS_AGENT_PORT")"
-    agent_bind="$(read_env_value "$env_file" "ODS_AGENT_BIND")"
-    [[ -n "$agent_bind" ]] || agent_bind="127.0.0.1"
-    if [[ "$enabled" == "true" ]] && macos_bind_uses_direct_gateway "$agent_bind" "$listen_host"; then
-        ai "Host-agent bind ${agent_bind} already covers the Colima gateway; disabling the host-agent bridge"
-        enabled="false"
-        upsert_env_value "$env_file" "ODS_MACOS_HOST_AGENT_BRIDGE_ENABLED" "false"
-    fi
-    [[ "$agent_port" =~ ^[0-9]+$ ]] || agent_port="7710"
-    macos_configure_port_bridge "$enabled" "$HOST_AGENT_BRIDGE_PLIST_LABEL" \
-        "$HOST_AGENT_BRIDGE_PLIST" "$HOST_AGENT_BRIDGE_LOG" "Colima host-agent bridge" \
-        "$listen_host" "$agent_port" "$agent_port" "$allowed_peer" "$INSTALL_DIR"
-}
 
-_opencode_candidate_is_file() {
-    local candidate="$1"
-    [[ -n "$candidate" && "$candidate" == /* && -x "$candidate" && ! -d "$candidate" ]]
-}
 
-_find_opencode_bin() {
-    local candidate="" brew_prefix=""
-    for candidate in "${OPENCODE_BIN:-}" "$HOME/.opencode/bin/opencode"; do
-        if _opencode_candidate_is_file "$candidate"; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-
-    if command -v brew >/dev/null 2>&1; then
-        brew_prefix="$(brew --prefix 2>/dev/null || true)"
-        candidate="${brew_prefix:+${brew_prefix}/bin/opencode}"
-        if _opencode_candidate_is_file "$candidate"; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    fi
-
-    candidate="$(type -P opencode 2>/dev/null || true)"
-    if _opencode_candidate_is_file "$candidate"; then
-        printf '%s\n' "$candidate"
-        return 0
-    fi
-
-    return 1
-}
-
-_install_opencode() {
-    OPENCODE_BIN="$(_find_opencode_bin 2>/dev/null || true)"
-    # shellcheck source=../lib/opencode-runtime.sh
-    . "$SCRIPT_DIR/../lib/opencode-runtime.sh"
-    if OPENCODE_BIN="$(ods_install_opencode "$OPENCODE_BIN")"; then
-        ai_ok "Reviewed OpenCode release installed ($OPENCODE_BIN)"
-    else
-        OPENCODE_BIN=""
-        ai_warn "OpenCode upgrade failed; existing binary/configuration preserved. Re-run after resolving the download or binary error."
-        return 1
-    fi
-}
-
+# One Docker CPU floor covers every feature selection. The env generator caps
+# each service's CPU limit (TTS, Whisper, Hermes) to Docker's CPUs, so no
+# selection can ask compose for more CPUs than Docker has (#3600).
 _require_docker_cpu_budget() {
     local min_cpus="${1:-6}"
-    local max_pin="${2:-4}"
-    local workload="${3:-compose stack}"
     local docker_ncpu
 
     if ! [[ "$min_cpus" =~ ^[0-9]+$ ]] || [[ "$min_cpus" -lt 1 ]]; then
@@ -1178,13 +1036,13 @@ _require_docker_cpu_budget() {
 
     docker_ncpu=$(get_docker_available_cpus)
     if [[ "$docker_ncpu" =~ ^[0-9]+$ ]] && [[ "$docker_ncpu" -lt "$min_cpus" ]]; then
-        ai_err "Docker daemon only has ${docker_ncpu} CPU(s); ODS's ${workload} pins limits up to ${max_pin} CPUs per service and needs at least ${min_cpus} to avoid 'range of CPUs is from 0.01 to N' compose failures."
+        ai_err "Docker has only ${docker_ncpu} CPU(s); the ODS installer requires at least ${min_cpus}."
         case "${DOCKER_BACKEND:-unknown}" in
             colima)
                 local profile_args
                 profile_args="$(_active_colima_hint_args)"
-                ai "Stop and re-create the Colima VM with more CPUs:"
-                ai "    colima stop${profile_args} && colima start${profile_args} --cpu ${min_cpus} --memory 12 --disk 60"
+                ai "Restart the existing Colima VM with more CPUs:"
+                ai "    colima stop${profile_args} && colima start${profile_args} --cpu ${min_cpus}"
                 ai "Then re-run this installer."
                 ;;
             desktop)
@@ -1200,9 +1058,22 @@ _require_docker_cpu_budget() {
                 ai "Raise your docker daemon's CPU allocation to ${min_cpus}+ and re-run."
                 ;;
         esac
+        ai "Or install with ${docker_ncpu} anyway (ODS runs slower): re-run with ODS_MIN_DOCKER_CPUS=${docker_ncpu} set."
         exit 1
     fi
-    ai_ok "Docker CPU budget: ${docker_ncpu} (>=${min_cpus} required for ${workload})"
+    ai_ok "Docker CPU budget: ${docker_ncpu} (>=${min_cpus} required)"
+}
+
+# Speech recognition (WHISPER_CPU_LIMIT=4.0) and text-to-speech (at most 4
+# threads) are sized for 4 CPUs each, so voice runs at full speed on the
+# default floor. Fewer is only possible with a lower ODS_MIN_DOCKER_CPUS.
+_warn_voice_cpu_budget() {
+    local sized_for=4
+    local docker_ncpu
+    docker_ncpu=$(get_docker_available_cpus)
+    if [[ "$docker_ncpu" =~ ^[0-9]+$ ]] && [[ "$docker_ncpu" -lt "$sized_for" ]]; then
+        ai_warn "Voice: Docker has ${docker_ncpu} CPU(s), fewer than the ${sized_for} that speech recognition and text-to-speech are sized for, so speech will be slower. Voice still works."
+    fi
 }
 
 _macos_python_imports_yaml() {
@@ -1220,20 +1091,6 @@ _set_installer_python_cmd() {
     fi
 }
 
-_ensure_macos_agent_python() {
-    local bootstrap_python="$1"
-    local venv_dir="${INSTALL_DIR}/.venv/host-agent"
-    local runtime="${venv_dir}/bin/python"
-    if [[ ! -x "$runtime" ]]; then
-        "$bootstrap_python" -m venv "$venv_dir" >>"$ODS_LOG_FILE" 2>&1 || return 1
-    fi
-    if ! "$runtime" -c 'import yaml, huggingface_hub, hf_xet' >/dev/null 2>&1; then
-        "$runtime" -m pip install --quiet pyyaml 'huggingface_hub[hf_xet]>=0.27' \
-            >>"$ODS_LOG_FILE" 2>&1 || return 1
-    fi
-    "$runtime" -c 'import yaml, huggingface_hub, hf_xet' >/dev/null 2>&1 || return 1
-    AGENT_PYTHON="$runtime"
-}
 
 _ensure_macos_pyyaml() {
     local pycmd=""
@@ -1430,7 +1287,7 @@ if ! $DOCKER_RUNNING; then
     ai_err "Docker daemon is not responding."
     case "${DOCKER_BACKEND:-unknown}" in
         desktop)  ai "Start Docker Desktop from /Applications or the menu bar, then re-run this installer." ;;
-        colima)   ai "Run \`colima start\` (e.g. \`colima start --cpu 6 --memory 12 --disk 60\`) then re-run this installer." ;;
+        colima)   _show_colima_start_hint ;;
         rancher)  ai "Open Rancher Desktop and wait for the daemon to come up, then re-run this installer." ;;
         orbstack) ai "Open OrbStack and wait for the daemon to come up, then re-run this installer." ;;
         *)        ai "Start your docker daemon (Docker Desktop, Colima, Rancher Desktop, OrbStack, ...) and re-run this installer." ;;
@@ -1444,21 +1301,10 @@ if ! _ensure_colima_private_network; then
 fi
 
 # Pre-flight the docker daemon's CPU allocation. Trip early with a clear
-# message rather than letting compose fail after pulls/builds. If the user
-# already requested voice from CLI flags (for example --all), account for
-# Kokoro's 8-CPU pin now; interactive feature selection is checked again
-# after the user picks features.
-_docker_cpu_override="${ODS_MIN_DOCKER_CPUS:-}"
-_docker_cpu_min="${_docker_cpu_override:-6}"
-_docker_cpu_max_pin=4
-_docker_cpu_workload="base compose stack"
-if $ENABLE_VOICE && [[ -z "$_docker_cpu_override" ]]; then
-    _docker_cpu_min=10
-    _docker_cpu_max_pin=8
-    _docker_cpu_workload="voice-enabled compose stack"
-fi
-_docker_cpu_preflight_min="$_docker_cpu_min"
-_require_docker_cpu_budget "$_docker_cpu_min" "$_docker_cpu_max_pin" "$_docker_cpu_workload"
+# message rather than after pulls/builds. Voice and the Full Stack share this
+# floor: their CPU limits are capped to Docker's CPUs, so an 8-core Mac can
+# run them (#3600). Voice is checked after the user picks features.
+_require_docker_cpu_budget "${ODS_MIN_DOCKER_CPUS:-6}"
 
 # Catch a common Colima-after-DockerDesktop config bomb: when a prior
 # Docker Desktop install left `"credsStore": "desktop"` in ~/.docker/config.json
@@ -1515,13 +1361,12 @@ fi
 # message before any compose work starts.
 test_docker_desktop_sharing "$INSTALL_DIR"
 if ! $DOCKER_SHARE_OK; then
-    ai_err "Docker Desktop cannot bind-mount ${INSTALL_DIR}."
-    ai_err "Add the path to Docker Desktop > Settings > Resources > File Sharing,"
-    ai_err "apply, then re-run this installer."
-    if [[ -n "$DOCKER_SHARE_ERR" ]]; then
-        ai "Probe output:"
-        printf '%s\n' "$DOCKER_SHARE_ERR" | sed 's/^/    /'
+    if [[ "$DOCKER_SHARE_REASON" == "denied" ]]; then
+        ai_err "Docker Desktop cannot bind-mount ${INSTALL_DIR}."
+        ai_err "Add the path to Docker Desktop > Settings > Resources > File Sharing,"
+        ai_err "apply, then re-run this installer."
     fi
+    ai_err "$DOCKER_SHARE_ERR"
     exit 1
 fi
 ai_ok "Docker Desktop file sharing OK"
@@ -1933,8 +1778,8 @@ info_box "  Langfuse:" "$(if $ENABLE_LANGFUSE; then echo enabled; else echo disa
 # why the dashboard shows no image-gen tile after install.
 info_box "  ComfyUI:" "not available on macOS (no MPS Docker image upstream)"
 
-if $ENABLE_VOICE && [[ -z "$_docker_cpu_override" ]] && [[ "${_docker_cpu_preflight_min:-0}" -lt 10 ]]; then
-    _require_docker_cpu_budget 10 8 "voice-enabled compose stack"
+if $ENABLE_VOICE; then
+    _warn_voice_cpu_budget
 fi
 
 # ============================================================================
@@ -2171,6 +2016,8 @@ else
     # generate_ods_env preserves existing .env without --force. Persist an
     # explicit addback or opt-out there too, so cache rebuilds keep the choice.
     upsert_env_value "${INSTALL_DIR}/.env" "ENABLE_OPEN_WEBUI" "$ENABLE_OPEN_WEBUI"
+    # Pixel can stop before OpenCode setup; retain the choice for continuation.
+    upsert_env_value "${INSTALL_DIR}/.env" "ENABLE_OPENCODE" "$ENABLE_OPENCODE"
     # Reinstalls preserve .env, including an earlier AirPlay port remap.
     # Use that same port for Compose, model downloads and readiness checks.
     WHISPER_PORT="$(read_env_value "$INSTALL_DIR/.env" "WHISPER_PORT")"
@@ -2558,6 +2405,10 @@ else
         # from consuming the entire token budget on internal reasoning)
         _reasoning=$(grep '^LLAMA_REASONING=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "")
         [[ -z "$_reasoning" ]] && _reasoning="off"
+        # Modes are case-insensitive, as in ods-host-agent.py; llama-server
+        # only accepts the lowercase spelling.
+        _reasoning_lower="$(printf '%s' "$_reasoning" | tr '[:upper:]' '[:lower:]')"
+        case "$_reasoning_lower" in off|on|auto) _reasoning="$_reasoning_lower" ;; esac
         # Map .env values (off/on/auto) to llama-server --reasoning-format values
         case "$_reasoning" in
             off)  _reasoning_fmt="none" ;;
@@ -2602,6 +2453,11 @@ else
         macos_resolve_checkpoint_args "$INSTALL_DIR" "$LLAMA_SERVER_BIN" "$_reasoning_fmt" || exit 1
         _llama_args+=(${MACOS_NATIVE_CHECKPOINT_ARGS[@]+"${MACOS_NATIVE_CHECKPOINT_ARGS[@]}"})
         fi
+        # The projector the host agent's switch launches with: a qualified profile's
+        # or a vision import's own (WP2), so a restart keeps the model's vision.
+        [[ -n "${MACOS_NATIVE_PROJECTOR_PATH:-}" ]] && _llama_args+=(--mmproj "$MACOS_NATIVE_PROJECTOR_PATH")
+        # A fixed chat template the switch chose for an exact template match (WP5).
+        [[ -n "${MACOS_NATIVE_CHAT_TEMPLATE_PATH:-}" ]] && _llama_args+=(--chat-template-file "$MACOS_NATIVE_CHAT_TEMPLATE_PATH")
 
         _macos_stop_install_owned_native_llama \
             "Stopping prior install-owned native inference before replacement..."
@@ -2757,6 +2613,9 @@ else
         COMPOSE_FLAGS+=("-f" "docker-compose.tier0.yml")
         ai "Applying lightweight memory limits for Tier 0"
     fi
+
+    # Both cloud and native Mac installs keep private API SQLite in the VM.
+    COMPOSE_FLAGS+=("-f" "installers/macos/dashboard-private-state.compose.yaml")
 
     # Docker compose override (user customizations)
     if [[ -f "${INSTALL_DIR}/docker-compose.override.yml" ]]; then
@@ -3067,9 +2926,15 @@ for service in (data.get("services") or {}).values():
             fi
         done
     } > "$_compose_launch_record"
+    # Save the stack before starting it. ods-uninstall.sh reads this file first,
+    # and a later failure (including a partial compose up) must not leave it
+    # naming an older run's stack whose volumes no longer match.
+    echo "${COMPOSE_FLAGS[*]}" > "${INSTALL_DIR}/.compose-flags"
     ai "Running: docker compose ${COMPOSE_FLAGS[*]} ${_macos_compose_up_args[*]}"
     set +o pipefail  # pipefail would abort on compose exit before PIPESTATUS is read; capture it first
-    docker compose "${COMPOSE_FLAGS[@]}" "${_macos_compose_up_args[@]}" 2>&1 | tee -a "$_compose_up_log" | while IFS= read -r line; do
+    /usr/bin/python3 "$INSTALL_DIR/installers/macos/lib/dashboard-private-state.py" \
+        launch --operation install --install-dir "$INSTALL_DIR" --flags="${COMPOSE_FLAGS[*]}" \
+        2>&1 | tee -a "$_compose_up_log" | while IFS= read -r line; do
         echo "  $line"
     done
     compose_exit="${PIPESTATUS[0]}"
@@ -3194,20 +3059,32 @@ for service in (data.get("services") or {}).values():
             [[ "${COMPOSE_FLAGS[_pixel_i]}" == -f ]] || { ai_err "Unexpected Compose selection"; exit 1; }
             _pixel_install_args+=(--compose-file "$INSTALL_DIR/${COMPOSE_FLAGS[_pixel_i+1]}")
         done
-        if ! /usr/bin/python3 "$LIB_DIR/pixel-native-install.py" "${_pixel_install_args[@]}"; then
-            ai_err "Native Pixel setup stopped. Keep data/pixel-native and its private receipts for diagnosis."
-            exit 1
-        fi
-        COMPOSE_FLAGS+=(
+        _pixel_compose_fragments=(
             -f extensions/services/pixel-model-relay/compose.yaml.disabled
             -f extensions/services/pixel-edge/compose.yaml.disabled
             -f installers/macos/pixel-native.compose.yaml.disabled
         )
+        if ! /usr/bin/python3 "$LIB_DIR/pixel-native-install.py" "${_pixel_install_args[@]}" \
+            2>&1 | tee -a "$ODS_LOG_FILE"; then
+            # Activation journals an attempt only after these fragments render
+            # and before it starts their containers. Record them for the
+            # uninstaller then; without the journal no Pixel container exists
+            # and its .env bindings may be missing, so leave them out.
+            if [[ -f "${INSTALL_DIR}/data/pixel-native/preparation/activation.json" ]]; then
+                echo "${COMPOSE_FLAGS[*]} ${_pixel_compose_fragments[*]}" > "${INSTALL_DIR}/.compose-flags"
+            fi
+            ai_err "Native Pixel setup stopped. Keep data/pixel-native and its private receipts for diagnosis."
+            exit 1
+        fi
+        COMPOSE_FLAGS+=("${_pixel_compose_fragments[@]}")
         ai_ok "Native Pixel activated for Dashboard/Portal"
     fi
 
     # Save compose flags for ods-macos.sh
     echo "${COMPOSE_FLAGS[*]}" > "${INSTALL_DIR}/.compose-flags"
+    if $ENABLE_PIXEL; then
+        _macos_add_example_projects
+    fi
 
     # ── Launch background model upgrade ──────────────────────────────────
     if [[ "$_BOOTSTRAP_ACTIVE" == "true" ]]; then
@@ -3238,265 +3115,14 @@ for service in (data.get("services") or {}).values():
         fi
     fi
 
-    # ── Install & start OpenCode only when selected ──
-    if $OPENCODE_DISABLE_EXPLICIT || $OPENCODE_DISABLE_SELECTED; then
-        if ods_macos_opencode_plist_owned \
-            "$OPENCODE_PLIST" "$OPENCODE_PLIST_LABEL" "$OPENCODE_BUN_TMPDIR"; then
-            if launchctl print "gui/$(id -u)/${OPENCODE_PLIST_LABEL}" >/dev/null 2>&1 \
-                && ! ods_macos_opencode_loaded_owned "$OPENCODE_PLIST" "$OPENCODE_PLIST_LABEL" \
-                    "$OPENCODE_BUN_TMPDIR" "$(id -u)"; then
-                ai_warn "A foreign OpenCode service uses the ODS label; leaving it untouched."
-            else
-                launchctl disable "gui/$(id -u)/${OPENCODE_PLIST_LABEL}" || {
-                    ai_err "Could not disable the ODS OpenCode login service."
-                    exit 1
-                }
-                ai "Disabled future OpenCode login starts; any current session remains running."
-            fi
-        fi
-    fi
-    if $ENABLE_OPENCODE; then
-    chapter "OPENCODE (AI CODING IDE)"
-
-    _install_opencode || true  # Optional IDE failure is reported; do not start an old/unverified version.
-
-    # OpenCode is native, so cloud mode uses LiteLLM's published host port while
-    # local mode follows the actual native llama bind and port.
-    if [[ -n "$OPENCODE_BIN" && -x "$OPENCODE_BIN" ]]; then
-        mkdir -p "$OPENCODE_CONFIG_DIR"
-        _opencode_switchboard_mode="$(read_env_value "$INSTALL_DIR/.env" "ODS_MODEL_SWITCHBOARD")"
-        if [[ "${_opencode_switchboard_mode:-enabled}" == "enabled" ]]; then
-            _opencode_model="ods/current"
-            _opencode_port="$(read_env_value "$INSTALL_DIR/.env" "LITELLM_PORT")"
-            [[ "$_opencode_port" =~ ^[0-9]+$ ]] || _opencode_port="4000"
-            _opencode_bind="127.0.0.1"
-            _opencode_host="$(macos_bind_probe_host "${_opencode_bind:-127.0.0.1}")"
-            _opencode_base_url="http://${_opencode_host}:${_opencode_port}/v1"
-            _opencode_api_key="$(read_env_value "$INSTALL_DIR/.env" "LITELLM_KEY")"
-        elif $CLOUD_MODE; then
-            _opencode_model="default"
-            _opencode_port="$(read_env_value "$INSTALL_DIR/.env" "LITELLM_PORT")"
-            [[ "$_opencode_port" =~ ^[0-9]+$ ]] || _opencode_port="4000"
-            _opencode_bind="127.0.0.1"
-            _opencode_host="$(macos_bind_probe_host "${_opencode_bind:-127.0.0.1}")"
-            _opencode_base_url="http://${_opencode_host}:${_opencode_port}/v1"
-            _opencode_api_key="$(read_env_value "$INSTALL_DIR/.env" "LITELLM_KEY")"
-        else
-            _opencode_model="$LLM_MODEL"
-            _opencode_port="$(read_env_value "$INSTALL_DIR/.env" "ODS_NATIVE_LLAMA_PORT")"
-            [[ "$_opencode_port" =~ ^[0-9]+$ ]] || _opencode_port="8080"
-            _opencode_bind="127.0.0.1"
-            _opencode_host="$(macos_bind_probe_host "${_opencode_bind:-127.0.0.1}")"
-            _opencode_base_url="http://${_opencode_host}:${_opencode_port}/v1"
-            _opencode_api_key="no-key"
-        fi
-        if [[ -z "$_opencode_api_key" ]] \
-           || ! _write_macos_opencode_config \
-                "$OPENCODE_CONFIG_DIR/opencode.json" \
-                "$_opencode_model" "$_opencode_base_url" "$_opencode_api_key" \
-                "${MAX_CONTEXT:-32768}"; then
-            ai_err "Could not configure OpenCode for the active inference route."
-            exit 1
-        fi
-        ai_ok "OpenCode configured for ${_opencode_model} at ${_opencode_base_url}"
-        unset _opencode_model _opencode_port _opencode_bind _opencode_host \
-            _opencode_switchboard_mode \
-            _opencode_base_url _opencode_api_key
-
-        # Install as macOS LaunchAgent (auto-start on login).
-        # Log path is intentionally decoupled from INSTALL_DIR: xpcproxy denies
-        # file-write-create on non-$HOME volumes, which causes the launchd spawn
-        # to exit 78 before the target process ever runs. $HOME/Library/Logs is
-        # always inside xpcproxy's sandbox writable set, so use that instead.
-        mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/ODS"
-        OPENCODE_LAUNCHD_PATH="$(_compute_launchd_path "$(dirname "$OPENCODE_BIN")")"
-        cat > "$OPENCODE_PLIST" <<PLIST_EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${OPENCODE_PLIST_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <!-- OpenCode 1.18.x (Bun 1.3.14) copies bundled native libraries to a
-             new temp file on every load and never deletes them
-             (anomalyco/opencode#42700, #49283). Empty the ODS-owned
-             BUN_TMPDIR on every start, then exec OpenCode itself. -->
-        <string>/bin/sh</string>
-        <string>-c</string>
-        <string>dir="\$1"; shift; rm -rf "\$dir" &amp;&amp; mkdir -p -m 0700 "\$dir" &amp;&amp; export BUN_TMPDIR="\$dir" &amp;&amp; exec "\$@"</string>
-        <string>ods-opencode-web</string>
-        <string>${OPENCODE_BUN_TMPDIR}</string>
-        <string>${OPENCODE_BIN}</string>
-        <string>web</string>
-        <string>--port</string>
-        <string>3003</string>
-        <string>--hostname</string>
-        <string>127.0.0.1</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>${INSTALL_DIR}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>${HOME}</string>
-        <key>PATH</key>
-        <string>${OPENCODE_LAUNCHD_PATH}</string>
-        <key>OPENCODE_ENABLE_EXA</key>
-        <string>1</string>
-        <!-- Preserve inherited OPENCODE_WEBSEARCH_PROVIDER; Exa is the default. -->
-    </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>${HOME}/Library/Logs/ODS/opencode-web.log</string>
-    <key>StandardErrorPath</key>
-    <string>${HOME}/Library/Logs/ODS/opencode-web.log</string>
-</dict>
-</plist>
-PLIST_EOF
-
-        # Unload existing (if any) and load new plist. bootout legitimately
-        # errors when no service is loaded, so we keep that suppressed; the
-        # bootstrap call surfaces real failures (e.g. launchd throttle EIO).
-        launchctl enable "gui/$(id -u)/${OPENCODE_PLIST_LABEL}" || {
-            ai_err "Could not enable the ODS OpenCode login service."
-            exit 1
-        }
-        launchctl bootout "gui/$(id -u)/${OPENCODE_PLIST_LABEL}" >/dev/null 2>&1 || true
-        _opencode_bootstrap_err="$(launchctl bootstrap "gui/$(id -u)" "$OPENCODE_PLIST" 2>&1)" && _opencode_bootstrap_rc=0 || _opencode_bootstrap_rc=$?
-        if [[ $_opencode_bootstrap_rc -eq 0 ]]; then
-            ai_ok "OpenCode Web UI service installed (LaunchAgent, port 3003)"
-        else
-            ai_warn "OpenCode LaunchAgent failed (rc=${_opencode_bootstrap_rc}): ${_opencode_bootstrap_err}"
-            ai_warn "Start manually: ${OPENCODE_BIN} web --port 3003"
-        fi
-    fi
-    fi
+    ods_macos_install_opencode
 fi
 
 # ── ODS Host Agent (extension lifecycle management) ──
 if $DRY_RUN; then
     ai "[DRY RUN] Would install, configure, and verify the authenticated dashboard host-agent path"
 else
-AGENT_PYTHON="$(command -v python3)"
-if [[ -f "${INSTALL_DIR}/bin/ods-host-agent.py" ]] && [[ -n "$AGENT_PYTHON" ]]; then
-    # See opencode-web block above for the xpcproxy sandbox rationale behind
-    # the $HOME-rooted log path.
-    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/ODS"
-    ODS_AGENT_PATH="$(_compute_launchd_path "")"
-    _agent_native_bind="$(read_env_value "$INSTALL_DIR/.env" "ODS_AGENT_BIND")"
-    _agent_native_bind="$(macos_normalize_agent_bind "${_agent_native_bind:-127.0.0.1}")"
-    _agent_probe_host="$(macos_bind_probe_host "$_agent_native_bind")"
-    if ! command -v docker >/dev/null 2>&1; then
-        ai_warn "docker not found on PATH at install time — host agent will fail to start until Docker Desktop is launched and 'docker' resolves on your shell PATH"
-    fi
-    ai "Preparing isolated ODS host-agent Python runtime..."
-    if ! _ensure_macos_agent_python "$AGENT_PYTHON"; then
-        ai_err "Could not prepare host-agent Python dependencies. See $ODS_LOG_FILE."
-        exit 1
-    fi
-    ODS_AGENT_PORT="$(read_env_value "$INSTALL_DIR/.env" "ODS_AGENT_PORT")"
-    ODS_AGENT_PORT="${ODS_AGENT_PORT:-7710}"
-    cat > "$ODS_AGENT_PLIST" <<AGENT_PLIST_EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${ODS_AGENT_PLIST_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${AGENT_PYTHON}</string>
-        <string>${INSTALL_DIR}/bin/ods-host-agent.py</string>
-        <string>--install-dir</string>
-        <string>${INSTALL_DIR}</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>${INSTALL_DIR}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>ODS_HOME</key>
-        <string>${INSTALL_DIR}</string>
-        <key>HOME</key>
-        <string>${HOME}</string>
-        <key>PATH</key>
-        <string>${ODS_AGENT_PATH}</string>
-    </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>${HOME}/Library/Logs/ODS/ods-host-agent.log</string>
-    <key>StandardErrorPath</key>
-    <string>${HOME}/Library/Logs/ODS/ods-host-agent.log</string>
-</dict>
-</plist>
-AGENT_PLIST_EOF
-
-    launchctl bootout "gui/$(id -u)/${ODS_AGENT_PLIST_LABEL}" >/dev/null 2>&1 || true
-    if ! macos_retire_owned_host_agent_listener "$_agent_probe_host" "$ODS_AGENT_PORT" "$INSTALL_DIR"; then
-        ai_err "Port ${ODS_AGENT_PORT} still has a listener that cannot be safely retired as this ODS host agent."
-        exit 1
-    fi
-    _agent_bootstrap_err="$(launchctl bootstrap "gui/$(id -u)" "$ODS_AGENT_PLIST" 2>&1)" && _agent_bootstrap_rc=0 || _agent_bootstrap_rc=$?
-    if [[ $_agent_bootstrap_rc -eq 0 ]]; then
-        # `launchctl bootstrap` can succeed (definition loaded) while launchd
-        # leaves the service in "pended nondemand spawn = speculative" and
-        # never actually launches the process — common right after a
-        # same-session bootout because the throttler hasn't reset yet, and
-        # `RunAtLoad=true` doesn't override the throttle. Force the spawn
-        # with `kickstart`, then poll /health so we don't report success
-        # while the agent is still down. Without this verification the
-        # dashboard-api will hit "Host agent unreachable" on every model and
-        # extension action even though the installer printed [OK].
-        launchctl kickstart -p "gui/$(id -u)/${ODS_AGENT_PLIST_LABEL}" >/dev/null 2>&1 || true
-        _agent_health_ok=false
-        for _agent_health_i in 1 2 3 4 5 6 7 8 9 10; do
-            if curl -fsS --max-time 1 "http://${_agent_probe_host}:${ODS_AGENT_PORT}/health" >/dev/null 2>&1; then
-                _agent_health_ok=true
-                break
-            fi
-            sleep 1
-        done
-        if [[ "$_agent_health_ok" == "true" ]]; then
-            ai_ok "ODS host agent installed (LaunchAgent, port ${ODS_AGENT_PORT})"
-        else
-            ai_warn "ODS host agent loaded but not responding on :${ODS_AGENT_PORT} after 10s."
-            ai_warn "  Log:         tail -F ~/Library/Logs/ODS/ods-host-agent.log"
-            ai_warn "  Force start: launchctl kickstart -p gui/\$(id -u)/${ODS_AGENT_PLIST_LABEL}"
-            ai_warn "  Dashboard model + extension actions will fail until the agent comes up."
-        fi
-    else
-        ai_warn "ODS host agent LaunchAgent failed (rc=${_agent_bootstrap_rc}): ${_agent_bootstrap_err}"
-        if [[ "${_agent_bootstrap_err}" == *"Input/output error"* ]]; then
-            ai_warn "launchd is throttled. Recover with: launchctl bootout gui/\$(id -u)/${ODS_AGENT_PLIST_LABEL}; sleep 10; then re-run this installer"
-        else
-            ai_warn "Start manually: ods agent start"
-        fi
-    fi
-else
-    [[ ! -f "${INSTALL_DIR}/bin/ods-host-agent.py" ]] && ai_warn "Host agent script not found, skipping"
-    [[ -z "$AGENT_PYTHON" ]] && ai_warn "python3 not found, host agent not installed"
-fi
-
-if ! _configure_macos_host_agent_bridge; then
-    exit 1
-fi
-if ! _verify_macos_dashboard_host_agent "$INSTALL_DIR/.env"; then
-    exit 1
-fi
+ods_macos_install_host_agent
 fi
 
 # ============================================================================
@@ -3626,120 +3252,9 @@ if $CLOUD_MODE; then
     fi
 fi
 
-# ── Pre-download the Whisper STT model ──
-# Speaches does NOT auto-download on transcription requests — it returns 404.
-# We must trigger the download explicitly here, verify it completed, and
-# surface a clear recovery command if anything fails.
-if [[ "$ENABLE_VOICE" == "true" ]]; then
-    # Read AUDIO_STT_MODEL from .env (written by env-generator). On macOS the
-    # default is base; user can override by editing .env before reinstalling.
-    STT_MODEL=$(grep -m1 '^AUDIO_STT_MODEL=' "${INSTALL_DIR}/.env" 2>/dev/null \
-                | cut -d= -f2- | tr -d '"' | tr -d '\r' || true)
-    [[ -z "$STT_MODEL" ]] && STT_MODEL="Systran/faster-whisper-base"
-    STT_MODEL_ENCODED="${STT_MODEL//\//%2F}"
-    # macOS reassigns Whisper to 9100 if another service owns port 9000.
-    WHISPER_PORT_RESOLVED="${WHISPER_PORT:-9000}"
-    WHISPER_URL="http://127.0.0.1:${WHISPER_PORT_RESOLVED}"
-    STT_MODEL_URL="${WHISPER_URL}/v1/models/${STT_MODEL_ENCODED}"
-    STT_TRIGGER_TIMEOUT_SECONDS="${ODS_STT_TRIGGER_TIMEOUT_SECONDS:-30}"
-    STT_CACHE_WAIT_SECONDS="${ODS_STT_CACHE_WAIT_SECONDS:-900}"
-    [[ "$STT_TRIGGER_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || STT_TRIGGER_TIMEOUT_SECONDS=30
-    [[ "$STT_CACHE_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] || STT_CACHE_WAIT_SECONDS=900
-    STT_RECOVERY_CMD="curl --max-time ${STT_TRIGGER_TIMEOUT_SECONDS} -X POST ${STT_MODEL_URL}"
+ods_macos_prepare_voice
 
-    _macos_stt_model_cached() {
-        local _url="$1"
-        curl -sf --max-time 10 "$_url" &>/dev/null
-    }
-
-    _trigger_macos_stt_model_download() {
-        local _url="$1"
-        local _rc=0
-
-        # Speaches can keep downloading after the request is accepted. Keep the
-        # client bounded, then use the cache endpoint as the strict source of truth.
-        curl -sS --fail --max-time "${STT_TRIGGER_TIMEOUT_SECONDS}" -X POST "$_url" \
-            >> "$ODS_LOG_FILE" 2>&1 || _rc=$?
-        if [[ "$_rc" -eq 0 || "$_rc" -eq 28 ]]; then
-            return 0
-        fi
-        ai_warn "STT model download trigger returned curl exit ${_rc}; verifying cache before failing."
-        return 1
-    }
-
-    _wait_macos_stt_model_cached() {
-        local _url="$1"
-        local _deadline=$((SECONDS + STT_CACHE_WAIT_SECONDS))
-
-        while (( SECONDS < _deadline )); do
-            if _macos_stt_model_cached "$_url"; then
-                return 0
-            fi
-            sleep 5
-        done
-        _macos_stt_model_cached "$_url"
-    }
-
-    # Step 1: wait briefly for the models API to be ready (max 15s).
-    _stt_api_ready=false
-    for _i in $(seq 1 15); do
-        if curl -sf --max-time 2 "${WHISPER_URL}/v1/models" &>/dev/null; then
-            _stt_api_ready=true
-            break
-        fi
-        sleep 1
-    done
-
-    if ! $_stt_api_ready; then
-        ai_warn "STT models API not ready -- download manually:"
-        echo "    $STT_RECOVERY_CMD"
-    # Step 2: skip if already cached.
-    elif _macos_stt_model_cached "$STT_MODEL_URL"; then
-        ai_ok "STT model already cached (${STT_MODEL})"
-    else
-        # Step 3: POST to trigger download.
-        ai "Downloading STT model (${STT_MODEL})..."
-        _trigger_macos_stt_model_download "$STT_MODEL_URL" || true
-
-        # Step 4: verify the model is actually cached.
-        if _wait_macos_stt_model_cached "$STT_MODEL_URL"; then
-            ai_ok "STT model cached (${STT_MODEL})"
-        else
-            ai_warn "STT model download failed -- run manually:"
-            echo "    $STT_RECOVERY_CMD"
-            echo "    See $ODS_LOG_FILE for details."
-        fi
-    fi
-fi
-
-# ── Auto-configure Perplexica ──
-if $ENABLE_PERPLEXICA; then
-    ai "Configuring Perplexica..."
-    PERPLEXICA_MODEL="${GGUF_FILE:-$LLM_MODEL}"
-    PERPLEXICA_API_KEY="no-key"
-    PERPLEXICA_BASE_URL="${CONTAINER_LLM_URL:-http://host.docker.internal:8080}"
-    _perplexica_switchboard_mode="$(read_env_value "$INSTALL_DIR/.env" "ODS_MODEL_SWITCHBOARD")"
-    if [[ "${_perplexica_switchboard_mode:-enabled}" == "enabled" ]]; then
-        PERPLEXICA_MODEL="ods/current"
-        PERPLEXICA_API_KEY="$(read_env_value "$INSTALL_DIR/.env" "LITELLM_KEY")"
-        PERPLEXICA_BASE_URL="http://litellm:4000"
-    fi
-    $CLOUD_MODE && PERPLEXICA_MODEL="default"
-    if $CLOUD_MODE; then
-        PERPLEXICA_API_KEY="$(read_env_value "$INSTALL_DIR/.env" "LITELLM_KEY")"
-        PERPLEXICA_BASE_URL="http://litellm:4000"
-    fi
-    _perplexica_port="$(read_env_value "$INSTALL_DIR/.env" "PERPLEXICA_PORT")"
-    [[ "$_perplexica_port" =~ ^[0-9]+$ ]] || _perplexica_port="3004"
-    if [[ -z "$PERPLEXICA_API_KEY" ]] \
-       || ! configure_perplexica "$_perplexica_port" "$PERPLEXICA_MODEL" \
-            "$PERPLEXICA_BASE_URL" "$PERPLEXICA_API_KEY"; then
-        ai_err "Perplexica was selected but its authenticated inference route could not be configured and verified."
-        exit 1
-    fi
-    ai_ok "Perplexica configured (model: ${PERPLEXICA_MODEL})"
-    unset PERPLEXICA_API_KEY PERPLEXICA_BASE_URL _perplexica_port _perplexica_switchboard_mode
-fi
+ods_macos_configure_perplexica
 
 # ── Pre-mark setup wizard complete ──
 # The dashboard-api reads ${INSTALL_DIR}/data/config/setup-complete.json
@@ -3780,7 +3295,7 @@ fi
     if $ENABLE_OPENCODE && [[ -x "$OPENCODE_BIN" ]]; then
         printf 'OpenCode (IDE)|http://127.0.0.1:%s||http://localhost:%s\n' "$OPENCODE_PORT" "$OPENCODE_PORT"
     fi
-} | ods_readiness_summary "./ods-macos.sh status" "$ODS_LOG_FILE" "http://localhost:3001"
+} | ods_readiness_summary "./ods-macos.sh status" "$ODS_LOG_FILE" "http://localhost:3001" "Dashboard"
 
 # get-ods.sh --force exports this when the reinstall removed a saved one.
 if [[ "${ODS_REINSTALL_REMOTE_ROUTE_REMOVED:-false}" == "true" ]]; then

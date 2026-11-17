@@ -58,6 +58,8 @@ $LibDir = Join-Path $ScriptDir "lib"
 . (Join-Path $LibDir "native-llama-runtime.ps1")
 . (Join-Path $LibDir "native-llama-legacy.ps1")
 . (Join-Path $LibDir "model-activation.ps1")
+. (Join-Path $LibDir "host-agent-process.ps1")
+. (Join-Path $LibDir "opencode-startup.ps1")
 . (Join-Path $LibDir "install-report.ps1")
 . (Join-Path $LibDir "tier-map.ps1")
 
@@ -70,6 +72,10 @@ $script:NATIVE_LLAMA_TASK_NAME = $script:ODSNativeLlamaLegacyTaskName
 
 # ── Resolve install directory ──
 $InstallDir = $script:ODS_INSTALL_DIR
+# The installed configuration also supplies the dashboard link and login
+# launcher. Do not let an unrelated shell override select a different port.
+$script:OPENCODE_PORT = Get-WindowsODSEnvPort `
+    -EnvMap (Get-WindowsODSEnvMap -InstallDir $InstallDir) -Name 'OPENCODE_PORT' -DefaultPort 3003
 
 # ============================================================================
 # Helpers
@@ -90,17 +96,19 @@ function Test-DockerRunning {
 }
 
 function Test-Install {
-    if (-not (Test-Path $InstallDir)) {
+    param([switch]$SkipDockerCheck)
+
+    if (-not (Test-Path -LiteralPath $InstallDir)) {
         Write-AIError "ODS not found at $InstallDir. Set ODS_HOME or run installer first."
         exit 1
     }
     $baseCompose = Join-Path $InstallDir "docker-compose.base.yml"
     $monoCompose = Join-Path $InstallDir "docker-compose.yml"
-    if (-not (Test-Path $baseCompose) -and -not (Test-Path $monoCompose)) {
+    if (-not (Test-Path -LiteralPath $baseCompose) -and -not (Test-Path -LiteralPath $monoCompose)) {
         Write-AIError "docker-compose.base.yml not found in $InstallDir"
         exit 1
     }
-    if (-not (Test-DockerRunning)) { exit 1 }
+    if (-not $SkipDockerCheck -and -not (Test-DockerRunning)) { exit 1 }
 }
 
 function Write-ODSUtf8NoBomFile {
@@ -148,8 +156,8 @@ function Get-ComposeFlags {
     Ensure-HermesDashboardSessionToken
 
     $flagsFile = Join-Path $InstallDir ".compose-flags"
-    if (Test-Path $flagsFile) {
-        $raw = (Get-Content $flagsFile -Raw).Trim()
+    if (Test-Path -LiteralPath $flagsFile) {
+        $raw = (Get-Content -LiteralPath $flagsFile -Raw).Trim()
         if (($raw -match 'user-extensions') -or (Test-Path -LiteralPath (Join-Path $InstallDir 'data/user-extensions')) -or (Test-Path -LiteralPath (Join-Path $InstallDir '.model-stores.compose.json')) -or
             (Test-Path -LiteralPath (Join-Path $InstallDir 'data/model-stores.json'))) {
             return (Resolve-ODSModelStoreComposeFlags -Flags ($raw -split "\s+"))
@@ -158,8 +166,8 @@ function Get-ComposeFlags {
     }
 
     $launchRecord = Join-Path (Join-Path $InstallDir "logs") "compose-launch.txt"
-    if (Test-Path $launchRecord) {
-        $composeFlagsLine = Get-Content $launchRecord -ErrorAction SilentlyContinue |
+    if (Test-Path -LiteralPath $launchRecord) {
+        $composeFlagsLine = Get-Content -LiteralPath $launchRecord -ErrorAction SilentlyContinue |
             Where-Object { $_ -match "^compose_flags=" } |
             Select-Object -First 1
         if ($composeFlagsLine) {
@@ -183,21 +191,21 @@ function Get-ComposeFlags {
     $nvidia = Join-Path $InstallDir "docker-compose.nvidia.yml"
     $mono = Join-Path $InstallDir "docker-compose.yml"
 
-    if (Test-Path $base) {
+    if (Test-Path -LiteralPath $base) {
         $flags += @("-f", "docker-compose.base.yml")
-        if (Test-Path $nvidia) {
+        if (Test-Path -LiteralPath $nvidia) {
             $flags += @("-f", "docker-compose.nvidia.yml")
         }
-    } elseif (Test-Path $mono) {
+    } elseif (Test-Path -LiteralPath $mono) {
         $flags += @("-f", "docker-compose.yml")
     }
 
     # Add enabled extension compose files
     $extDir = Join-Path (Join-Path $InstallDir "extensions") "services"
-    if (Test-Path $extDir) {
-        Get-ChildItem -Path $extDir -Directory | ForEach-Object {
+    if (Test-Path -LiteralPath $extDir) {
+        Get-ChildItem -LiteralPath $extDir -Directory | ForEach-Object {
             $composePath = Join-Path $_.FullName "compose.yaml"
-            if (Test-Path $composePath) {
+            if (Test-Path -LiteralPath $composePath) {
                 $relPath = $composePath.Substring($InstallDir.Length + 1) -replace "\\", "/"
                 $flags += @("-f", $relPath)
             }
@@ -469,7 +477,7 @@ function Assert-ODSInstallDirSafeForRemoval {
     }
     $envPath = Join-Path $fullPath ".env"
     if (Test-Path -LiteralPath $envPath -PathType Leaf) {
-        $envText = Get-Content -LiteralPath $envPath -Raw -ErrorAction SilentlyContinue
+        $envText = Get-Content -LiteralPath $envPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
         if (
             $envText -match '(?m)^WEBUI_SECRET=' -and
             $envText -match '(?m)^DASHBOARD_API_KEY='
@@ -698,6 +706,7 @@ function Test-ODSUninstallStartupLauncherOwned {
 function Stop-ODSUninstallOwnedHelpers {
     # Shared executable locations, ports and stale PID files cannot identify
     # an installation. Only a helper's executable/script path can do that.
+    Remove-ODSOpenCodeStartupFallback -InstallDir $InstallDir
     $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
     $byId = @{}; $ancestors = @{}
     foreach ($process in $processes) { $byId[[int]$process.ProcessId] = $process }
@@ -1015,8 +1024,17 @@ function Invoke-ODSSttModelDownloadTrigger {
     # bounded so slow Hugging Face transfers do not wedge ods.ps1 or install.
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
     if ($curl) {
-        $curlOutput = & $curl.Source --fail --silent --show-error --max-time 30 -X POST $ModelUrl 2>&1
-        $curlExit = $LASTEXITCODE
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            # PS 5.1 turns redirected native stderr into ErrorRecords. Curl's
+            # timeout diagnostic must reach the exit-28 decision below instead
+            # of terminating repair before it can verify the model cache.
+            $ErrorActionPreference = 'Continue'
+            $curlOutput = & $curl.Source --fail --silent --show-error --max-time 30 -X POST $ModelUrl 2>&1
+            $curlExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
         if ($curlExit -eq 0 -or $curlExit -eq 28) { return $true }
         Write-AIWarn "STT model download trigger returned curl exit $curlExit; verifying cache before failing."
         if ($curlOutput) {
@@ -1158,6 +1176,12 @@ function Test-ODSComposeServicesStarted {
         try {
             $ids = @(& docker compose @ComposeFlags ps --all -q $service 2>$null |
                 Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            # Partial stdout is not a complete inventory when Docker failed.
+            # Keep the bounded retry path rather than certifying startup from
+            # whichever container IDs happened to arrive before the failure.
+            if ($LASTEXITCODE -ne 0) {
+                return $false
+            }
         } catch {
             return $false
         }
@@ -1292,7 +1316,7 @@ function Set-ODSEnvValue {
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $escapedKey = [regex]::Escape($Key)
     $updated = $false
-    foreach ($line in @(Get-Content $envFile)) {
+    foreach ($line in @(Get-Content -LiteralPath $envFile -Encoding UTF8)) {
         if ($line -match "^${escapedKey}=") {
             if (-not $updated) {
                 [void]$lines.Add("${Key}=${Value}")
@@ -1731,7 +1755,9 @@ function Stop-ODSOpenCodeRuntime {
         if ($exe -and $opencodeExe -and $exe.Equals($opencodeExe, [StringComparison]::OrdinalIgnoreCase)) {
             $isODSOpenCode = (
                 $cmd -match '(?i)\bweb\b' -and
-                $cmd -match ('(?i)--port\s+' + [regex]::Escape($opencodePort))
+                # Match the entire port argument, never another server's 30030
+                # when this installation is configured for 3003.
+                $cmd -match ('(?i)--port\s+' + [regex]::Escape($opencodePort) + '(?=\s|$)')
             )
         }
 
@@ -2485,7 +2511,7 @@ function Invoke-ConfigShow {
         return
     }
 
-    Get-Content $envFile | ForEach-Object {
+    Get-Content -LiteralPath $envFile -Encoding UTF8 | ForEach-Object {
         $line = $_.Trim()
         if ($line -match "^#" -or $line -eq "") { return }
         # Redact any key whose NAME contains a sensitive keyword, mirroring the
@@ -2516,20 +2542,34 @@ function Invoke-Chat {
             @{ role = "user"; content = $Message }
         )
     } | ConvertTo-Json -Depth 3
+    # Windows PowerShell 5.1 encodes a [string] -Body as ISO-8859-1, which
+    # replaces non-Latin text with "?". Send explicit UTF-8 bytes instead.
+    $bodyBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($body)
 
     $llmEndpoint = Get-WindowsLocalLlmEndpoint -InstallDir $InstallDir -NativeBackend (Get-NativeInferenceBackend)
+    $headers = @{}
+    if ($llmEndpoint.ContainsKey("ApiKey") -and -not [string]::IsNullOrWhiteSpace([string]$llmEndpoint.ApiKey)) {
+        $headers.Authorization = "Bearer " + [string]$llmEndpoint.ApiKey
+    }
     try {
         $resp = Invoke-RestMethod -Uri $llmEndpoint.ChatCompletionsUrl `
-            -Method POST -Body $body -ContentType "application/json" -TimeoutSec 120
+            -Method POST -Headers $headers -Body $bodyBytes -ContentType "application/json; charset=utf-8" -TimeoutSec 120
 
-        if ($resp.choices -and $resp.choices[0].message) {
-            Write-Host ""
-            Write-Host $resp.choices[0].message.content
-            Write-Host ""
+        if (-not $resp.choices -or -not $resp.choices[0].message -or
+            $resp.choices[0].message.content -isnot [string] -or
+            [string]::IsNullOrWhiteSpace($resp.choices[0].message.content)) {
+            $detail = 'No assistant text in the response'
+            if ($resp.error -and $resp.error.message) { $detail = [string]$resp.error.message }
+            throw $detail
         }
+
+        Write-Host ""
+        Write-Host $resp.choices[0].message.content
+        Write-Host ""
     } catch {
         Write-AIError "Chat request failed: $_"
         Write-AI "Is llama-server running? Try: .\ods.ps1 status"
+        exit 1
     }
 }
 
@@ -2569,8 +2609,10 @@ function Invoke-Update {
 }
 
 function Invoke-Report {
-    Test-Install
-    Push-Location $InstallDir
+    # Support diagnostics include failed Docker probes; an unavailable daemon
+    # must not prevent collecting the bundle needed to diagnose it.
+    Test-Install -SkipDockerCheck
+    Push-Location -LiteralPath $InstallDir
     try {
         $flags = Get-ComposeFlags
         Write-ODSInstallReport -InstallDir $InstallDir -ComposeFlags $flags | Out-Null
@@ -2865,7 +2907,7 @@ function Invoke-Agent {
             if (Test-Path $pidFile) {
                 try {
                     $_oldPid = [int](Get-Content $pidFile -Raw).Trim()
-                    Stop-Process -Id $_oldPid -Force -ErrorAction SilentlyContinue
+                    Stop-ODSHostAgentProcess -ProcessId $_oldPid -AgentScript $agentScript
                 } catch { }
                 Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
             }
@@ -2965,8 +3007,7 @@ WshShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hid
             if (Test-Path $pidFile) {
                 try {
                     $_pid = [int](Get-Content $pidFile -Raw).Trim()
-                    Stop-Process -Id $_pid -Force -ErrorAction SilentlyContinue
-                    Write-AISuccess "Host agent stopped (PID $_pid)"
+                    Stop-ODSHostAgentProcess -ProcessId $_pid -AgentScript $agentScript
                 } catch {
                     Write-AIWarn "Could not stop agent PID: $_"
                 }
@@ -2976,7 +3017,7 @@ WshShell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hid
             }
             foreach ($_listener in @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)) {
                 if ($_listener.OwningProcess -gt 0) {
-                    Stop-Process -Id ([int]$_listener.OwningProcess) -Force -ErrorAction SilentlyContinue
+                    Stop-ODSHostAgentProcess -ProcessId ([int]$_listener.OwningProcess) -AgentScript $agentScript
                 }
             }
         }

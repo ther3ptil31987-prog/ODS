@@ -7,6 +7,11 @@ import './portal-model-selector.css'
 
 export function modelDisplayName(model,compact=false) {
   let value=String(typeof model==='string'?model:model?.name || model?.id || '').trim()
+  // Native engines may advertise an absolute GGUF path as their model name.
+  // Shorten the label only; provider namespaces and request IDs stay intact.
+  if(/\.gguf$/i.test(value) && /^(?:\/(?!\/)|[a-z]:[\\/]|\\\\)/i.test(value)) {
+    value=value.split(/[\\/]/).pop()
+  }
   if(compact && /^extra\./i.test(value)) {
     const family=value.match(/\b([a-z]+[\d.]*-\d+(?:\.\d+)?[bm])\b/i)
     if(family)value=family[1]
@@ -182,7 +187,7 @@ function LoadedModelSelector({activeModel='',runtimeSource,observeCatalog,unavai
           ? <p className="portal-model-notice">Change this model on its external host.</p>
           : <Link className="portal-model-manage" to={remote?'/pixel/settings?section=connections':'/models'}><SlidersHorizontal size={14} aria-hidden="true"/>{remote?'Provider settings':'Manage models'}</Link>}
       </>}
-      <PortalModelRecovery active={open && observeCatalog} refreshKey={`${pending}:${Boolean(activationLoading)}`} onPendingChange={setRecoveryPending} onBusyChange={setRecoveryBusy} onRecovered={()=>{setLocalError('');clearMutationError();void refresh();onSettled?.()}}/>
+      <PortalModelRecovery active={open && observeCatalog} operationActive={pending || Boolean(modelLifecycle?.active)} refreshKey={`${pending}:${Boolean(activationLoading)}`} onPendingChange={setRecoveryPending} onBusyChange={setRecoveryBusy} onRecovered={()=>{setLocalError('');clearMutationError();void refresh();onSettled?.()}}/>
     </section>
   </div>
 }

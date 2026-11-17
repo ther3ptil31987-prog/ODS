@@ -58,6 +58,8 @@ Check ($installDir.Value -eq "/home/o'brien/ods `$(x)" -and $installDir.StringCo
 # Capacity gate: disk first, then virtualization only when WSL is not ready.
 function Get-ODSPortalFreeSystemGB { return $script:free }
 function Test-ODSPortalVirtualization { $script:virtChecked = $true; return $script:virt }
+# Setup loads this from wsl-portal-spark.ps1; these cases are an x64 PC.
+function Test-ODSSparkWindowsArm64 { return $false }
 foreach ($case in @(
     @{ free=39; virt=$true; ready=$false; ok=$false; name='39 GB free is refused before installing WSL' },
     @{ free=20; virt=$true; ready=$true; ok=$true; name='low space only warns when WSL is already installed (rerun)' },
@@ -69,6 +71,54 @@ foreach ($case in @(
     try { Assert-ODSPortalHostCapacity $case.ready } catch { $passed = $false }
     Check ($passed -eq $case.ok) $case.name
 }
+# The virtualization stop names the firmware setting the PC actually has. An
+# Arm PC has no Intel VT-x or AMD SVM setting.
+$x64Virtualization = 'Hardware virtualization is turned off, and WSL2 cannot run without it. Restart into your BIOS/UEFI settings, enable Intel VT-x (Intel Virtualization Technology) or AMD SVM, save, start Windows and rerun this command. Your PC maker''s support site names the exact menu.'
+foreach ($arm64 in @($false, $true)) {
+    $script:free = 80; $script:virt = $false
+    $script:arm64Asked = $false
+    $failure = & {
+        function Test-ODSSparkWindowsArm64 { $script:arm64Asked = $true; return $arm64 }
+        try { Assert-ODSPortalHostCapacity $false; '' } catch { $_.Exception.Message }
+    }
+    if ($arm64) {
+        Check ($failure -match 'firmware \(UEFI\) settings' -and $failure -match 'Turn on virtualization' -and
+            $failure -notmatch 'Intel|AMD|VT-x|SVM' -and $script:arm64Asked) 'on Windows on Arm the virtualization stop names the UEFI firmware setting, not Intel or AMD'
+    } else {
+        Check ($failure -ceq $x64Virtualization) 'on x64 the virtualization stop is unchanged'
+    }
+}
+$script:virt = $true; $script:arm64Asked = $false
+& {
+    function Test-ODSSparkWindowsArm64 { $script:arm64Asked = $true; return $true }
+    Assert-ODSPortalHostCapacity $false
+}
+Check (-not $script:arm64Asked) 'the architecture is read only when setup stops for virtualization'
+
+# The Windows drive under the distribution's virtual disk comes from its WSL
+# registration (BasePath); anything without a drive letter stays unknown.
+function Get-ODSPortalWslRegistrations { return $script:registrations }
+foreach ($case in @(
+    @{ base='C:\Users\Ana Maria\AppData\Local\Packages\CanonicalGroupLimited.Ubuntu24.04LTS_79rhkp1fndgsc\LocalState'; drive='C:'; name='a Store install reports its profile drive' },
+    @{ base='\\?\d:\WSL\Ubuntu-24.04'; drive='D:'; name='a moved distribution with a \\?\ path reports its own drive' },
+    @{ base='\\server\share\wsl'; drive=''; name='a network path names no drive' },
+    @{ base='\\?\UNC\server\share\wsl'; drive=''; name='a long network path names no drive' },
+    @{ base=''; drive=''; name='a registration without BasePath names no drive' })) {
+    # A subkey that is not a distribution (no DistributionName) is skipped.
+    $script:registrations = @(
+        [pscustomobject]@{ Version=2 },
+        [pscustomobject]@{ DistributionName='docker-desktop'; BasePath='E:\Docker\wsl' },
+        [pscustomobject]@{ DistributionName='Ubuntu-24.04'; BasePath=$case.base })
+    Check ((Get-ODSPortalDistroDrive 'ubuntu-24.04') -ceq $case.drive) $case.name
+}
+$script:registrations = @([pscustomobject]@{ DistributionName='Ubuntu'; BasePath='C:\wsl' })
+Check ((Get-ODSPortalDistroDrive 'Ubuntu-24.04') -ceq '') 'an unregistered distribution names no drive'
+$script:registrations = @()
+Check ((Get-ODSPortalDistroDrive 'Ubuntu-24.04') -ceq '') 'no WSL registrations name no drive'
+$script:registrations = @(
+    [pscustomobject]@{ DistributionName='Ubuntu-24.04'; BasePath='C:\wsl' },
+    [pscustomobject]@{ DistributionName='Ubuntu-24.04'; BasePath='D:\wsl' })
+Check ((Get-ODSPortalDistroDrive 'Ubuntu-24.04') -ceq '') 'an ambiguous registration names no drive'
 
 # Docker inside the distro: a bounded wait that stops at the first answer
 # or at the deadline, never beyond it.
@@ -173,6 +223,124 @@ if ($IsLinux) {
         $written = Get-Content -LiteralPath $conf -Raw
         Check ($written -match '(?m)^default=maria$' -and $written -match '(?m)^hostname=pc$' -and $written -match '(?ms)^\[boot\]\s+systemd = true') 'wsl.conf writer adds systemd and keeps existing settings'
     } finally { Remove-Item -LiteralPath $fake -Recurse -Force }
+}
+
+# Discovery uses real files in isolated installation layouts. Registry reads
+# are fixtures; no Docker executable, winget, daemon or WSL is invoked.
+& {
+    $fixture = Join-Path ([IO.Path]::GetTempPath()) ('ods-desktop-discovery-' + [guid]::NewGuid().ToString('N'))
+    $savedEnvironment = @{}
+    foreach ($name in @('LOCALAPPDATA', 'ProgramFiles', 'ProgramW6432')) {
+        $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
+    }
+    $registrations = @{}
+    function Get-ItemProperty([string]$LiteralPath, [string]$ErrorAction) { return $registrations[$LiteralPath] }
+    try {
+        foreach ($case in @('user', 'machine', 'machine64', 'registry-user', 'registry-machine', 'registry-wow', 'quoted-registry', 'stale-registry', 'empty-registry', 'partial-registry', 'none', 'cli-only', 'partial', 'split-installation', 'directory-exe', 'relative-registry', 'drive-relative-registry', 'root-relative-registry', 'remote-registry')) {
+            $caseRoot = Join-Path $fixture $case
+            $env:LOCALAPPDATA = Join-Path $caseRoot 'User [QA]'
+            $env:ProgramFiles = Join-Path $caseRoot 'Program Files'
+            $env:ProgramW6432 = Join-Path $caseRoot 'Program Files 64'
+            $registrations.Clear()
+            $expected = Join-Path $env:LOCALAPPDATA 'Programs/DockerDesktop'
+            if ($case -eq 'machine') { $expected = Join-Path $env:ProgramFiles 'Docker/Docker' }
+            if ($case -eq 'machine64') { $expected = Join-Path $env:ProgramW6432 'Docker/Docker' }
+            $userKey = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop'
+            $machineKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop'
+            $wowKey = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop'
+            if ($case -like 'registry-*') {
+                $expected = Join-Path $caseRoot 'Custom [Docker] Location'
+                $key = switch ($case) { 'registry-user' { $userKey }; 'registry-machine' { $machineKey }; 'registry-wow' { $wowKey } }
+                $registrations[$key] = [pscustomobject]@{ InstallLocation = $expected }
+            }
+            if ($case -eq 'quoted-registry') {
+                # Some uninstall registrations quote the location or keep padding.
+                $expected = Join-Path $caseRoot 'Quoted [Docker] Location'
+                $registrations[$userKey] = [pscustomobject]@{ InstallLocation = ' "' + $expected + '" ' }
+            }
+            if ($case -eq 'stale-registry') { $registrations[$userKey] = [pscustomobject]@{ InstallLocation = (Join-Path $caseRoot 'removed') } }
+            if ($case -eq 'empty-registry') { $registrations[$userKey] = [pscustomobject]@{ DisplayName = 'Docker Desktop' } }
+            if ($case -eq 'partial-registry') {
+                $incomplete = Join-Path $caseRoot 'incomplete'
+                $null = [IO.Directory]::CreateDirectory($incomplete)
+                [IO.File]::WriteAllText((Join-Path $incomplete 'Docker Desktop.exe'), 'fixture - never executed')
+                $registrations[$userKey] = [pscustomobject]@{ InstallLocation = $incomplete }
+            }
+            if ($case -eq 'relative-registry') { $registrations[$userKey] = [pscustomobject]@{ InstallLocation = 'relative-docker' } }
+            if ($case -eq 'drive-relative-registry') { $registrations[$userKey] = [pscustomobject]@{ InstallLocation = 'C:relative-docker' } }
+            if ($case -eq 'root-relative-registry') { $registrations[$userKey] = [pscustomobject]@{ InstallLocation = '\relative-docker' } }
+            if ($case -eq 'remote-registry') { $registrations[$userKey] = [pscustomobject]@{ InstallLocation = '\\uncontacted-server\Docker' } }
+            $invalidRegistration = $case -in @('relative-registry', 'drive-relative-registry', 'root-relative-registry', 'remote-registry')
+            $absent = $case -in @('none', 'cli-only', 'directory-exe') -or $invalidRegistration
+            if ($case -ne 'none' -and -not $invalidRegistration) {
+                $null = [IO.Directory]::CreateDirectory((Join-Path $expected 'resources/bin'))
+                if ($case -eq 'directory-exe') {
+                    $null = [IO.Directory]::CreateDirectory((Join-Path $expected 'Docker Desktop.exe'))
+                } elseif ($case -ne 'cli-only') {
+                    [IO.File]::WriteAllText((Join-Path $expected 'Docker Desktop.exe'), 'fixture - never executed')
+                }
+                if ($case -notin @('partial', 'split-installation')) { [IO.File]::WriteAllText((Join-Path $expected 'resources/bin/docker.exe'), 'fixture - never executed') }
+                if ($case -eq 'split-installation') {
+                    $otherCli = Join-Path $env:ProgramFiles 'Docker/Docker/resources/bin'
+                    $null = [IO.Directory]::CreateDirectory($otherCli)
+                    [IO.File]::WriteAllText((Join-Path $otherCli 'docker.exe'), 'fixture - never executed')
+                }
+            }
+            $failure = ''
+            $desktop = $null
+            try { $desktop = Get-ODSPortalDockerDesktop } catch { $failure = $_.Exception.Message }
+            if ($case -in @('partial', 'split-installation')) {
+                Check ($failure -match 'incomplete.*Docker CLI') 'partial Desktop is reported without a misleading new-install offer'
+            } elseif ($absent) {
+                Check ($failure -eq '' -and -not $desktop.Installed) "$case is not a complete local Docker Desktop installation"
+            } else {
+                Check ($failure -eq '' -and $desktop.Installed) "$case Docker Desktop layout is discovered"
+                Check ($desktop.Exe -ceq (Join-Path $expected 'Docker Desktop.exe') -and $desktop.Cli -ceq (Join-Path $expected 'resources/bin/docker.exe')) "$case GUI and CLI come from the same literal directory"
+            }
+        }
+    } finally {
+        foreach ($name in $savedEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name]) }
+        if (Test-Path -LiteralPath $fixture) {
+            $resolvedFixture = (Resolve-Path -LiteralPath $fixture).ProviderPath
+            if (-not [IO.Path]::GetFullPath($resolvedFixture).Equals([IO.Path]::GetFullPath($fixture), [StringComparison]::OrdinalIgnoreCase)) { throw 'Unexpected discovery fixture path' }
+            Remove-Item -LiteralPath $resolvedFixture -Recurse -Force
+        }
+    }
+}
+
+& {
+    $desktopPresent = $false
+    $wingetCode = 0
+    function Get-ODSPortalDockerDesktop { [pscustomobject]@{ Installed = $desktopPresent; Exe = 'fixture-desktop'; Cli = 'fixture-cli' } }
+    function Get-Command {
+        [pscustomobject]@{ Source = { $global:LASTEXITCODE = $wingetCode; Write-Output 'localized winget output' } }
+    }
+    foreach ($case in @(
+        @{ code=0; present=$true; ok=$true; existing=$false },
+        @{ code=-1978335189; present=$true; ok=$true; existing=$true },
+        @{ code=-1978335189; present=$false; ok=$false; existing=$false },
+        @{ code=0; present=$false; ok=$false; existing=$false },
+        @{ code=-1978335135; present=$true; ok=$true; existing=$true },
+        @{ code=-1978334963; present=$true; ok=$true; existing=$true },
+        @{ code=-1978334962; present=$true; ok=$true; existing=$true },
+        @{ code=-1978334962; present=$false; ok=$false; existing=$false },
+        @{ code=-1978334967; present=$true; ok=$true; existing=$false },
+        @{ code=-1978334967; present=$false; ok=$false; existing=$false },
+        @{ code=-1978334966; present=$true; ok=$false; existing=$false },
+        @{ code=1603; present=$true; ok=$false; existing=$false },
+        @{ code=1603; present=$false; ok=$false; existing=$false })) {
+        $desktopPresent = $case.present; $wingetCode = $case.code
+        $failure = ''; $result = $null
+        try { $result = Install-ODSPortalDockerDesktop } catch { $failure = $_.Exception.Message }
+        Check (($failure -eq '') -eq $case.ok) "winget exit $wingetCode / Desktop $desktopPresent has the correct outcome"
+        if ($case.ok) {
+            Check ($result.AlreadyInstalled -eq $case.existing -and $result.Desktop.Installed) 'only a verified no-update result reuses the existing Desktop'
+        } elseif ($wingetCode -in @(-1978335189, -1978335135, -1978334963, -1978334962)) {
+            Check ($failure -match 'already installed' -and $failure -match 'locate') 'unresolved registered Desktop gets a discovery diagnostic'
+        }
+    }
+    # The final nonzero native exit above is test data, not this suite's result.
+    $global:LASTEXITCODE = 0
 }
 
 Write-Host "Passed $script:checks Windows Portal prerequisite contracts."

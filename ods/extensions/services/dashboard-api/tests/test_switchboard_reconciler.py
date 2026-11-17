@@ -322,6 +322,12 @@ class TestHostAgentWiring:
         probed: list[str] = []
 
         def fake_run(cmd, **_kwargs):
+            if cmd[:2] == ['docker', 'inspect']:
+                assert cmd == ['docker', 'inspect', '--type', 'container', 'ods-llama-server']
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps([{
+                    'Id': 'a' * 64, 'Config': {'Cmd': ['--model', '/models/new-model.gguf']},
+                    'State': {'Status': 'running'},
+                }]), stderr='')
             url = next((str(part) for part in cmd if str(part).startswith("http")), "")
             probed.append(url.rsplit(":8080", 1)[-1])
             if url.endswith("/health"):
@@ -447,7 +453,7 @@ class TestHostAgentWiring:
         monkeypatch.setattr(
             tma._mod,
             "_llama_runtime_props",
-            lambda *_args: (1024 if staged()[-1:] == ["new-model.gguf"] else 2048, ""),
+            lambda *_args: (1024 if staged()[-1:] == ["new-model.gguf"] else 2048, "", None),
         )
         handler = tma._ResponseHandler()
         tma._mod.AgentHandler._do_model_activate(handler, "target-model")
@@ -568,7 +574,7 @@ def _isolation(monkeypatch, tmp_path, request):
     )
     monkeypatch.setattr(tma._mod, "_chat_completion_ready", lambda *_a, **_k: True)
     monkeypatch.setattr(tma._mod, "_runtime_health", lambda _env: "ok")
-    monkeypatch.setattr(tma._mod, "_llama_runtime_props", lambda _env: (65536, ""))
+    monkeypatch.setattr(tma._mod, "_llama_runtime_props", lambda _env: (65536, "", None))
     monkeypatch.setattr(tma._mod, "_container_exists", lambda _c: False)
     monkeypatch.setattr(tma._mod, "_container_running", lambda _c: False)
     monkeypatch.setattr(

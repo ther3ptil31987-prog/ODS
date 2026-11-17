@@ -160,6 +160,77 @@ def test_journal_is_private_and_precedes_begin_without_secrets(controller):
     assert host._pixel_model_recovery_status()['pending'] is False
 
 
+@pytest.mark.parametrize('gateway_applied,resolution',[(False,'rollback'),(True,'rollback'),(True,'recovery')])
+def test_a_refused_apply_stays_uncertain_and_recoverable(controller,monkeypatch,gateway_applied,resolution):
+    # The coordinator can write the target and replace the config before it
+    # refuses (a restart timeout as host-command-failed, runtime-busy from its
+    # hold), and the gateway can load that config later. The journal keeps the
+    # target, so either native state is still provable.
+    _,state,calls,call=controller
+    env={'PIXEL_OPENWEBUI_KEY':'configured'}
+    tx=host._begin_pixel_model_transaction(env)
+    def refuse(operation,request=None,*,config):
+        if operation=='model-apply':
+            calls.append(operation)
+            raise host._PixelModelTransactionRejected('refused',code='host-command-failed')
+        return call(operation,request,config=config)
+    monkeypatch.setattr(host,'_runtime_model_control',refuse)
+    with pytest.raises(host._PixelModelTransactionUncertain):tx.apply(NEW)
+    journal=json.loads(host._pixel_model_journal_path().read_text())
+    assert journal['phase']=='applying' and journal['target']==NEW
+    if gateway_applied:
+        state.update(status='applied',contract=copy.deepcopy(NEW))
+    if resolution=='rollback':
+        # What a caller does after the failure (rollback_and_prove, the remote rebind).
+        tx.verify_held()
+        tx.finish('rollback')
+        assert state['contract']==OLD and state['outcome']=='rollback'
+    else:
+        # An owner's explicit recovery completes the transaction the gateway took.
+        assert host._recover_pixel_model_transaction(env)['outcome']=='commit' and state['contract']==NEW
+    assert not host._pixel_model_recovery_status()['pending']
+
+
+def test_a_transition_busy_apply_is_a_definite_refusal_the_caller_rolls_back(controller,monkeypatch):
+    # Laptop fleet run 2026-11-11: a remote route enabled right after an update met the
+    # controller's post-update transition (409 transition-busy). Treated as uncertain, the
+    # apply left the journal at "applying" while the controller still held the previous
+    # contract, so neither the caller's rollback nor recovery could release Portal.
+    _,state,calls,call=controller
+    env={'PIXEL_OPENWEBUI_KEY':'configured'}
+    tx=host._begin_pixel_model_transaction(env)
+    def busy(operation,request=None,*,config):
+        if operation=='model-apply':
+            calls.append(operation)
+            raise host._PixelModelTransactionRejected('busy',code='transition-busy')
+        return call(operation,request,config=config)
+    monkeypatch.setattr(host,'_runtime_model_control',busy)
+    with pytest.raises(host._PixelModelTransactionRejected) as refused:tx.apply(NEW)
+    assert not isinstance(refused.value,host._PixelModelTransactionUncertain)
+    journal=json.loads(host._pixel_model_journal_path().read_text())
+    assert journal['phase']=='held' and journal['target'] is None and state['contract']==OLD
+    tx.verify_held()
+    tx.finish('rollback')
+    assert state['contract']==OLD and state['outcome']=='rollback'
+    assert not host._pixel_model_recovery_status()['pending']
+    assert calls.count('model-apply')==1
+
+
+def test_a_transition_busy_apply_stays_uncertain_when_status_no_longer_shows_this_hold(controller,monkeypatch):
+    # Only the exact hold proves the refusal changed nothing; another owner's hold does not.
+    _,state,calls,call=controller
+    tx=host._begin_pixel_model_transaction({'PIXEL_OPENWEBUI_KEY':'configured'})
+    def busy_and_reowned(operation,request=None,*,config):
+        if operation=='model-apply':
+            state.update(transactionId='f'*64)
+            raise host._PixelModelTransactionRejected('busy',code='transition-busy')
+        return call(operation,request,config=config)
+    monkeypatch.setattr(host,'_runtime_model_control',busy_and_reowned)
+    with pytest.raises(host._PixelModelTransactionUncertain):tx.apply(NEW)
+    journal=json.loads(host._pixel_model_journal_path().read_text())
+    assert journal['phase']=='applying' and journal['target']==NEW
+
+
 @pytest.mark.parametrize('partial',[False,True])
 def test_begin_409_is_resolved_by_fresh_native_state_not_status_code(controller,monkeypatch,partial):
     _,state,calls,call=controller
@@ -256,6 +327,33 @@ def test_partial_host_mutation_cannot_be_recovered_by_a_generic_reset(controller
     assert state['pending'] and 'model-finish' not in calls
     with pytest.raises(host._PixelModelTransactionUncertain):host._begin_pixel_model_transaction(env)
     assert calls.count('model-begin')==1
+
+
+def test_legacy_macos_promotion_with_held_2b_contract_keeps_recovery_pending(controller, monkeypatch):
+    config, state, calls, _ = controller
+    previous = {'model': 'Qwen3.5-2B-Q4_K_M.gguf', 'contextLength': 65536,
+                'maxTokens': 8192, 'reasoning': False}
+    state['contract'] = previous
+    env = {'PIXEL_OPENWEBUI_KEY': 'configured', 'GPU_BACKEND': 'apple',
+           'GGUF_FILE': 'Qwen3.5-9B-Q4_K_M.gguf', 'LLM_MODEL': 'qwen3.5-9b'}
+    transaction = host._begin_pixel_model_transaction(env)
+    config.write_text('changed by interrupted activation')
+    status = host.INSTALL_DIR / 'data/bootstrap-status.json'
+    status.write_text(json.dumps({'status': 'complete', 'percent': 100,
+                                 'model': env['GGUF_FILE']}))
+    monkeypatch.setattr(host, '_managed_wsl_runtime', lambda _: {'managed': False})
+    monkeypatch.setattr(host, '_wait_for_model_readiness', lambda *a, **k: {
+        'identity': env['GGUF_FILE'], 'contextLength': 65536, 'contextVerified': True})
+    monkeypatch.setattr(host, '_prove_pixel_model_contract', _real_prove_pixel_model_contract)
+    assert not host._prove_pixel_model_contract(env, previous)
+    before = host._pixel_model_journal_path().read_bytes()
+    for explicit_release in (False, True):
+        result = host._recover_pixel_model_transaction(env, release_unverified=explicit_release)
+        assert result['pending'] and result['phase'] == 'held'
+        assert result['releasable'] is False
+    assert transaction.target is None
+    assert host._pixel_model_journal_path().read_bytes() == before
+    assert 'model-apply' not in calls and 'model-finish' not in calls
 
 
 @pytest.mark.parametrize('drift', ['GGUF_FILE=other-model.gguf', 'CTX_SIZE=8192'])
@@ -501,6 +599,82 @@ def test_owner_can_release_a_switch_that_changed_nothing_without_the_live_proof(
     assert result=={'pending':False,'phase':'completed','transactionId':tx.id,'outcome':'rollback'}
     assert calls[len(before):]==['model-status','model-status','model-finish']
     assert state['status']=='completed' and state['contract']==OLD and not host._pixel_model_recovery_status()['pending']
+
+
+def remote_proof(monkeypatch, failure=None):
+    """Exercise the real proof, with only the saved route and transport replaced."""
+    monkeypatch.setattr(host, '_prove_pixel_model_contract', _real_prove_pixel_model_contract)
+    monkeypatch.setattr(host, '_read_remote_provider_route_state_for_update', lambda: {})
+    monkeypatch.setattr(host, '_remote_provider_runtime_contract', lambda _: copy.deepcopy(OLD))
+    probes = []
+    def verify(config, *, model):
+        probes.append(model)
+        if failure is not None:
+            raise failure
+    monkeypatch.setattr(host, '_verify_litellm_route', verify)
+    return probes
+
+
+def test_remote_outage_is_an_unproven_contract_without_exception_detail(monkeypatch, caplog):
+    probes = remote_proof(monkeypatch, RuntimeError('private-provider-detail'))
+    with caplog.at_level('WARNING'):
+        assert _real_prove_pixel_model_contract({}, OLD) is False
+    assert probes == ['ods/current']
+    assert 'the saved remote route did not pass its live completion check' in caplog.text
+    assert 'private-provider-detail' not in caplog.text
+
+
+def test_remote_proof_still_requires_matching_identity_and_live_completion(monkeypatch):
+    probes = remote_proof(monkeypatch)
+    assert _real_prove_pixel_model_contract({}, NEW) is False
+    assert probes == []
+    assert _real_prove_pixel_model_contract({}, OLD) is True
+    assert probes == ['ods/current']
+
+
+def test_remote_proof_does_not_swallow_unexpected_exception_types(monkeypatch):
+    remote_proof(monkeypatch, ValueError('unexpected failure'))
+    with pytest.raises(ValueError, match='unexpected failure'):
+        _real_prove_pixel_model_contract({}, OLD)
+
+
+def test_remote_outage_exposes_eligible_owner_release_without_releasing(controller, monkeypatch):
+    _, state, calls, _ = controller
+    env = {'PIXEL_OPENWEBUI_KEY': 'configured'}
+    tx = host._begin_pixel_model_transaction(env)
+    probes = remote_proof(monkeypatch, RuntimeError('route unavailable'))
+    result = host._recover_pixel_model_transaction(env)
+    assert result == {'pending': True, 'phase': 'held', 'transactionId': tx.id,
+                      'reason': 'model-recovery-proof-required', 'releasable': True}
+    assert probes == ['ods/current'] and 'model-finish' not in calls
+    assert state['pending'] is True
+    # Explicit release already precedes live proof; this fix changes discovery,
+    # not that authority or its unchanged-state checks.
+    result = host._recover_pixel_model_transaction(env, release_unverified=True)
+    assert result == {'pending': False, 'phase': 'completed', 'transactionId': tx.id,
+                      'outcome': 'rollback'}
+    assert probes == ['ods/current']
+    assert calls.count('model-finish') == 1 and state['contract'] == OLD
+
+
+@pytest.mark.parametrize('drift', ['files', 'contract', 'transaction', 'applied'])
+def test_remote_outage_does_not_waive_owner_release_checks(controller, monkeypatch, drift):
+    config, state, calls, _ = controller
+    env = {'PIXEL_OPENWEBUI_KEY': 'configured'}
+    tx = host._begin_pixel_model_transaction(env)
+    if drift == 'files':
+        config.write_text('changed')
+    elif drift == 'contract':
+        state['contract'] = copy.deepcopy(NEW)
+    elif drift == 'transaction':
+        state['transactionId'] = 'd' * 64
+    else:
+        tx.apply(NEW)
+    remote_proof(monkeypatch, RuntimeError('route unavailable'))
+    result = host._recover_pixel_model_transaction(env)
+    assert result['pending'] is True and result['releasable'] is False
+    assert host._recover_pixel_model_transaction(env, release_unverified=True)['pending'] is True
+    assert 'model-finish' not in calls
 
 
 def test_release_without_proof_refuses_a_controller_on_another_contract(controller,monkeypatch):

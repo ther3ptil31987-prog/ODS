@@ -27,7 +27,8 @@ function Get-WindowsODSEnvMap {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $result }
 
     try {
-        Get-Content -LiteralPath $Path -ErrorAction Stop | ForEach-Object {
+        # Windows PowerShell 5.1 decodes BOM-less files as ANSI without -Encoding.
+        Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop | ForEach-Object {
             $line = $_.Trim()
             if ($line -match "^#" -or $line -eq "") { return }
             if ($line -match "^([A-Za-z_][A-Za-z0-9_]*)=(.*)$") {
@@ -247,7 +248,8 @@ function Test-WindowsLlmModelReadiness {
     if (-not [string]::IsNullOrWhiteSpace($GgufFile)) {
         $modelPath = Join-Path (Join-Path (Join-Path $InstallDir "data") "models") $GgufFile
         $result.ModelFile = $modelPath
-        $result.FileExists = Test-Path $modelPath
+        # Test-Path $modelPath treats brackets as wildcards; evaluate -LiteralPath.
+        $result.FileExists = Test-Path -LiteralPath $modelPath -PathType Leaf
     } else {
         # No local GGUF configured (e.g. cloud/managed backend) -> file gate N/A.
         $result.FileExists = $true

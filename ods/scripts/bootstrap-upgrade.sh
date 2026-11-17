@@ -384,6 +384,7 @@ write_status() {
 {
   "status": "$status",
   "model": "$_safe_model",
+  "downloadGeneration": "${BOOTSTRAP_DOWNLOAD_GENERATION:-}",
   "percent": ${percent:-null},
   "bytesDownloaded": $downloaded,
   "bytesTotal": $total,
@@ -396,6 +397,9 @@ STATUSEOF
         rm -f "$_tmp" 2>/dev/null || true
         return 1
     fi
+    chmod 0644 "$_tmp" 2>/dev/null || {
+        log "WARNING: could not set 0644 permissions on $STATUS_FILE temp file"
+    }
     if ! mv "$_tmp" "$STATUS_FILE"; then
         rm -f "$_tmp" 2>/dev/null || true
         return 1
@@ -1492,6 +1496,47 @@ log "Target: $MODELS_DIR/$FULL_GGUF_FILE"
 # ── Phase 1: Download the full model ──
 mkdir -p "$MODELS_DIR"
 acquire_upgrade_lock
+BOOTSTRAP_DOWNLOAD_GENERATION=""
+BOOTSTRAP_DOWNLOAD_CONTROL=""
+# Git Bash uses a Windows Python/process model. Preserve its existing download
+# path until that native cancellation protocol is qualified separately.
+if ! is_windows_bash; then
+    BOOTSTRAP_DOWNLOAD_GENERATION="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')" || fail "Could not identify the download operation."
+    BOOTSTRAP_DOWNLOAD_CONTROL="$(cd "$(dirname "${BASH_SOURCE[0]}")/../extensions/services/dashboard-api" && pwd)/bootstrap_download_control.py"
+    [[ -f "$BOOTSTRAP_DOWNLOAD_CONTROL" && ! -L "$BOOTSTRAP_DOWNLOAD_CONTROL" ]] || fail "Download cancellation helper is unavailable."
+fi
+BOOTSTRAP_DOWNLOAD_REQUEST="$INSTALL_DIR/data/bootstrap-download.cancel.json"
+
+finish_cancelled_download() {
+    stop_download_monitor
+    local bytes=0
+    [[ -f "$_part_path" ]] && bytes="$(file_size "$_part_path")"
+    write_status "cancelled" "$(status_percent "$bytes" "$TOTAL_BYTES")" "$bytes" "$TOTAL_BYTES" 0 "Download cancelled by user; partial file preserved."
+    release_model_lifecycle_lock
+    release_upgrade_lock
+    log "Download cancelled by user; partial file preserved."
+    exit 0
+}
+
+check_download_cancel() {
+    [[ -n "$BOOTSTRAP_DOWNLOAD_GENERATION" ]] || return 0
+    if python3 "$BOOTSTRAP_DOWNLOAD_CONTROL" --request "$BOOTSTRAP_DOWNLOAD_REQUEST" \
+            --generation "$BOOTSTRAP_DOWNLOAD_GENERATION" --check; then
+        finish_cancelled_download
+    fi
+}
+
+download_child() {
+    if [[ -z "$BOOTSTRAP_DOWNLOAD_GENERATION" ]]; then
+        "$@"
+        return $?
+    fi
+    python3 "$BOOTSTRAP_DOWNLOAD_CONTROL" --request "$BOOTSTRAP_DOWNLOAD_REQUEST" \
+        --generation "$BOOTSTRAP_DOWNLOAD_GENERATION" -- "$@"
+    local rc=$?
+    [[ "$rc" != 76 ]] || finish_cancelled_download
+    return "$rc"
+}
 
 # Get total file size for progress calculation
 TOTAL_BYTES=$(get_remote_size "$FULL_GGUF_URL")
@@ -1590,9 +1635,10 @@ if [[ "$_dl_success" != "true" ]]; then
     _download_round=1
     while [[ "$_dl_success" != "true" ]]; do
         for ((_attempt=1; _attempt<=_download_attempts; _attempt++)); do
+            check_download_cancel
             if [[ "$_download_round" -gt 1 || "$_attempt" -gt 1 ]]; then
                 log "Retry attempt $_attempt of $_download_attempts (round $_download_round)..."
-                sleep 5
+                download_child sleep 5
             fi
 
             if [[ -f "$_part_path" && "$TOTAL_BYTES" -gt 0 ]]; then
@@ -1603,6 +1649,7 @@ if [[ "$_dl_success" != "true" ]]; then
                 elif [[ "$_part_bytes" -eq "$TOTAL_BYTES" ]]; then
                     log "Partial file already has the expected size; promoting it for integrity verification."
                     acquire_model_lifecycle_lock || fail "Could not serialize full-model finalization."
+                    check_download_cancel
                     if ! mv "$_part_path" "$_final_path"; then
                         log "Download attempt $_attempt failed while finalizing $_part_path -> $_final_path"
                         release_model_lifecycle_lock
@@ -1615,7 +1662,7 @@ if [[ "$_dl_success" != "true" ]]; then
                 # restart the transfer from byte zero after a long connection reset,
                 # truncating an otherwise good multi-GB .part file.
                 start_download_monitor "$_part_path" "$TOTAL_BYTES"
-                if curl -fSL -C - --connect-timeout "$_download_connect_timeout" \
+                if download_child curl -fSL -C - --connect-timeout "$_download_connect_timeout" \
                         --speed-time "$_download_speed_time" --speed-limit "$_download_speed_limit" \
                         "${_download_curl_http_flags[@]}" \
                         -o "$_part_path" "$FULL_GGUF_URL" 2>&1; then
@@ -1624,6 +1671,7 @@ if [[ "$_dl_success" != "true" ]]; then
                         log "Download attempt $_attempt reported success but produced no partial file: $_part_path"
                     else
                         acquire_model_lifecycle_lock || fail "Could not serialize full-model finalization."
+                        check_download_cancel
                         if ! mv "$_part_path" "$_final_path"; then
                             log "Download attempt $_attempt failed while finalizing $_part_path -> $_final_path"
                             release_model_lifecycle_lock
@@ -1681,7 +1729,7 @@ if [[ "$_dl_success" != "true" ]]; then
         write_status "downloading" "$_download_percent" "$_downloaded_bytes" "$TOTAL_BYTES" 0 \
             "Retrying download in ${_download_retry_backoff_seconds}s; partial file preserved for resume."
         log "Download attempts exhausted after ${_download_elapsed}s; retrying in ${_download_retry_backoff_seconds}s with partial resume."
-        sleep "$_download_retry_backoff_seconds"
+        download_child sleep "$_download_retry_backoff_seconds"
         _download_round=$(( _download_round + 1 ))
     done
 
@@ -1706,6 +1754,35 @@ if [[ -n "$FULL_GGUF_SHA256" ]]; then
     fi
 fi
 
+promote_managed_macos_bootstrap() {
+    [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]] || return 10
+    local helper="$INSTALL_DIR/scripts/macos-bootstrap-promote.py"
+    local python
+    python="$(command -v python3)" || return 1
+    [[ -f "$helper" && ! -L "$helper" ]] || return 1
+    "$python" "$helper" "$INSTALL_DIR" "$FULL_GGUF_FILE" \
+        "$FULL_LLM_MODEL" "$FULL_MAX_CONTEXT"
+}
+
+BOOTSTRAP_GGUF="${BOOTSTRAP_GGUF_FILE:-Qwen3.5-2B-Q4_K_M.gguf}"
+BOOTSTRAP_PATH="$MODELS_DIR/$BOOTSTRAP_GGUF"
+HOT_SWAP_VERIFIED=false
+# The host agent owns the native Pixel and router gates, model configuration,
+# runtime restart, and rollback. Call it before acquiring any of those gates.
+# An ambiguous activation must never fall through to the legacy raw restart.
+if promote_managed_macos_bootstrap; then
+    HOT_SWAP_VERIFIED=true
+    log "Native Pixel and full-model runtime promotion verified."
+else
+    _macos_promotion_result=$?
+    if [[ "$_macos_promotion_result" -ne 10 ]]; then
+        write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 \
+            "Full model downloaded, but protected macOS activation could not be confirmed. Existing model files were kept. Inspect Dashboard Models and recovery state before retrying."
+        fail "Protected macOS model activation could not be confirmed."
+    fi
+fi
+
+if [[ "$HOT_SWAP_VERIFIED" != "true" ]]; then
 # Download bytes stay outside the lifecycle lock. Linux finalization acquires it
 # immediately before publishing the full GGUF filename, then retains it through
 # config promotion, compose verification, and bootstrap cleanup.
@@ -1713,6 +1790,10 @@ acquire_model_lifecycle_lock || fail "Could not serialize background full-model 
 
 _windows_native_llama_swap_applies=false
 _docker_llama_swap_applies=false
+_macos_ubatch_swap_applies=false
+if [[ -f "$INSTALL_DIR/data/.llama-server.pid" && -n "$(read_env_value LLAMA_ARG_UBATCH)" ]]; then
+    _macos_ubatch_swap_applies=true
+fi
 if is_windows_bash; then
     # Windows AMD runs ggml-org llama-server.exe natively (Round F); the
     # installer migrates older runtimes before this script runs.
@@ -1744,7 +1825,7 @@ if [[ "$_windows_native_llama_swap_applies" == "true" || "$_docker_llama_swap_ap
     fi
 fi
 
-if [[ "$_windows_native_llama_swap_applies" == "true" || "$_docker_llama_swap_applies" == "true" ]]; then
+if [[ "$_windows_native_llama_swap_applies" == "true" || "$_docker_llama_swap_applies" == "true" || "$_macos_ubatch_swap_applies" == "true" ]]; then
     log "Snapshotting active model config before full-model swap..."
     if ! snapshot_active_model_config; then
         discard_active_model_config_snapshot
@@ -1753,6 +1834,11 @@ if [[ "$_windows_native_llama_swap_applies" == "true" || "$_docker_llama_swap_ap
         exit 1
     fi
 fi
+
+# Retain the legacy native model before promotion rewrites GGUF_FILE. Process
+# listings join argv without quoting, so they cannot preserve model paths with
+# spaces. This capture also works when no Docker config snapshot was needed.
+MACOS_LEGACY_PREVIOUS_GGUF="$(read_env_value GGUF_FILE)"
 
 # ── Phase 3: Update .env ──
 BOOTSTRAP_PIXEL_CONFIG_MUTATED=true
@@ -1774,10 +1860,6 @@ load-on-startup = true
 n-ctx = ${FULL_MAX_CONTEXT}
 EOF
 log "models.ini updated"
-
-BOOTSTRAP_GGUF="${BOOTSTRAP_GGUF_FILE:-Qwen3.5-2B-Q4_K_M.gguf}"
-BOOTSTRAP_PATH="$MODELS_DIR/$BOOTSTRAP_GGUF"
-HOT_SWAP_VERIFIED=false
 
 # ── Phase 5: Hot-swap llama-server (if running) ──
 # Read OLLAMA_PORT from .env (nohup doesn't inherit env vars from parent)
@@ -2195,6 +2277,10 @@ elif [[ -f "$INSTALL_DIR/data/.llama-server.pid" ]]; then
             # from consuming the entire token budget on internal reasoning)
             _reasoning=$(grep '^LLAMA_REASONING=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 || echo "")
             [[ -z "$_reasoning" ]] && _reasoning="off"
+            # Normalize mode names before deriving both launch and rollback
+            # arguments; custom reasoning-format names retain their spelling.
+            _reasoning_lower="$(printf '%s' "$_reasoning" | tr '[:upper:]' '[:lower:]')"
+            case "$_reasoning_lower" in off|on|auto) _reasoning="$_reasoning_lower" ;; esac
             case "$_reasoning" in
                 off)  _reasoning_fmt="none" ;;
                 on)   _reasoning_fmt="deepseek" ;;
@@ -2208,6 +2294,8 @@ elif [[ -f "$INSTALL_DIR/data/.llama-server.pid" ]]; then
             # model is stopped. A rejected setting must not strand the swap.
             _llama_tuning_args=(--reasoning-format "$_reasoning_fmt")
             _tuning_helper="$INSTALL_DIR/installers/macos/lib/native-checkpoint-args.py"
+            _explicit_ubatch="$(read_env_value LLAMA_ARG_UBATCH)"
+            _tuning_qualified=false
             if [[ -f "$_tuning_helper" ]] && _tuning_file="$(mktemp)"; then
                 if "${ODS_PYTHON_CMD:-python3}" "$_tuning_helper" --binary "$LLAMA_SERVER_BIN" \
                     --interval="$(read_env_value LLAMA_ARG_CHECKPOINT_EVERY_NT)" \
@@ -2215,6 +2303,7 @@ elif [[ -f "$INSTALL_DIR/data/.llama-server.pid" ]]; then
                     --cache-mib="$(read_env_value LLAMA_ARG_CACHE_RAM)" \
                     --idle-seconds="$(read_env_value LLAMA_ARG_SLEEP_IDLE_SECONDS)" \
                     --min-spacing="$(read_env_value LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT)" \
+                    --ubatch="$_explicit_ubatch" \
                     --explicit-spec-type="$(read_env_value LLAMA_ARG_SPEC_TYPE)" \
                     --spec-default="$(read_env_value LLAMA_SPEC_TYPE)" \
                     --draft-n-max="$(read_env_value LLAMA_ARG_SPEC_DRAFT_N_MAX)" \
@@ -2222,36 +2311,38 @@ elif [[ -f "$INSTALL_DIR/data/.llama-server.pid" ]]; then
                     --draft-type-v="$(read_env_value LLAMA_ARG_SPEC_DRAFT_TYPE_V)" \
                     --reasoning-mode="$_reasoning" --reasoning-format-fallback="$_reasoning_fmt" \
                     --apply-defaults > "$_tuning_file"; then
+                    _tuning_qualified=true
                     _llama_tuning_args=()
                     while IFS= read -r -d '' _tuning_field; do
                         _llama_tuning_args+=("$_tuning_field")
                     done < "$_tuning_file"
                 else
-                    log "WARNING: native llama-server tuning was rejected for this runtime; starting the full model without it. Fix .env, then run './ods-macos.sh restart'."
+                    if [[ -z "$_explicit_ubatch" ]]; then
+                        log "WARNING: native llama-server tuning was rejected for this runtime; starting the full model without it. Fix .env, then run './ods-macos.sh restart'."
+                    fi
                 fi
                 rm -f "$_tuning_file"
             fi
 
-            # Capture old model path for rollback before we kill the process
-            _old_pid=$(cat "$LLAMA_SERVER_PID_FILE" 2>/dev/null | tr -d '[:space:]')
-            _old_model_path=""
-            if [[ -n "$_old_pid" ]] && kill -0 "$_old_pid" 2>/dev/null; then
-                _old_model_path=$(ps -p "$_old_pid" -o args= 2>/dev/null | grep -oE '\-\-model [^ ]+' | awk '{print $2}') || true
+            # Explicit microbatch tuning must never silently disappear. The
+            # snapshot also covers legacy native installs without Docker.
+            if [[ -n "$_explicit_ubatch" && "$_tuning_qualified" != true ]]; then
+                _restore_detail="Previous active model config restored."
+                if ! restore_active_model_config; then
+                    _restore_detail="Active model config restoration failed; repair .env before retrying."
+                fi
+                write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 \
+                    "Native microbatch tuning could not be qualified. The running model was not stopped. $_restore_detail"
+                exit 1
             fi
 
-            # Stop existing native llama-server
-            if [[ -n "$_old_pid" ]] && kill -0 "$_old_pid" 2>/dev/null; then
-                # Verify it's actually llama-server (PID could have been reused)
-                if ps -p "$_old_pid" -o comm= 2>/dev/null | grep -q llama; then
-                    log "Stopping native llama-server (PID $_old_pid)..."
-                    kill "$_old_pid" 2>/dev/null || true
-                    sleep 2
-                    if kill -0 "$_old_pid" 2>/dev/null; then
-                        kill -9 "$_old_pid" 2>/dev/null || true
-                    fi
-                else
-                    log "PID $_old_pid is no longer llama-server, skipping kill"
-                fi
+            # Capture old model path for rollback before we stop the service.
+            # MACOS_LEGACY_PREVIOUS_GGUF is the pre-promotion verified snapshot;
+            # it is authoritative for rollback and must not be inferred from
+            # process argv or gated on a possibly-stale PID file.
+            _old_model_path=""
+            if [[ -n "${MACOS_LEGACY_PREVIOUS_GGUF:-}" ]]; then
+                _old_model_path="$MODELS_DIR/$MACOS_LEGACY_PREVIOUS_GGUF"
             fi
 
             # The dashboard's LAN binding must not expose native inference.
@@ -2279,50 +2370,80 @@ elif [[ -f "$INSTALL_DIR/data/.llama-server.pid" ]]; then
             [[ -n "$_spec_type" ]] && _llama_args+=(--spec-type "$_spec_type")
             _llama_args+=(${_llama_tuning_args[@]+"${_llama_tuning_args[@]}"})
 
-            # Relaunch with new model
+            # Relaunch with new model. The helper stops any install-owned
+            # engine before starting, so no separate pre-stop is needed here.
             log "Starting native llama-server with ${_gguf_file}..."
-            bash "$INSTALL_DIR/installers/macos/lib/native-llama-service.sh" start \
-                "$INSTALL_DIR" "$LLAMA_SERVER_BIN" "$LLAMA_SERVER_PID_FILE" "${_llama_args[@]}"
-            _new_pid="$(cat "$LLAMA_SERVER_PID_FILE")"
+            _start_ok=false
+            if bash "$INSTALL_DIR/installers/macos/lib/native-llama-service.sh" start \
+                    "$INSTALL_DIR" "$LLAMA_SERVER_BIN" "$LLAMA_SERVER_PID_FILE" "${_llama_args[@]}"; then
+                _start_ok=true
+            fi
+            _new_pid=""
+            if [[ -f "$LLAMA_SERVER_PID_FILE" ]]; then
+                _new_pid="$(cat "$LLAMA_SERVER_PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+            fi
 
-            # Wait for health
-            log "Waiting for native llama-server health..."
             _healthy=false
-            for _i in $(seq 1 60); do
-                if curl -sf --max-time 5 "http://127.0.0.1:${_native_port}/health" &>/dev/null; then
-                    _healthy=true
-                    break
-                fi
-                sleep 5
-            done
+            if $_start_ok; then
+                log "Waiting for native llama-server health..."
+                for _i in $(seq 1 60); do
+                    if curl -sf --max-time 5 "http://127.0.0.1:${_native_port}/health" &>/dev/null; then
+                        _healthy=true
+                        break
+                    fi
+                    sleep 5
+                done
+            else
+                log "WARNING: native-llama-service.sh start returned non-zero."
+            fi
 
             if $_healthy; then
-                log "SUCCESS: Native llama-server running with ${_gguf_file} (PID $_new_pid)"
+                log "SUCCESS: Native llama-server running with ${_gguf_file} (PID ${_new_pid:-unknown})"
                 HOT_SWAP_VERIFIED=true
             else
                 log "WARNING: New model failed to load. Attempting rollback..."
-                kill "$_new_pid" 2>/dev/null || true
-                sleep 2
-                if kill -0 "$_new_pid" 2>/dev/null; then
-                    kill -9 "$_new_pid" 2>/dev/null || true
+                _cleanup_ok=false
+                if bash "$INSTALL_DIR/installers/macos/lib/native-llama-service.sh" stop \
+                        "$INSTALL_DIR" "$LLAMA_SERVER_BIN" "$LLAMA_SERVER_PID_FILE"; then
+                    _cleanup_ok=true
+                else
+                    log "ERROR: native-llama-service.sh stop failed; refusing to start rollback."
                 fi
+
+                if ! $_cleanup_ok; then
+                    write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 \
+                        "Full model downloaded and verified, but native macOS llama-server failed to load it and cleanup failed. Run './ods-macos.sh restart' to recover."
+                    exit 1
+                fi
+
                 if [[ -n "${_old_model_path:-}" && -f "$_old_model_path" ]]; then
-                    bash "$INSTALL_DIR/installers/macos/lib/native-llama-service.sh" start \
+                    _rollback_ok=false
+                    if bash "$INSTALL_DIR/installers/macos/lib/native-llama-service.sh" start \
                             "$INSTALL_DIR" "$LLAMA_SERVER_BIN" "$LLAMA_SERVER_PID_FILE" \
                             --host "$_bind" --port "$_native_port" \
                             --model "$_old_model_path" \
                             --ctx-size "$_ctx_size" \
                             --n-gpu-layers "$_gpu_layers" \
                             --reasoning-format "${_reasoning_fmt:-none}" \
-                            --metrics
-                    _rollback_pid="$(cat "$LLAMA_SERVER_PID_FILE")"
-                    log "Rolled back to previous model: $(basename "$_old_model_path") (PID $_rollback_pid)"
+                            --metrics; then
+                        _rollback_ok=true
+                    fi
+                    if $_rollback_ok; then
+                        _rollback_pid=""
+                        if [[ -f "$LLAMA_SERVER_PID_FILE" ]]; then
+                            _rollback_pid="$(cat "$LLAMA_SERVER_PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+                        fi
+                        log "Restart requested for previous model: $(basename "$_old_model_path") (PID ${_rollback_pid:-unknown})"
+                    else
+                        log "ERROR: Rollback start failed for previous model: $(basename "$_old_model_path")"
+                        log "Run './ods-macos.sh restart' to manually recover."
+                    fi
                 else
                     log "WARNING: Could not rollback — previous model not found."
                     log "Run './ods-macos.sh restart' to manually recover."
                 fi
                 write_status "failed" 100 "$TOTAL_BYTES" "$TOTAL_BYTES" 0 \
-                    "Full model downloaded and verified, but native macOS llama-server did not load it after swap. Bootstrap model kept; run './ods-macos.sh restart' or re-run to retry."
+                    "Full model downloaded and verified, but native macOS llama-server did not load it after swap. Previous model file retained; run './ods-macos.sh restart' or re-run to retry."
                 exit 1
             fi
         fi
@@ -2331,6 +2452,8 @@ else
     log "Docker services not running. Config updated — full model will load on next start."
     discard_active_model_config_snapshot
 fi
+
+fi # Legacy promotion for Linux, Windows, and macOS without native Pixel.
 
 # ── Phase 5b: Remove bootstrap model only after verified full-model serving ──
 # Keep the bootstrap as the recovery path unless the new model has answered a

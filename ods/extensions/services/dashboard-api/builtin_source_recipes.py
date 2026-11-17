@@ -32,10 +32,10 @@ _RECIPES = {
 #     python3 scripts/pin-builtin-build-contexts.py --write
 # (service: (folder, image, dockerfile, digest))
 _CONTEXT_BUILDS = {
-    "ape": ("ape", None, "Dockerfile", "088871f355fb73f2ca036eeb5e1f22cf3bb7882f7be87ee70b190c87886386cd"),
-    "brave-search": ("brave-search", "ods-brave-search:local", "Dockerfile", "6f785938be3c27b7dacb45028e7ce9a2a14b313dc4d53d8b745f078fa9075e90"),
-    "privacy-shield": ("privacy-shield", None, "Dockerfile", "1a176804603adcea6ee4d9dc505441c5dc8bb8ac2b1475746489388a50bac001"),
-    "token-spy": ("token-spy", None, "Dockerfile", "6af1b5694bbde7894592fb9eac55b988ac46cc3afe85e5240a4f5b056ec575ea"),
+    "ape": ("ape", None, "Dockerfile", "ffa14f37d9bca3fc9aa35582b5f3a4b9adaa1e75222a9c29dc9d55d9cfa49805"),
+    "brave-search": ("brave-search", "ods-brave-search:local", "Dockerfile", "f1be25450cae210788c29d02dc497ff64f3fe7f9184cc73332c08a734e709e95"),
+    "privacy-shield": ("privacy-shield", None, "Dockerfile", "deb8da4c40e7eac01c2576c33bd11f0df21c2332bf929bc6ba0272669ffa64b8"),
+    "token-spy": ("token-spy", None, "Dockerfile", "98e93c93cdff9ff63bed7569a8dec9e45171c59e60516878e097a43274277eff"),
 }
 _MAX_CONTEXT_FILE_BYTES = 8 * 1024 * 1024
 _MAX_CONTEXT_FILES = 512

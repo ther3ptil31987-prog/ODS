@@ -12,7 +12,9 @@
 #           ENABLE_VOICE, ENABLE_WORKFLOWS, ENABLE_RAG, ENABLE_HERMES,
 #           GPU_ASSIGNMENT_JSON, COMFYUI_GPU_UUID, WHISPER_GPU_UUID,
 #           EMBEDDINGS_GPU_UUID, LLAMA_SERVER_GPU_UUIDS, LLAMA_ARG_SPLIT_MODE,
-#           LLAMA_ARG_TENSOR_SPLIT,
+#           LLAMA_ARG_TENSOR_SPLIT, GPU_COMPUTE_CAP (optional),
+#           LLM_BACKEND (phase 02; with vllm also VLLM_IMAGE, VLLM_MODEL_DIR,
+#           VLLM_SERVED_MODEL, VLLM_ARGS, VLLM_GPU_UUID),
 #           chapter(), ai(), ai_ok(), ai_warn(), log(), warn(), error()
 # Provides: WEBUI_SECRET, N8N_PASS, LITELLM_KEY, LIVEKIT_SECRET,
 #           DASHBOARD_API_KEY, SHIELD_API_KEY, TOKEN_SPY_API_KEY,
@@ -31,6 +33,8 @@ declare -F ods_native_llm_normalize_origin >/dev/null 2>&1 \
     || source "$SCRIPT_DIR/installers/lib/native-llm.sh"
 declare -F ods_amd_target_is_cdna >/dev/null 2>&1 \
     || source "$SCRIPT_DIR/installers/lib/amd-runtime.sh"
+declare -F ods_llama_image_for_compute_cap >/dev/null 2>&1 \
+    || source "$SCRIPT_DIR/installers/lib/tier-map.sh"
 
 ods_progress 38 "directories" "Preparing installation directory"
 chapter "SETTING UP INSTALLATION"
@@ -107,7 +111,10 @@ _phase06_pixel_runtime_layout() {
     docker_endpoint="$(timeout 10s "${docker_command[@]}" context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)" || return 1
     [[ "$docker_endpoint" == unix:///* ]] || return 1
     docker_os="$(timeout 10s "${docker_command[@]}" info --format '{{.OperatingSystem}}' 2>/dev/null)" || return 1
-    [[ "$docker_os" == "Docker Desktop" ]] || return 0
+    case "$docker_os" in
+        'Docker Desktop'|'Docker Desktop (containerized)') ;;
+        *) return 0 ;;
+    esac
     [[ -d "$wsl_mount" && "$(findmnt -n -o PROPAGATION -T "$wsl_mount")" == shared ]] || return 1
     # Use this distro's path. Docker Desktop's WSL proxy translates bind
     # sources from the calling distro; the daemon's own name for this tmpfs
@@ -138,11 +145,22 @@ else
     source "$SCRIPT_DIR/installers/lib/llama-memory-budget.sh"
     # shellcheck source=../lib/searxng-locale.sh
     source "$SCRIPT_DIR/installers/lib/searxng-locale.sh"
+    # Validate before any directory repair, including in-place installs.
+    # shellcheck source=../lib/source-copy.sh
+    source "$SCRIPT_DIR/installers/lib/source-copy.sh"
+    ods_validate_searxng_settings_path "$INSTALL_DIR" || return 1
 
     # shellcheck source=../../lib/dotenv-quote.sh
     source "$SCRIPT_DIR/lib/dotenv-quote.sh"
     # shellcheck source=../../lib/safe-env.sh
     source "$SCRIPT_DIR/lib/safe-env.sh"
+
+    # Pixel validates the install root before inspecting its source journal.
+    # Normalize only verified owner-private provider paths before that check;
+    # waiting until source copy makes legacy 0775 roots fail too early.
+    if [[ "$SCRIPT_DIR" != "$INSTALL_DIR" ]]; then
+        ods_prepare_retained_cloud_provider "$INSTALL_DIR" || return 1
+    fi
 
     # Older Pixel source updates (bin/pixel_source_upgrade.py, run as root) set
     # only the owner of the files and folders they wrote, so those kept root's
@@ -188,7 +206,10 @@ else
         local key="$1" default="${2:-}"
         if [[ -n "$_env_existing" ]]; then
             local val
-            val=$(grep -m1 "^${key}=" "$_env_existing" 2>/dev/null | cut -d= -f2- || true)
+            # The last KEY= line, as Compose and the other ODS readers use: an
+            # owner who appended a key (FAQ: "Add OPENAI_API_KEY ... to .env")
+            # below the installer's empty line keeps it across the rerun.
+            val=$(awk -v key="$key" 'index($0, key "=") == 1 { value = substr($0, length(key) + 2) } END { printf "%s", value }' "$_env_existing" 2>/dev/null || true)
             val="$(safe_env_decode_value "$val")"
             if [[ -n "$val" ]]; then
                 printf '%s\n' "$val"
@@ -382,6 +403,12 @@ else
     _phase06_prune_ready=true
     if [[ "${ENABLE_PIXEL_RUNTIME:-false}" == "true" \
         && ( -e "$_phase06_pixel_marker" || -L "$_phase06_pixel_marker" ) ]]; then
+        # Fail before source restoration, pruning or staging. Rootless fallback
+        # is supported for optional extras, not an existing Pixel deployment.
+        if [[ ${EUID:-$(id -u)} -ne 0 && "${ODS_SUDO_AVAILABLE:-true}" == false ]]; then
+            error "source-upgrade-sudo-required: Updating the existing Pixel installation requires sudo. Preserve the installation and any pending upgrade state."
+            return 1
+        fi
         _phase06_pixel_owner="$(ods_pixel_install_owner)" || {
             error "Could not identify the ODS owner for a Pixel source transition."
             return 1
@@ -390,13 +417,17 @@ else
             error "Could not resolve the ODS owner home for a Pixel source transition."
             return 1
         }
-        # A failed source-update step prints its own reason (fixed text, never
-        # paths) above; name the step too, so the install never stops without
-        # a cause (fleet: a laptop stopped in phase 06 with none).
+        # Name the failed step even if the child was interrupted before it
+        # could emit a diagnostic. Do not promise a reason was printed.
         _phase06_source_failed() {
-            error "The Pixel source update stopped at its '$1' step; the reason is printed above."
+            error "The Pixel source update stopped at its '$1' step. Preserve the installation and any pending upgrade state."
             return 1
         }
+        if ! _ods_pixel_start_stopped_access_service \
+            "$_phase06_pixel_owner" "$_phase06_pixel_home" "$_phase06_requested_pixel_ref"; then
+            error "The Pixel access coordinator is stopped and did not start. See journalctl -u ods-pixel-access.service; the installation and any pending upgrade state were left intact."
+            return 1
+        fi
         _ods_pixel_source_transition_required \
             "$_phase06_pixel_owner" "$_phase06_pixel_home" "$_phase06_requested_pixel_ref" "$SCRIPT_DIR" \
             || _phase06_pixel_source_transition=$?
@@ -410,9 +441,9 @@ else
                 _phase06_pixel_source_transition=0
                 # The pending plan is bound to the tree it recorded. Keep the
                 # retired service files: `stage` below either resumes this
-                # release's own plan, which pruned them before staging, or
-                # refuses an older plan so the release that staged it can
-                # still finish or roll it back.
+                # release's own plan, or archives an older untouched unheld
+                # plan after verifying its exact baseline. Held plans retain
+                # their source so that release can finish or roll them back.
                 _phase06_prune_ready=false
             fi
             unset _phase06_source_status
@@ -457,7 +488,10 @@ else
                 unset _phase06_source_status
                 ODS_PIXEL_SOURCE_TRANSACTION="$(_ods_pixel_source_upgrade hold "$_phase06_pixel_owner")" \
                     || _phase06_source_failed hold || return 1
-                [[ "$ODS_PIXEL_SOURCE_TRANSACTION" =~ ^[a-f0-9]{64}$ ]] || _phase06_source_failed hold || return 1
+                if [[ ! "$ODS_PIXEL_SOURCE_TRANSACTION" =~ ^[a-f0-9]{64}$ ]]; then
+                    error "source-hold-response-invalid: The Pixel source hold did not return a valid transaction identifier. Preserve any existing admission hold and upgrade state; no source copy was started."
+                    return 1
+                fi
                 export ODS_PIXEL_SOURCE_TRANSACTION
                 _ods_pixel_source_upgrade copy "$_phase06_pixel_owner" || _phase06_source_failed copy || return 1
                 # Everything after this boundary can update Compose/env/data
@@ -532,6 +566,17 @@ else
     ods_progress 38 "directories" "Creating directory structure"
     mkdir -p "$INSTALL_DIR"/{config,data,models}
     mkdir -p "$INSTALL_DIR"/data/{open-webui,whisper,tts,n8n,qdrant,models,privacy-shield,ape,token-spy,hermes,persona}
+    # llama-server's CUDA kernel cache (docker-compose.nvidia.yml).
+    mkdir -p "$INSTALL_DIR"/data/llama-server/cuda-cache
+    # The vLLM engine's compile, autotune and CUDA kernel caches
+    # (docker-compose.vllm.yml), made here so Docker does not create it.
+    if [[ "${LLM_BACKEND:-}" == "vllm" ]]; then
+        mkdir -p "$INSTALL_DIR"/data/vllm/cache
+    fi
+    # The host agent writes extension progress as the install owner. Created
+    # here, the Dashboard API (UID 1000, which may be another user) cannot
+    # make it first and lock the owner's host agent out of it.
+    mkdir -p "$INSTALL_DIR"/data/extension-progress
     mkdir -p "$INSTALL_DIR"/data/hermes-proxy/{caddy-data,caddy-config}
     mkdir -p "$INSTALL_DIR"/data/langfuse/{postgres,clickhouse,redis,minio}
     mkdir -p "$INSTALL_DIR"/data/remote-provider/secrets
@@ -619,8 +664,9 @@ else
     if ! $_phase06_rootless; then
         for _data_dir in "$INSTALL_DIR"/data/*/; do
             [[ "${ENABLE_HERMES:-false}" == "true" && "$_data_dir" == "$INSTALL_DIR/data/hermes/" ]] && continue
-            # Private retained chat results belong to Dashboard UID 1000.
+            # Private chat results and image history belong to Dashboard UID 1000.
             [[ "$_data_dir" == "$INSTALL_DIR/data/pixel-chat-results/" ]] && continue
+            [[ "$_data_dir" == "$INSTALL_DIR/data/pixel-images/" ]] && continue
             # Token Spy's persistent directory intentionally belongs to its
             # container UID 1000; phase 06 verifies that identity below.
             [[ "$_data_dir" == "$INSTALL_DIR/data/token-spy/" ]] && continue
@@ -648,6 +694,7 @@ else
             for _d in "$INSTALL_DIR/$_root"/*/; do
                 [[ "${ENABLE_HERMES:-false}" == "true" && "$_d" == "$INSTALL_DIR/data/hermes/" ]] && continue
                 [[ "$_d" == "$INSTALL_DIR/data/pixel-chat-results/" ]] && continue
+                [[ "$_d" == "$INSTALL_DIR/data/pixel-images/" ]] && continue
                 [[ "$_d" == "$INSTALL_DIR/data/token-spy/" ]] && continue
                 [[ "$_d" == "$INSTALL_DIR/data/ape/" ]] && continue
                 [[ -d "$_d" ]] && ! [[ -w "$_d" ]] && _cant_write="$_cant_write ${_d#"$INSTALL_DIR"/}"
@@ -686,7 +733,7 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
     fi
 
     if declare -F _ods_apply_deferred_feature_state >/dev/null; then
-        _ods_apply_deferred_feature_state || {
+        _ods_apply_deferred_feature_state "$_phase06_requested_pixel_ref" || {
             error "Deferred feature reconciliation failed; resume the same installer candidate."
             return 1
         }
@@ -718,6 +765,23 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
     [[ -d "$INSTALL_DIR" && ! -L "$INSTALL_DIR" ]] || error "Unsafe installed root"
     chmod go-w "$INSTALL_DIR" || error "Could not secure installed root"
     unset _installed_code_root
+
+    # Dashboard runs as a different UID and reads these public bind-mounted
+    # manifests. Keep .env, service-private files and runtime data private.
+    _phase06_step "prepare-extension-manifests"
+    _phase06_manifest_args=()
+    if [[ -n "${ODS_PIXEL_SOURCE_TRANSACTION:-}" ]]; then
+        # Pixel installed candidate file modes from its staged inventory.
+        # Preserve those and retained custom files while preparing traversal.
+        _phase06_manifest_args+=(--preserve-file-modes)
+    fi
+    if ! python3 "$INSTALL_DIR/scripts/prepare-extension-manifests.py" "$INSTALL_DIR" \
+        "${_phase06_manifest_args[@]}" \
+        >> "$LOG_FILE" 2>&1; then
+        error "Could not prepare public service manifests for the Dashboard API. See $LOG_FILE for details."
+        return 1
+    fi
+    unset _phase06_manifest_args
 
     # Source staging under umask 077 makes the two public policy bind mounts
     # unreadable to APE and remote-provider-egress, which run as non-root.
@@ -877,13 +941,43 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
     _env_get_preserve_empty() {
         local key="$1" default="${2:-}" val
         if [[ -n "$_env_existing" ]] && grep -q -m1 "^${key}=" "$_env_existing" 2>/dev/null; then
-            val=$(grep -m1 "^${key}=" "$_env_existing" 2>/dev/null | cut -d= -f2- || true)
+            # The last assignment, as in _env_get.
+            val=$(awk -v key="$key" 'index($0, key "=") == 1 { value = substr($0, length(key) + 2) } END { printf "%s", value }' "$_env_existing" 2>/dev/null || true)
             safe_env_decode_value "$val"
             printf '\n'
             return
         fi
         printf '%s\n' "$default"
     }
+
+    # Resolve every fixed service-port assignment before regenerating .env.
+    # Export the resolved values too: later phases use the service registry,
+    # which otherwise retains the defaults it loaded before this rerun.
+    while read -r _port_key _port_default; do
+        _port_value="$(_env_get_explicit_first "$_port_key" "$_port_default")"
+        if [[ ! "$_port_value" =~ ^[1-9][0-9]{0,4}$ ]] || (( 10#$_port_value > 65535 )); then
+            error "$_port_key must be a port from 1 to 65535"
+            return 1
+        fi
+        printf -v "${_port_key}_VALUE" '%s' "$_port_value"
+        printf -v "$_port_key" '%s' "$_port_value"
+        export "$_port_key"
+    done <<'SERVICE_PORT_DEFAULTS'
+DASHBOARD_PORT 3001
+DASHBOARD_REMOTE_PORT 3011
+WEBUI_PORT 3000
+PERPLEXICA_PORT 3004
+TTS_PORT 8880
+N8N_PORT 5678
+QDRANT_PORT 6333
+QDRANT_GRPC_PORT 6334
+EMBEDDINGS_PORT 8090
+LITELLM_PORT 4000
+HERMES_PROXY_PORT 9120
+SERVICE_PORT_DEFAULTS
+    declare -F sr_resolve_ports >/dev/null 2>&1 && sr_resolve_ports
+    unset _port_key _port_default _port_value
+    N8N_WEBHOOK_URL_VALUE="$(_env_get_explicit_first N8N_WEBHOOK_URL "http://localhost:${N8N_PORT_VALUE}")"
 
     # The local llama-server port may already belong to another owner service
     # (for example a fleet worker). Honor an explicit install override before
@@ -910,6 +1004,7 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
     LITELLM_KEY=$(_phase06_env_hex_secret LITELLM_KEY 16 "sk-ods-")
     ODS_WINDOWS_SYSTEM_DIRECTORY="$(_env_get_explicit_first ODS_WINDOWS_SYSTEM_DIRECTORY '')"
     ODS_WSL_STATE_ROOT="$(_env_get_explicit_first ODS_WSL_STATE_ROOT '')"
+    ODS_WSL_DISK_DRIVE="$(_env_get_explicit_first ODS_WSL_DISK_DRIVE '')"
     # Host-native llama-server (Windows Portal): the in-stack llama-server is
     # off, and LiteLLM and model-router reach the native server with
     # LLAMA_SERVER_API_KEY. install-core.sh validated the flags.
@@ -1029,6 +1124,12 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
             *) ai_bad "PIXEL_WEB_SEARCH_PROVIDER must be parallel-free or searxng."; return 1 ;;
         esac
         export PIXEL_WEB_SEARCH_PROVIDER="$PIXEL_WEB_SEARCH_PROVIDER_VALUE"
+        PIXEL_RESPONSE_LANGUAGE_VALUE="$(_env_get_explicit_first PIXEL_RESPONSE_LANGUAGE "")"
+        case "$PIXEL_RESPONSE_LANGUAGE_VALUE" in
+            ""|en) ;;
+            *) ai_bad "PIXEL_RESPONSE_LANGUAGE=$PIXEL_RESPONSE_LANGUAGE_VALUE in .env is not supported. Set it to en, or remove the line to match the owner's language, then rerun the installer."; return 1 ;;
+        esac
+        export PIXEL_RESPONSE_LANGUAGE="$PIXEL_RESPONSE_LANGUAGE_VALUE"
         PIXEL_SOURCE_DIR_VALUE="$_phase06_requested_pixel_dir"
         # Phase 11 installs Pixel in this same installer shell. Preserve the
         # resolved immutable source contract in that shell as well as in .env;
@@ -1151,6 +1252,31 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
         done
         unset _amd_image_key _amd_llama_repo
     fi
+    # A GPU of compute capability 12.1 (DGX Spark GB10, RTX Spark N1X) gets
+    # unusable "????" answers from llama.cpp's CUDA 12 images, the Compose
+    # default included; it runs the CUDA 13 image config/backends/nvidia.json
+    # pins for it. Every step that sets the image (tier default, catalog
+    # selector, preserved model) ran before this, so .env and the phase 08
+    # pull name the same image. A host-native route runs no container.
+    if [[ "$GPU_BACKEND" == "nvidia" && "$NATIVE_LLM_ACTIVE" != "true" && -n "${GPU_COMPUTE_CAP:-}" ]]; then
+        if ! _compute_llama_image="$(ods_nvidia_llama_image_for_compute "$GPU_COMPUTE_CAP" "$SCRIPT_DIR/config/backends/nvidia.json")"; then
+            error "Could not read the llama.cpp image for compute capability $GPU_COMPUTE_CAP from $SCRIPT_DIR/config/backends/nvidia.json, so ODS stopped before writing its settings. The ODS files may be incomplete: download ODS again and rerun the installer. Need help? Ask on the ODS Discord: ${ODS_HELP_DISCORD_URL:-https://discord.gg/4ntNp9MAwC}"
+            return 1
+        fi
+        if [[ -n "$_compute_llama_image" ]]; then
+            _mapped_llama_image="$(ods_llama_image_for_compute_cap "${LLAMA_SERVER_IMAGE:-}" "$_compute_llama_image")"
+            if [[ "$_mapped_llama_image" != "${LLAMA_SERVER_IMAGE:-}" ]]; then
+                log "Compute capability $GPU_COMPUTE_CAP: llama-server runs $_mapped_llama_image instead of ${LLAMA_SERVER_IMAGE:-the Compose default}, a CUDA 12 build without kernels for this GPU"
+                LLAMA_SERVER_IMAGE="$_mapped_llama_image"
+            fi
+            if [[ -n "${LLAMA_SERVER_IMAGE_FALLBACK:-}" \
+                && "$(ods_llama_image_for_compute_cap "$LLAMA_SERVER_IMAGE_FALLBACK" "$_compute_llama_image")" != "$LLAMA_SERVER_IMAGE_FALLBACK" ]]; then
+                log "Not writing LLAMA_SERVER_IMAGE_FALLBACK: $LLAMA_SERVER_IMAGE_FALLBACK is a CUDA 12 build without kernels for compute capability $GPU_COMPUTE_CAP"
+                unset LLAMA_SERVER_IMAGE_FALLBACK
+            fi
+        fi
+        unset _compute_llama_image _mapped_llama_image
+    fi
     LLAMA_SERVER_MEMORY_LIMIT_VALUE=""
     if [[ "$GPU_BACKEND" == "nvidia" && "$EXTERNAL_LLM_ACTIVE" != "true" && "${ODS_MODE:-local}" != "cloud" ]]; then
         _docker_memory_gb="$(ods_docker_memory_gb 2>/dev/null || true)"
@@ -1181,6 +1307,12 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
         ai_warn "External LLM reuse uses the authenticated LiteLLM gateway directly; setting ODS_MODEL_SWITCHBOARD=observe."
         ODS_MODEL_SWITCHBOARD_VALUE="observe"
     fi
+    # Only model-router knows the vLLM engine's endpoint (vllm-default); the
+    # legacy and observe LiteLLM maps send ods/current to llama-server.
+    if [[ "${LLM_BACKEND:-}" == "vllm" && "$ODS_MODEL_SWITCHBOARD_VALUE" != "enabled" ]]; then
+        ai_warn "The vLLM engine is reached through model-router; setting ODS_MODEL_SWITCHBOARD=enabled."
+        ODS_MODEL_SWITCHBOARD_VALUE="enabled"
+    fi
     # Compose inherits exported installer variables ahead of the generated
     # .env. Keep the live process value aligned with the effective value so an
     # external-model install cannot select switchboard.yaml while its router
@@ -1188,8 +1320,10 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
     ODS_MODEL_SWITCHBOARD="$ODS_MODEL_SWITCHBOARD_VALUE"
     export ODS_MODEL_SWITCHBOARD
     # A host-native llama-server is reachable only through LiteLLM, which holds
-    # its key; the in-stack llama-server serves every other local install.
-    _default_llm_api_url="$(if [[ "$NATIVE_LLM_ACTIVE" == "true" ]]; then echo "http://litellm:4000"; elif [[ "${ODS_MODE:-local}" == "local" ]]; then echo "http://llama-server:8080"; else echo "http://litellm:4000"; fi)"
+    # its key. The vLLM engine has no in-stack llama-server either: LiteLLM
+    # sends every model name to model-router as ods/current. The in-stack
+    # llama-server serves every other local install.
+    _default_llm_api_url="$(if [[ "$NATIVE_LLM_ACTIVE" == "true" || "${LLM_BACKEND:-}" == "vllm" ]]; then echo "http://litellm:4000"; elif [[ "${ODS_MODE:-local}" == "local" ]]; then echo "http://llama-server:8080"; else echo "http://litellm:4000"; fi)"
     if [[ "$EXTERNAL_LLM_ACTIVE" == "true" ]]; then
         LLM_API_URL_VALUE="http://litellm:4000"
         OPEN_WEBUI_LLM_BASE_URL_VALUE="http://litellm:4000/v1"
@@ -1205,9 +1339,10 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
         if [[ "${ODS_REMOTE_ROUTE_PAUSED:-false}" == "true" ]]; then
             LLM_API_URL_VALUE="${ODS_REMOTE_ROUTE_PREVIOUS_API_URL:-$_default_llm_api_url}"
         fi
-        # The in-stack llama-server is off for a host-native route. Preserve
-        # other existing values as operator-selected endpoints.
-        if [[ "$NATIVE_LLM_ACTIVE" == "true" ]]; then
+        # The in-stack llama-server is off for a host-native route and for the
+        # vLLM engine. Preserve other existing values as operator-selected
+        # endpoints.
+        if [[ "$NATIVE_LLM_ACTIVE" == "true" || "${LLM_BACKEND:-}" == "vllm" ]]; then
             case "$LLM_API_URL_VALUE" in
                 http://llama-server:8080|http://llama-server:8080/v1)
                     LLM_API_URL_VALUE="$_default_llm_api_url"
@@ -1268,6 +1403,26 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
         HERMES_LLM_BASE_URL_VALUE="http://model-router:9099/v1"
         HERMES_LLM_API_KEY_VALUE="no-key"
     fi
+    # The vLLM engine replaces the in-stack llama-server, as the host-native
+    # route does: Open WebUI reaches the model through LiteLLM and Hermes
+    # through model-router. A retained URL that names llama-server, or an
+    # empty one an API-mode reset left, would reach no server.
+    if [[ "${LLM_BACKEND:-}" == "vllm" ]]; then
+        case "$OPEN_WEBUI_LLM_BASE_URL_VALUE" in
+            ""|http://llama-server:8080|http://llama-server:8080/v1)
+                OPEN_WEBUI_LLM_BASE_URL_VALUE="http://litellm:4000"
+                OPEN_WEBUI_LLM_API_KEY_VALUE="${LITELLM_KEY}"
+                ;;
+        esac
+        case "$HERMES_LLM_BASE_URL_VALUE" in
+            http://llama-server:8080|http://llama-server:8080/v1)
+                HERMES_LLM_BASE_URL_VALUE="http://model-router:9099/v1"
+                HERMES_LLM_API_KEY_VALUE="no-key"
+                ;;
+        esac
+    fi
+    # Owner-card gating is opt-in; a rerun must not silently turn it back off.
+    HERMES_REQUIRE_OWNER_CARD_VALUE="$(_env_get_explicit_first HERMES_REQUIRE_OWNER_CARD false)"
     LLM_API_URL="$LLM_API_URL_VALUE"
     HERMES_LLM_BASE_URL="$HERMES_LLM_BASE_URL_VALUE"
     HERMES_LLM_API_KEY="$HERMES_LLM_API_KEY_VALUE"
@@ -1422,6 +1577,12 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
     N_GPU_LAYERS_VALUE="${N_GPU_LAYERS_VALUE:-auto}"
     # Owner opt-out for the overlay default; empty keeps ngram-mod implicit.
     LLAMA_SPEC_TYPE_VALUE=$(_env_get LLAMA_SPEC_TYPE "${LLAMA_SPEC_TYPE:-}")
+    # llama.cpp runtime tuning: explicit process env > saved .env > default.
+    # These are documented owner settings; a rerun must not reset them.
+    LLAMA_PARALLEL_VALUE=$(_env_get_explicit_first LLAMA_PARALLEL "1")
+    LLAMA_ARG_FLASH_ATTN_VALUE=$(_env_get_explicit_first LLAMA_ARG_FLASH_ATTN "auto")
+    LLAMA_ARG_CACHE_TYPE_K_VALUE=$(_env_get_explicit_first LLAMA_ARG_CACHE_TYPE_K "f16")
+    LLAMA_ARG_CACHE_TYPE_V_VALUE=$(_env_get_explicit_first LLAMA_ARG_CACHE_TYPE_V "f16")
 
     # A retained port is kept (an AMD install moved to 9100 stays there).
     WHISPER_PORT_VALUE="$(_env_get_explicit_first WHISPER_PORT "9000")"
@@ -1448,6 +1609,46 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
     # Keep it aligned with the retained .env port on an upgrade.
     DASHBOARD_API_PORT="$DASHBOARD_API_PORT_VALUE"
 
+    # Resolve GPU runtime overrides before opening .env for writing. Lookups
+    # inside its heredoc would read the already-truncated file on a rerun.
+    HSA_OVERRIDE_GFX_VERSION_VALUE=""
+    ROCBLAS_USE_HIPBLASLT_VALUE=""
+    ONEAPI_DEVICE_SELECTOR_VALUE=""
+    if [[ "$GPU_BACKEND" == "amd" ]]; then
+        HSA_OVERRIDE_GFX_VERSION_VALUE="$(_env_get HSA_OVERRIDE_GFX_VERSION \
+            "$(ods_amd_hsa_override_for_target "$AMD_INFERENCE_BACKEND_VALUE" "${AMD_GFX_TARGET:-}")")"
+        ROCBLAS_USE_HIPBLASLT_VALUE="$(_env_get ROCBLAS_USE_HIPBLASLT "")"
+    elif [[ "$GPU_BACKEND" == "sycl" ]]; then
+        ONEAPI_DEVICE_SELECTOR_VALUE="$(_env_get ONEAPI_DEVICE_SELECTOR level_zero:gpu)"
+    fi
+
+    # The vLLM engine's settings (LLM_BACKEND=vllm), appended after the
+    # template below so every other install writes the same bytes as before.
+    # Resolved here, before the template truncates the .env _env_get reads.
+    # ODS Talk image attachments reach the model through LiteLLM, as the
+    # host-native overlay sets; an owner's own vision server is kept.
+    VLLM_GPU_MEMORY_UTILIZATION_VALUE=""
+    VLLM_TALK_VISION_URL_VALUE=""
+    VLLM_TALK_VISION_KEY_VALUE=""
+    if [[ "${LLM_BACKEND:-}" == "vllm" ]]; then
+        for _vllm_key in VLLM_IMAGE VLLM_MODEL_DIR VLLM_SERVED_MODEL VLLM_GPU_UUID; do
+            [[ -n "${!_vllm_key:-}" ]] || {
+                error "The vLLM engine needs ${_vllm_key}, which this run's model choice did not set, so .env was not written. Rerun the installer; if it happens again, rerun with --llm-backend llama-server. Need help? Ask on the ODS Discord: ${ODS_HELP_DISCORD_URL:-https://discord.gg/4ntNp9MAwC}"
+                return 1
+            }
+        done
+        unset _vllm_key
+        VLLM_GPU_MEMORY_UTILIZATION_VALUE="$(_env_get_explicit_first VLLM_GPU_MEMORY_UTILIZATION "")"
+        VLLM_TALK_VISION_URL_VALUE="$(_env_get ODS_TALK_VISION_URL "http://litellm:4000/v1")"
+        VLLM_TALK_VISION_KEY_VALUE="$(_env_get ODS_TALK_VISION_KEY "${LITELLM_KEY}")"
+        case "$VLLM_TALK_VISION_URL_VALUE" in
+            http://llama-server:*|http://ods-llama-server:*)
+                VLLM_TALK_VISION_URL_VALUE="http://litellm:4000/v1"
+                VLLM_TALK_VISION_KEY_VALUE="${LITELLM_KEY}"
+                ;;
+        esac
+    fi
+
     # Generate .env file
     if [[ "${ENABLE_PIXEL_RUNTIME:-false}" == true ]]; then
         _phase06_pixel_runtime_layout || {
@@ -1461,6 +1662,14 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
     # subsequent phases — later mkdirs create container-bind-mount dirs that
     # need world-traverse (e.g. SearXNG runs as uid 977).
     # The chmod 600 below is belt-and-braces.
+    # The template only knows ODS's own keys. Snapshot the previous .env so the
+    # settings bundled and installed extensions own can be carried over after
+    # the rewrite.
+    _phase06_previous_env=""
+    if [[ -f "$INSTALL_DIR/.env" ]]; then
+        _phase06_previous_env="$(mktemp)" || return 1
+        cp "$INSTALL_DIR/.env" "$_phase06_previous_env" || return 1
+    fi
     (
         umask 077
         cat > "$INSTALL_DIR/.env" << ENV_EOF
@@ -1475,6 +1684,8 @@ ODS_VERSION=${VERSION:-3.0.0}
 # 127.0.0.1 = localhost only (secure default)
 # 0.0.0.0   = accessible from LAN (install with --lan or set manually)
 BIND_ADDRESS=$(dotenv_value "${BIND_ADDRESS}")
+DASHBOARD_PORT=${DASHBOARD_PORT_VALUE}
+DASHBOARD_REMOTE_PORT=${DASHBOARD_REMOTE_PORT_VALUE}
 # Lets the non-root remote-provider services read only lifecycle secrets that
 # the host agent writes mode 0640 under this installation owner's data group.
 REMOTE_PROVIDER_DATA_GID=$(id -g 2>/dev/null || echo 1000)
@@ -1489,7 +1700,7 @@ LLM_API_URL=$(dotenv_value "${LLM_API_URL_VALUE}")
 OPEN_WEBUI_LLM_BASE_URL=$(dotenv_value "${OPEN_WEBUI_LLM_BASE_URL_VALUE}")
 OPEN_WEBUI_LLM_API_KEY=$(dotenv_value "${OPEN_WEBUI_LLM_API_KEY_VALUE}")
 OPEN_WEBUI_TASK_MODEL=$(dotenv_value "${OPEN_WEBUI_TASK_MODEL_VALUE}")
-LLM_BACKEND=$(if [[ "$EXTERNAL_LLM_ACTIVE" == "true" ]]; then echo "external"; else echo "llama-server"; fi)
+LLM_BACKEND=$(if [[ "$EXTERNAL_LLM_ACTIVE" == "true" ]]; then echo "external"; elif [[ "${LLM_BACKEND:-}" == "vllm" ]]; then echo "vllm"; else echo "llama-server"; fi)
 LLM_API_BASE_PATH=/v1
 EXTERNAL_LLM_URL=${EXTERNAL_LLM_URL_VALUE}
 EXTERNAL_LLM_CONTAINER_URL=${EXTERNAL_LLM_CONTAINER_URL_VALUE}
@@ -1509,6 +1720,7 @@ NATIVE_LLM_CONTAINER_BASE_URL=$(dotenv_value "${NATIVE_LLM_CONTAINER_BASE_URL_VA
 $(if [[ -n "$LLAMA_SERVER_API_KEY_VALUE" ]]; then printf 'LLAMA_SERVER_API_KEY=%s' "$(dotenv_value "$LLAMA_SERVER_API_KEY_VALUE")"; fi)
 $(if [[ -n "${ODS_WINDOWS_SYSTEM_DIRECTORY}" ]]; then printf 'ODS_WINDOWS_SYSTEM_DIRECTORY=%s' "$(dotenv_value "$ODS_WINDOWS_SYSTEM_DIRECTORY")"; fi)
 $(if [[ -n "${ODS_WSL_STATE_ROOT}" ]]; then printf 'ODS_WSL_STATE_ROOT=%s' "$(dotenv_value "$ODS_WSL_STATE_ROOT")"; fi)
+$(if [[ -n "${ODS_WSL_DISK_DRIVE}" ]]; then printf 'ODS_WSL_DISK_DRIVE=%s' "$(dotenv_value "$ODS_WSL_DISK_DRIVE")"; fi)
 
 #=== Cloud API Keys ===
 ANTHROPIC_API_KEY=$(dotenv_value "${ANTHROPIC_API_KEY:-}")
@@ -1520,6 +1732,9 @@ MINIMAX_API_KEY=$(dotenv_value "${MINIMAX_API_KEY:-}")
 TARGET_API_KEY=not-needed
 
 #=== LLM Settings (llama-server) ===
+# Read back by ods-cli (status-json, mode, model current), the host agent and
+# bootstrap-upgrade when they re-resolve the compose stack.
+TIER=$(dotenv_value "${TIER}")
 MODEL_PROFILE=$(dotenv_value "${MODEL_PROFILE_VALUE}")
 # Effective model profile for this hardware: ${MODEL_PROFILE_EFFECTIVE:-qwen}
 LLM_MODEL=${LLM_MODEL}
@@ -1545,23 +1760,27 @@ MODEL_RUNTIME_PROFILE=$(dotenv_quote "${MODEL_RUNTIME_PROFILE:-}")
 MODEL_RUNTIME_PROFILE_LABEL=$(dotenv_quote "${MODEL_RUNTIME_PROFILE_LABEL:-}")
 MODEL_RUNTIME_PROFILE_SOURCE=$(dotenv_quote "${MODEL_RUNTIME_PROFILE_SOURCE:-}")
 GPU_BACKEND=${GPU_BACKEND}
+$(if [[ -n "${GPU_COMPUTE_CAP:-}" ]]; then echo "GPU_COMPUTE_CAP=${GPU_COMPUTE_CAP}"; fi)
 SYSTEM_RAM_GB=${RAM_GB:-0}
 N_GPU_LAYERS=$(dotenv_value "${N_GPU_LAYERS_VALUE}")
 $(if [[ -n "${LLAMA_SERVER_IMAGE:-}" ]]; then echo "LLAMA_SERVER_IMAGE=${LLAMA_SERVER_IMAGE}"; fi)
 $(if [[ -n "${LLAMA_SERVER_IMAGE_FALLBACK:-}" ]]; then echo "LLAMA_SERVER_IMAGE_FALLBACK=${LLAMA_SERVER_IMAGE_FALLBACK}"; fi)
 $(if [[ -n "$LLAMA_SERVER_MEMORY_LIMIT_VALUE" ]]; then echo "LLAMA_SERVER_MEMORY_LIMIT=${LLAMA_SERVER_MEMORY_LIMIT_VALUE}"; fi)
 #=== llama.cpp Runtime Tuning ===
-LLAMA_ARG_FLASH_ATTN=${LLAMA_ARG_FLASH_ATTN:-auto}
-LLAMA_ARG_CACHE_TYPE_K=${LLAMA_ARG_CACHE_TYPE_K:-f16}
-LLAMA_ARG_CACHE_TYPE_V=${LLAMA_ARG_CACHE_TYPE_V:-f16}
+LLAMA_ARG_FLASH_ATTN=$(dotenv_value "${LLAMA_ARG_FLASH_ATTN_VALUE}")
+LLAMA_ARG_CACHE_TYPE_K=$(dotenv_value "${LLAMA_ARG_CACHE_TYPE_K_VALUE}")
+LLAMA_ARG_CACHE_TYPE_V=$(dotenv_value "${LLAMA_ARG_CACHE_TYPE_V_VALUE}")
 # Optional MoE only. Example for 8-12GB VRAM: LLAMA_ARG_N_CPU_MOE=25
 $(if [[ -n "${LLAMA_ARG_N_CPU_MOE:-}" ]]; then echo "LLAMA_ARG_N_CPU_MOE=${LLAMA_ARG_N_CPU_MOE}"; fi)
 $(if [[ -n "${LLAMA_ARG_NO_CACHE_PROMPT:-}" ]]; then echo "LLAMA_ARG_NO_CACHE_PROMPT=${LLAMA_ARG_NO_CACHE_PROMPT}"; fi)
 $(if [[ -n "${LLAMA_ARG_CHECKPOINT_EVERY_NT:-}" ]]; then echo "LLAMA_ARG_CHECKPOINT_EVERY_NT=${LLAMA_ARG_CHECKPOINT_EVERY_NT}"; fi)
 $(if [[ -n "${LLAMA_ARG_CTX_CHECKPOINTS:-}" ]]; then echo "LLAMA_ARG_CTX_CHECKPOINTS=${LLAMA_ARG_CTX_CHECKPOINTS}"; fi)
 $(if [[ -n "${LLAMA_ARG_CACHE_RAM:-}" ]]; then echo "LLAMA_ARG_CACHE_RAM=${LLAMA_ARG_CACHE_RAM}"; fi)
+# Optional operator-level container tuning; emitted only when present.
+$(if [[ "${LLAMA_ARG_UBATCH:-}" =~ ^[1-9][0-9]{0,2}$ ]] && (( LLAMA_ARG_UBATCH <= 512 )); then echo "LLAMA_ARG_UBATCH=${LLAMA_ARG_UBATCH}"; fi)
+$(if [[ "${LLAMA_ARG_FIT_TARGET:-}" =~ ^[1-9][0-9]{0,4}$ ]] && (( LLAMA_ARG_FIT_TARGET >= 512 && LLAMA_ARG_FIT_TARGET <= 65536 )); then echo "LLAMA_ARG_FIT_TARGET=${LLAMA_ARG_FIT_TARGET}"; fi)
 $(if [[ -n "${LLAMA_THREADS_VALUE:-}" ]]; then echo "LLAMA_THREADS=${LLAMA_THREADS_VALUE}"; fi)
-LLAMA_PARALLEL=${LLAMA_PARALLEL:-1}
+LLAMA_PARALLEL=$(dotenv_value "${LLAMA_PARALLEL_VALUE}")
 # NVIDIA/CPU llama.cpp images default to lossless n-gram speculation (ngram-mod).
 # LLAMA_SPEC_TYPE=none turns it off; unset keeps the default.
 $(if [[ -n "$LLAMA_SPEC_TYPE_VALUE" ]]; then echo "LLAMA_SPEC_TYPE=$(dotenv_value "$LLAMA_SPEC_TYPE_VALUE")"; fi)
@@ -1572,6 +1791,12 @@ $(if [[ -n "${LLAMA_ARG_SPEC_TYPE:-}" ]]; then echo "LLAMA_ARG_SPEC_TYPE=${LLAMA
 $(if [[ -n "${LLAMA_ARG_SPEC_DRAFT_N_MAX:-}" ]]; then echo "LLAMA_ARG_SPEC_DRAFT_N_MAX=${LLAMA_ARG_SPEC_DRAFT_N_MAX}"; fi)
 $(if [[ -n "${LLAMA_ARG_SPEC_DRAFT_TYPE_K:-}" ]]; then echo "LLAMA_ARG_SPEC_DRAFT_TYPE_K=${LLAMA_ARG_SPEC_DRAFT_TYPE_K}"; fi)
 $(if [[ -n "${LLAMA_ARG_SPEC_DRAFT_TYPE_V:-}" ]]; then echo "LLAMA_ARG_SPEC_DRAFT_TYPE_V=${LLAMA_ARG_SPEC_DRAFT_TYPE_V}"; fi)
+# Model activation sets these for the active model only: an imported model's
+# vision projector and a fixed chat template. A rerun keeps them only for the
+# same model (scripts/preserve-active-model.py).
+$(if [[ -n "${LLAMA_ARG_MMPROJ:-}" ]]; then echo "LLAMA_ARG_MMPROJ=$(dotenv_value "$LLAMA_ARG_MMPROJ")"; fi)
+$(if [[ -n "${MODEL_CHAT_TEMPLATE_OVERRIDE:-}" ]]; then echo "MODEL_CHAT_TEMPLATE_OVERRIDE=$(dotenv_value "$MODEL_CHAT_TEMPLATE_OVERRIDE")"; fi)
+$(if [[ -n "${LLAMA_ARG_CHAT_TEMPLATE_FILE:-}" ]]; then echo "LLAMA_ARG_CHAT_TEMPLATE_FILE=$(dotenv_value "$LLAMA_ARG_CHAT_TEMPLATE_FILE")"; fi)
 LLAMA_CPU_LIMIT=${LLAMA_CPU_LIMIT}
 LLAMA_CPU_RESERVATION=${LLAMA_CPU_RESERVATION}
 
@@ -1597,17 +1822,13 @@ $(if [[ "$GPU_BACKEND" == "amd" ]]; then
     # HSA_OVERRIDE_GFX_VERSION is read only by the ROCm image, and only a GPU
     # the image was not built for needs it (a wrong value fails model load or
     # hangs the GPU). Vulkan never reads it. An owner-set value is kept.
-    _amd_hsa_override="$(_env_get HSA_OVERRIDE_GFX_VERSION \
-        "$(ods_amd_hsa_override_for_target "$AMD_INFERENCE_BACKEND_VALUE" "${AMD_GFX_TARGET:-}")")"
-
     cat << AMD_ENV
 #=== GPU Group IDs (for container device access) ===
 VIDEO_GID=$(getent group video 2>/dev/null | cut -d: -f3 || echo 44)
 RENDER_GID=$(getent group render 2>/dev/null | cut -d: -f3 || echo 992)
-$(if [[ -n "$_amd_hsa_override" ]]; then printf '\n#=== ROCm gfx override (%s) ===\nHSA_OVERRIDE_GFX_VERSION=%s' "${AMD_GFX_TARGET:-unknown target}" "$(dotenv_value "$_amd_hsa_override")"; fi)
-$(if [[ -n "$(_env_get ROCBLAS_USE_HIPBLASLT "")" ]]; then printf 'ROCBLAS_USE_HIPBLASLT=%s' "$(dotenv_value "$(_env_get ROCBLAS_USE_HIPBLASLT "")")"; fi)
+$(if [[ -n "$HSA_OVERRIDE_GFX_VERSION_VALUE" ]]; then printf '\n#=== ROCm gfx override (%s) ===\nHSA_OVERRIDE_GFX_VERSION=%s' "${AMD_GFX_TARGET:-unknown target}" "$(dotenv_value "$HSA_OVERRIDE_GFX_VERSION_VALUE")"; fi)
+$(if [[ -n "$ROCBLAS_USE_HIPBLASLT_VALUE" ]]; then printf 'ROCBLAS_USE_HIPBLASLT=%s' "$(dotenv_value "$ROCBLAS_USE_HIPBLASLT_VALUE")"; fi)
 AMD_ENV
-    unset _amd_hsa_override
 fi)
 $(if [[ "$GPU_BACKEND" == "sycl" ]]; then cat << INTEL_ENV
 #=== GPU Group IDs (for container device access) ===
@@ -1616,24 +1837,24 @@ RENDER_GID=$(getent group render 2>/dev/null | cut -d: -f3 || echo 992)
 
 #=== Intel Arc / oneAPI SYCL Settings ===
 # Set level_zero:0 on hosts with more than one Intel GPU.
-ONEAPI_DEVICE_SELECTOR=$(dotenv_value "$(_env_get ONEAPI_DEVICE_SELECTOR level_zero:gpu)")
+ONEAPI_DEVICE_SELECTOR=$(dotenv_value "$ONEAPI_DEVICE_SELECTOR_VALUE")
 ZES_ENABLE_SYSMAN=1
 INTEL_ENV
 fi)
 
 #=== Ports ===
 OLLAMA_PORT=$(dotenv_value "${OLLAMA_PORT_VALUE}")
-WEBUI_PORT=3000
+WEBUI_PORT=$(dotenv_value "${WEBUI_PORT_VALUE}")
 DASHBOARD_API_PORT=$(dotenv_value "${DASHBOARD_API_PORT_VALUE}")
 SEARXNG_PORT=$(dotenv_value "${SEARXNG_PORT_VALUE}")
-PERPLEXICA_PORT=3004
+PERPLEXICA_PORT=$(dotenv_value "${PERPLEXICA_PORT_VALUE}")
 WHISPER_PORT=$(dotenv_value "${WHISPER_PORT_VALUE}")
-TTS_PORT=8880
-N8N_PORT=5678
-QDRANT_PORT=6333
-QDRANT_GRPC_PORT=6334
-EMBEDDINGS_PORT=8090
-LITELLM_PORT=4000
+TTS_PORT=$(dotenv_value "${TTS_PORT_VALUE}")
+N8N_PORT=$(dotenv_value "${N8N_PORT_VALUE}")
+QDRANT_PORT=$(dotenv_value "${QDRANT_PORT_VALUE}")
+QDRANT_GRPC_PORT=$(dotenv_value "${QDRANT_GRPC_PORT_VALUE}")
+EMBEDDINGS_PORT=$(dotenv_value "${EMBEDDINGS_PORT_VALUE}")
+LITELLM_PORT=$(dotenv_value "${LITELLM_PORT_VALUE}")
 LANGFUSE_PORT=$(dotenv_value "${LANGFUSE_PORT}")
 
 #=== Hermes Agent ===
@@ -1643,8 +1864,8 @@ LANGFUSE_PORT=$(dotenv_value "${LANGFUSE_PORT}")
 HERMES_LLM_BASE_URL=$(dotenv_value "${HERMES_LLM_BASE_URL_VALUE}")
 HERMES_LLM_API_KEY=$(dotenv_value "${HERMES_LLM_API_KEY_VALUE}")
 HERMES_LANGUAGE=${HERMES_LANGUAGE:-en}
-HERMES_REQUIRE_OWNER_CARD=${HERMES_REQUIRE_OWNER_CARD:-false}
-HERMES_PROXY_PORT=${HERMES_PROXY_PORT:-9120}
+HERMES_REQUIRE_OWNER_CARD=$(dotenv_value "${HERMES_REQUIRE_OWNER_CARD_VALUE}")
+HERMES_PROXY_PORT=$(dotenv_value "${HERMES_PROXY_PORT_VALUE}")
 HERMES_PROXY_UPSTREAM=${HERMES_PROXY_UPSTREAM:-ods-hermes:9119}
 ODS_AUTH_UPSTREAM=${ODS_AUTH_UPSTREAM:-ods-dashboard-api:3002}
 
@@ -1665,6 +1886,7 @@ PIXEL_SOURCE_URL=$(dotenv_quote "$PIXEL_SOURCE_URL_VALUE")
 PIXEL_SOURCE_REF=$(dotenv_value "${PIXEL_SOURCE_REF_VALUE}")
 PIXEL_SOURCE_DIR=$(dotenv_quote "$PIXEL_SOURCE_DIR_VALUE")
 $(if [[ -n "$PIXEL_WEB_SEARCH_PROVIDER_VALUE" ]]; then printf 'PIXEL_WEB_SEARCH_PROVIDER=%s\n' "$PIXEL_WEB_SEARCH_PROVIDER_VALUE"; fi)
+$(if [[ -n "${PIXEL_RESPONSE_LANGUAGE_VALUE:-}" ]]; then printf 'PIXEL_RESPONSE_LANGUAGE=%s\n' "$PIXEL_RESPONSE_LANGUAGE_VALUE"; fi)
 PIXEL_OPENWEBUI_KEY=$(dotenv_value "${PIXEL_OPENWEBUI_KEY_VALUE}")
 PIXEL_MODEL_RELAY_KEY=$(dotenv_value "${PIXEL_MODEL_RELAY_KEY_VALUE}")
 PIXEL_MODEL_RELAY_PORT=$(dotenv_value "${PIXEL_MODEL_RELAY_PORT_VALUE}")
@@ -1723,7 +1945,7 @@ WEB_SEARCH_ENGINE=searxng
 
 #=== n8n Settings ===
 N8N_HOST=localhost
-N8N_WEBHOOK_URL=http://localhost:5678
+N8N_WEBHOOK_URL=$(dotenv_value "${N8N_WEBHOOK_URL_VALUE}")
 TIMEZONE=${SYSTEM_TZ:-UTC}
 
 #=== Langfuse (LLM Observability) ===
@@ -1766,8 +1988,38 @@ fi)
 
 ENV_EOF
     )
+    if [[ "${LLM_BACKEND:-}" == "vllm" ]]; then
+        {
+            printf '\n#=== vLLM engine (LLM_BACKEND=vllm, docker-compose.vllm.yml) ===\n'
+            printf '# The vLLM catalog model the installer chose for one GPU, with that\n'
+            printf "# entry's vLLM arguments. Installer reruns rewrite these lines.\n"
+            printf 'VLLM_IMAGE=%s\n' "$(dotenv_value "$VLLM_IMAGE")"
+            printf 'VLLM_MODEL_DIR=%s\n' "$(dotenv_value "$VLLM_MODEL_DIR")"
+            printf 'VLLM_SERVED_MODEL=%s\n' "$(dotenv_value "$VLLM_SERVED_MODEL")"
+            printf 'VLLM_ARGS=%s\n' "$(dotenv_value "${VLLM_ARGS:-}")"
+            printf 'VLLM_GPU_UUID=%s\n' "$(dotenv_value "$VLLM_GPU_UUID")"
+            if [[ -n "$VLLM_GPU_MEMORY_UTILIZATION_VALUE" ]]; then
+                printf 'VLLM_GPU_MEMORY_UTILIZATION=%s\n' "$(dotenv_value "$VLLM_GPU_MEMORY_UTILIZATION_VALUE")"
+            fi
+            printf 'ODS_TALK_VISION_URL=%s\n' "$(dotenv_value "$VLLM_TALK_VISION_URL_VALUE")"
+            printf 'ODS_TALK_VISION_KEY=%s\n' "$(dotenv_value "$VLLM_TALK_VISION_KEY_VALUE")"
+        } >> "$INSTALL_DIR/.env"
+    fi
+    # Compose reads an LLM_BACKEND phase 02 exported ahead of .env; keep the
+    # two equal (an API route writes external).
+    [[ "$EXTERNAL_LLM_ACTIVE" != "true" ]] || LLM_BACKEND=external
 
     chmod 600 "$INSTALL_DIR/.env"  # Secure secrets file
+    if [[ -n "$_phase06_previous_env" ]]; then
+        # shellcheck source=../lib/extension-env-carry.sh
+        . "$SCRIPT_DIR/installers/lib/extension-env-carry.sh"
+        ods_carry_extension_env_keys "$_phase06_previous_env" "$INSTALL_DIR/.env" \
+            "$SCRIPT_DIR/extensions/services" "$INSTALL_DIR/data/user-extensions"
+        ods_carry_public_url_env_keys "$_phase06_previous_env" "$INSTALL_DIR/.env"
+        ods_carry_named_env_keys "$_phase06_previous_env" "$INSTALL_DIR/.env" "${ODS_OWNER_ENV_KEYS[@]}"
+        rm -f "$_phase06_previous_env"
+    fi
+    unset _phase06_previous_env
     # Docker Desktop's daemon is outside the installing WSL namespace.
     # Prepare its authenticated control address before phase 07 starts the
     # host agent and before Compose inherits dashboard-api's environment.
@@ -1852,12 +2104,17 @@ ENV_EOF
     if [[ "$NATIVE_LLM_ACTIVE" == "true" ]]; then
         _router_llm_base_url="$NATIVE_LLM_CONTAINER_BASE_URL_VALUE"
     fi
+    # The vLLM engine's endpoint is vllm-default (http://vllm-server:8000);
+    # every other route keeps the llama-server endpoint.
+    _router_llm_backend=llama-server
+    [[ "${LLM_BACKEND:-}" != "vllm" ]] || _router_llm_backend=vllm
     _router_common_args=(
         --switchboard-mode "${ODS_MODEL_SWITCHBOARD_VALUE:-enabled}"
         --ods-mode "$_router_ods_mode"
         --gpu-backend "${GPU_BACKEND:-nvidia}"
         --gguf-file "${GGUF_FILE:-}"
         --llm-base-url "$_router_llm_base_url"
+        --llm-backend "$_router_llm_backend"
         --output-root "$INSTALL_DIR"
         --write
     )
@@ -1865,6 +2122,9 @@ ENV_EOF
     # and the switchboard map name LLAMA_SERVER_API_KEY, as the host agent's
     # activation render does.
     [[ "$NATIVE_LLM_ACTIVE" != "true" ]] || _router_common_args+=(--llm-api-key-env LLAMA_SERVER_API_KEY)
+    # The vllm-default endpoint carries the served model's thinking map, which
+    # the renderer reads from the vLLM catalog entry --model names (LLM_MODEL).
+    [[ "$_router_llm_backend" != "vllm" ]] || _router_common_args+=(--model "$LLM_MODEL")
     _router_surfaces=(model-router-endpoints)
     if [[ "$_router_ods_mode" != "cloud" ]]; then
         _router_surfaces+=(litellm-switchboard)
@@ -1879,7 +2139,7 @@ ENV_EOF
         fi
     done
     unset _router_renderer_py _router_surface _router_common_args
-    unset _router_ods_mode _router_surfaces _router_llm_base_url
+    unset _router_ods_mode _router_surfaces _router_llm_base_url _router_llm_backend
 
     # Validate generated .env against schema (fails fast on missing/unknown keys).
     _phase06_step "validate-env"
@@ -1897,12 +2157,32 @@ ENV_EOF
     # Generate SearXNG config with randomized secret key
     # Fix ownership from previous container runs (SearXNG writes as uid 977)
     _phase06_step "generate-searxng-config"
+    ods_validate_searxng_settings_path "$INSTALL_DIR" || return 1
     mkdir -p "$INSTALL_DIR/config/searxng"
     if [[ -f "$INSTALL_DIR/config/searxng/settings.yml" ]] && ! [[ -w "$INSTALL_DIR/config/searxng/settings.yml" ]]; then
         _phase06_repair_host_path "$INSTALL_DIR/config/searxng/settings.yml" "SearXNG configuration" || return 1
     fi
     _searxng_lang="$(ods_searxng_default_lang)"
-    cat > "$INSTALL_DIR/config/searxng/settings.yml" << SEARXNG_EOF
+    _searxng_settings="$INSTALL_DIR/config/searxng/settings.yml"
+    _searxng_rewrite=1
+    if [[ "${FORCE:-false}" != true && -f "$_searxng_settings" ]]; then
+        if [[ ! -s "$_searxng_settings" ]]; then
+            error "Existing SearXNG settings are empty; restore the file or use --force to regenerate."
+            return 1
+        fi
+        # Read the whole file: grep -q could hide a later read error after a
+        # match. Only the stock secret scalar triggers default regeneration.
+        _searxng_grep=0
+        grep -E '^[[:space:]]*secret_key:[[:space:]]*("CHANGEME-run-the-installer-to-generate-a-secure-key"|'"'"'CHANGEME-run-the-installer-to-generate-a-secure-key'"'"'|CHANGEME-run-the-installer-to-generate-a-secure-key)[[:space:]]*(#.*)?$' "$_searxng_settings" >/dev/null || _searxng_grep=$?
+        case "$_searxng_grep" in
+            0) ;;
+            1) _searxng_rewrite=0 ;;
+            *) error "Failed to read existing SearXNG settings; configuration was not regenerated."
+               return 1 ;;
+        esac
+    fi
+    if [[ $_searxng_rewrite -eq 1 ]]; then
+        cat > "$INSTALL_DIR/config/searxng/settings.yml" << SEARXNG_EOF
 use_default_settings: true
 server:
   secret_key: "${SEARXNG_SECRET}"
@@ -1937,8 +2217,11 @@ engines:
   - name: stackoverflow
     disabled: false
 SEARXNG_EOF
-    ai_ok "Generated SearXNG config with randomized secret key (search language ${_searxng_lang})"
-    unset _searxng_lang
+        ai_ok "Generated SearXNG config with randomized secret key (search language ${_searxng_lang})"
+    else
+        ai_ok "Preserved existing SearXNG config (use --force to regenerate)"
+    fi
+    unset _searxng_lang _searxng_settings _searxng_rewrite _searxng_grep
 fi
 
 # Documentation, CLI tools, and compose variants already copied by rsync/cp block above

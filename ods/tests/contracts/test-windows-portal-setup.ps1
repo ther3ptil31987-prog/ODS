@@ -84,6 +84,7 @@ function Reset-Scenario {
     $script:calls = [Collections.Generic.List[string]]::new()
     $script:prompts = [Collections.Generic.List[string]]::new()
     $script:scenario = 'ready'
+    $script:windowsBuild = 19045
     $script:delegateCode = 0
     $script:featureCode = 0
     $script:allowPreparation = $true
@@ -98,8 +99,10 @@ function Reset-Scenario {
     $script:downloaded = $false
     $script:registerNeeded = $false
     $script:virtualization = $true
+    $script:arm64 = $false
     $script:freeGB = 200
     $script:dockerInstalled = $true
+    $script:dockerAlreadyInstalled = $false
     $script:engineUp = $true
     $script:integrated = $true
     $script:userEnablesIntegration = $true
@@ -113,11 +116,18 @@ function Reset-Scenario {
     $script:amdBinding = @()
     $script:distroListFailure = $null
     $script:initProbes = @()
+    $script:wslRegistrations = @([pscustomobject]@{ DistributionName='Ubuntu-24.04'; BasePath='C:\Users\maria\AppData\Local\wsl\{4c1b6a3e}' })
 }
 function Test-ODSPortalVirtualization { $script:calls.Add('virt-check'); return $script:virtualization }
+function Test-ODSSparkWindowsArm64 { $script:calls.Add('arm64-check'); return $script:arm64 }
 function Get-ODSPortalFreeSystemGB { return $script:freeGB }
+function Get-ODSPortalWindowsBuild { return $script:windowsBuild }
+function Get-ODSPortalWslRegistrations { return $script:wslRegistrations }
 function Get-ODSPortalDockerDesktop { return [pscustomobject]@{ Installed=$script:dockerInstalled; Exe='docker-desktop.exe'; Cli='docker.exe' } }
-function Install-ODSPortalDockerDesktop { $script:calls.Add('docker-install'); $script:dockerInstalled = $true }
+function Install-ODSPortalDockerDesktop {
+    $script:calls.Add('docker-install'); $script:dockerInstalled = $true
+    return [pscustomobject]@{ AlreadyInstalled=$script:dockerAlreadyInstalled; Desktop=(Get-ODSPortalDockerDesktop) }
+}
 function Test-ODSPortalDockerEngine($Desktop) { return $script:engineUp }
 function Start-ODSPortalDockerDesktop($Desktop) { $script:calls.Add('docker-start'); $script:engineUp = $true }
 function Wait-ODSPortalDistroDocker([string]$Distro, [int]$Seconds) {
@@ -215,7 +225,7 @@ function Invoke-ODSPortalWsl([string[]]$Arguments) {
     return [pscustomobject]@{ Code=$code; Output=$output; Error=$stderr }
 }
 try {
-    foreach ($file in @('wsl-portal-setup.ps1', 'wsl-portal-prereqs.ps1')) {
+    foreach ($file in @('wsl-portal-setup.ps1', 'wsl-portal-prereqs.ps1', 'wsl-portal-spark.ps1')) {
         $parsed = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot "../../installers/windows/lib/$file"), [ref]$null, [ref]$null)
         $bad = $parsed.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -ne '?' -and $n.VariablePath.UserPath.EndsWith('?') }, $true)
         Check (@($bad).Count -eq 0) "$file never interpolates a variable followed by ? (PowerShell reads `$name? as one variable)"
@@ -262,9 +272,45 @@ try {
     Check ((Invoke-ODSPortalSetup @{} 'unused') -eq 0) 'ready host without -All delegates successfully'
     Check ($script:capturedArguments[-1] -ceq '--pixel' -and $script:capturedArguments -notcontains '--no-hermes') 'Linux flags leave --no-hermes out, so a rerun keeps the installed selection'
     Check ((@($script:capturedNewInstallation) -join ' ') -ceq '--no-hermes') 'Hermes is turned off only through the new-installation flag'
+    # Reject old Windows before WSL probes, prompts, elevation or installs,
+    # whether WSL is absent, unprepared, or already running.
+    foreach ($build in @(16299, 18362, 19040)) {
+        foreach ($nonInteractive in @($false, $true)) {
+            foreach ($wslMode in @('no-wsl', 'features', 'ready')) {
+                Reset-Scenario
+                $script:windowsBuild = $build
+                $script:scenario = $wslMode
+                $message = ''
+                try { $null = Invoke-ODSPortalSetup @{NonInteractive=$nonInteractive} 'unused' } catch { $message = $_.Exception.Message }
+                Check ($message -match 'requires Windows build 19041' -and $message -match "reports build $build" -and $message -match 'Update Windows') "build $build ($wslMode, nonInteractive=$nonInteractive) reports the requirement and remedy"
+                Check ($script:calls.Count -eq 0) "build $build ($wslMode, nonInteractive=$nonInteractive) stops before all downstream calls"
+            }
+        }
+    }
+    foreach ($build in @(19041, 19045, 22631)) {
+        Reset-Scenario
+        $script:windowsBuild = $build
+        Check ((Invoke-ODSPortalSetup @{} 'unused') -eq 0) "supported build $build keeps the ready-host flow"
+        Check ($script:calls.Contains('install:Ubuntu-24.04')) "supported build $build reaches the Linux installer"
+    }
+    Reset-Scenario
+    $script:windowsBuild = 19041
+    $script:scenario = 'no-wsl'
+    Check ((Invoke-ODSPortalSetup @{} 'unused') -eq 3010) 'supported build 19041 keeps the missing-WSL feature flow'
+    Check ($script:calls.Contains('features') -and $script:calls.Contains('resume')) 'supported build 19041 still activates features and schedules resume'
     Reset-Scenario
     $null = Invoke-ODSPortalSetup @{NoHermes=$true} 'unused'
     Check ($script:capturedArguments -contains '--no-hermes') '-NoHermes turns Hermes off on a rerun too'
+    # The Windows drive under the distribution's virtual disk reaches the
+    # Linux installer, so ODS can check that drive before model downloads.
+    Reset-Scenario
+    $script:wslRegistrations = @([pscustomobject]@{ DistributionName='Ubuntu-24.04'; BasePath='\\?\D:\WSL\Ubuntu-24.04' })
+    Check ((Invoke-ODSPortalSetup @{} 'unused') -eq 0) 'a distribution stored on drive D: installs'
+    Check ((@($script:capturedArguments)[0..1] -join ' ') -ceq '--wsl-disk-drive D:' -and $script:capturedArguments[-1] -ceq '--pixel') 'the drive that stores the distribution reaches the Linux installer ahead of the Pixel policy'
+    Reset-Scenario
+    $script:wslRegistrations = @()
+    $driveNotice = @(& { $script:noDriveResult = Invoke-ODSPortalSetup @{} 'unused' } 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+    Check ($script:noDriveResult -eq 0 -and $script:capturedArguments -notcontains '--wsl-disk-drive' -and $driveNotice -match 'Could not find the Windows drive that stores Ubuntu-24\.04') 'an unknown storage drive is said, and no drive flag is passed'
     # windows.ps1 owns the new-installation probe (no <root>/.env before
     # install-core). Run its real flag block for a new installation and a rerun.
     $windowsAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '../../installers/windows.ps1'), [ref]$null, [ref]$null)
@@ -540,6 +586,13 @@ try {
     try { $null = Invoke-ODSPortalSetup @{} 'unused' } catch { $message = $_.Exception.Message }
     Check ($message -match 'BIOS' -and -not $script:calls.Contains('features')) 'disabled virtualization stops before enabling WSL'
     Reset-Scenario
+    $script:scenario='no-wsl'; $script:virtualization=$false; $script:arm64=$true
+    $message=''
+    try { $null = Invoke-ODSPortalSetup @{} 'unused' } catch { $message = $_.Exception.Message }
+    Check ($message -match 'firmware \(UEFI\)' -and $message -notmatch 'Intel|AMD' -and -not $script:calls.Contains('features')) 'on Windows on Arm, disabled virtualization names the UEFI setting and stops before enabling WSL'
+    Reset-Scenario
+    Check ((Invoke-ODSPortalSetup @{} 'unused') -eq 0 -and -not $script:calls.Contains('arm64-check')) 'setup reads the architecture only to word a virtualization stop'
+    Reset-Scenario
     $script:scenario='no-wsl'; $script:dockerInstalled=$false
     Check ((Invoke-ODSPortalSetup @{} 'unused') -eq 3010) 'WSL and Docker Desktop share one restart'
     Check ($script:calls.Contains('features') -and $script:calls.Contains('docker-install') -and $script:calls.Contains('resume')) 'missing Docker Desktop is installed before the WSL restart'
@@ -551,6 +604,27 @@ try {
     $script:dockerInstalled=$false
     Check ((Invoke-ODSPortalSetup @{} 'unused') -eq 3010) 'installing Docker Desktop requests a restart'
     Check ($script:calls.Contains('docker-install') -and $script:calls.Contains('resume') -and -not $script:calls.Contains('install:Ubuntu-24.04')) 'Docker Desktop install continues after restart, not before'
+    Reset-Scenario
+    $script:dockerInstalled=$false; $script:dockerAlreadyInstalled=$true; $script:engineUp=$false
+    Check ((Invoke-ODSPortalSetup @{} 'unused') -eq 0) 'a verified winget no-update result continues with the existing Desktop'
+    Check ($script:calls.Contains('docker-start') -and -not $script:calls.Contains('resume')) 'existing Desktop starts without scheduling a Windows restart'
+    $order = $script:calls.ToArray()
+    $delegate = [Array]::IndexOf($order, 'install:Ubuntu-24.04')
+    foreach ($probe in @('--distribution Ubuntu-24.04 --exec docker info', '--distribution Ubuntu-24.04 --exec docker compose version')) {
+        $index = [Array]::IndexOf($order, $probe)
+        Check ($index -ge 0 -and $index -lt $delegate) 'existing Desktop must pass its WSL Docker and Compose probes before Linux setup'
+    }
+    Reset-Scenario
+    $script:dockerInstalled=$false; $script:dockerAlreadyInstalled=$true
+    $script:integrated=$false; $script:userEnablesIntegration=$false
+    $message=''
+    try { $null = Invoke-ODSPortalSetup @{} 'unused' } catch { $message = $_.Exception.Message }
+    Check ($message -match 'Resources > WSL integration, turn on Ubuntu-24\.04' -and -not $script:calls.Contains('install:Ubuntu-24.04') -and -not $script:calls.Contains('resume')) 'winget no-update never bypasses missing WSL integration'
+    Reset-Scenario
+    $script:dockerInstalled=$false; $script:dockerAlreadyInstalled=$true; $script:scenario='compose'
+    $message=''
+    try { $null = Invoke-ODSPortalSetup @{} 'unused' } catch { $message = $_.Exception.Message }
+    Check ($message -match 'docker compose version must succeed' -and -not $script:calls.Contains('install:Ubuntu-24.04') -and -not $script:calls.Contains('resume')) 'winget no-update never bypasses a failed Compose probe'
     Reset-Scenario
     $script:dockerInstalled=$false; $script:allowPreparation=$false
     Check ((Invoke-ODSPortalSetup @{} 'unused') -eq 1) 'declining Docker Desktop cancels setup'

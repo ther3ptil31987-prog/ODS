@@ -1,6 +1,19 @@
 # Prerequisite orchestration; actual installation remains in install-core.sh.
 . (Join-Path $PSScriptRoot 'wsl-portal-prereqs.ps1')
 . (Join-Path $PSScriptRoot 'wsl-portal-amd.ps1')
+. (Join-Path $PSScriptRoot 'wsl-portal-spark.ps1')
+
+function Get-ODSPortalWindowsBuild {
+    return [Environment]::OSVersion.Version.Build
+}
+
+function Assert-ODSPortalWindowsBuild {
+    # Match the supported installer minimum in enable-wsl-features.ps1.
+    $build = Get-ODSPortalWindowsBuild
+    if ($build -lt 19041) {
+        throw "This version of ODS requires Windows build 19041 or newer. This computer reports build $build. Update Windows, then run the installer again."
+    }
+}
 
 function Write-ODSPortalStage([int]$Step, [string]$Title, [string]$Detail) {
     Write-Host ''
@@ -301,11 +314,12 @@ function Install-ODSPortalDockerBeforeRestart([bool]$NonInteractive) {
     # Docker Desktop also needs a restart after installing, so share the one
     # restart WSL already requires.
     if ((Get-ODSPortalDockerDesktop).Installed) { return }
-    if (Confirm-ODSPortalPreparation $script:ODSPortalDockerConsent $NonInteractive) { Install-ODSPortalDockerDesktop }
+    if (Confirm-ODSPortalPreparation $script:ODSPortalDockerConsent $NonInteractive) { $null = Install-ODSPortalDockerDesktop }
 }
 
 function Initialize-ODSPortalWindowsFoundation([System.Collections.IDictionary]$Options, [string]$InstallerRoot, [bool]$NonInteractive) {
     # Returns $null when WSL is ready, otherwise the exit code to stop with.
+    Assert-ODSPortalWindowsBuild
     $present = [bool](Get-Command wsl.exe -ErrorAction SilentlyContinue)
     $ready = $present -and ((Invoke-ODSPortalWsl -Arguments @('--status')).Code -eq 0)
     Assert-ODSPortalHostCapacity $ready
@@ -358,8 +372,13 @@ function Initialize-ODSPortalDocker([string]$Distro, [System.Collections.IDictio
     $desktop = Get-ODSPortalDockerDesktop
     if (-not $desktop.Installed) {
         if (-not (Confirm-ODSPortalPreparation $script:ODSPortalDockerConsent $NonInteractive)) { return 1 }
-        Install-ODSPortalDockerDesktop
-        return (Request-ODSPortalRestart $InstallerRoot $Options 'Docker Desktop was installed and needs a Windows restart before its first start.')
+        $installation = Install-ODSPortalDockerDesktop
+        if (-not $installation.AlreadyInstalled) {
+            return (Request-ODSPortalRestart $InstallerRoot $Options 'Docker Desktop was installed and needs a Windows restart before its first start.')
+        }
+        # A verified current installation still needs the normal engine and
+        # distro integration checks, not another install or mandatory restart.
+        $desktop = $installation.Desktop
     }
     if (-not (Test-ODSPortalDockerEngine $desktop)) { Start-ODSPortalDockerDesktop $desktop }
     # Setup never edits Docker's settings or restarts Docker: its own
@@ -500,6 +519,14 @@ function Invoke-ODSPortalSetup([System.Collections.IDictionary]$Options, [string
             $forwardEnvironment = $route.Environment
             $windowsModelRoute = $forwardEnvironment.Count -gt 0
         }
+    }
+    # Ubuntu sees its virtual disk's growth limit, not the Windows drive that
+    # stores the disk; ODS checks that drive before model downloads.
+    $wslDiskDrive = Get-ODSPortalDistroDrive $distro
+    if ($wslDiskDrive) {
+        $linuxArgs = @('--wsl-disk-drive', $wslDiskDrive) + $linuxArgs
+    } else {
+        Write-Host "         Could not find the Windows drive that stores $distro. Before model downloads ODS will check only the space inside Ubuntu." -ForegroundColor Yellow
     }
     Write-ODSPortalStage 4 'INSTALL PIXEL / PORTAL' "Prerequisites passed for $distro. Starting the Linux installer."
     Write-Host '         When Ubuntu asks for your [sudo] password, type your Ubuntu password and press Enter. Nothing appears while you type.'

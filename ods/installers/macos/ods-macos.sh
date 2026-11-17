@@ -81,6 +81,9 @@ unset ODS_SCRIPT_HINT
 
 # ── Resolve install directory ──
 INSTALL_DIR="${ODS_INSTALL_DIR}"
+# Only the private child verifier below can enable the internal lifecycle body.
+# An inherited environment variable must never bypass the parent transaction.
+NATIVE_LIFECYCLE_CHILD=false
 
 # ============================================================================
 # Helpers
@@ -120,8 +123,15 @@ test_install() {
 }
 
 get_compose_flags() {
+    if [[ "$NATIVE_LIFECYCLE_CHILD" == true ]]; then
+        "${ODS_PYTHON_CMD:-python3}" "$INSTALL_DIR/installers/macos/lib/pixel-native-lifecycle.py" \
+            --install-dir "$INSTALL_DIR" --verify-child --action "$COMMAND" --service "${native_service:-}" --frozen-flags
+        return $?
+    fi
     local flags helper
     flags="$(_get_base_compose_flags)" || return $?
+    flags="$(/usr/bin/python3 "$INSTALL_DIR/installers/macos/lib/dashboard-private-state.py" \
+        flags --install-dir "$INSTALL_DIR" --flags="$flags")" || return $?
     helper="${INSTALL_DIR}/installers/macos/lib/pixel-native-stack.py"
     if [[ -e "${INSTALL_DIR}/data/pixel-native/preparation/activation.json" || -L "${INSTALL_DIR}/data/pixel-native/preparation/activation.json" ]]; then
         /usr/bin/python3 "$helper" --install-dir "$INSTALL_DIR" --flags="$flags"
@@ -130,13 +140,44 @@ get_compose_flags() {
     fi
 }
 
+dashboard_compose_up() {
+    local flags="$1" action="$2" service="${3:-}"
+    local -a selection=()
+    [[ -z "$service" ]] || selection+=(--service "$service")
+    [[ "$NATIVE_LIFECYCLE_CHILD" != true ]] || selection+=(--native-lifecycle)
+    # The helper checks the selected service's dependency closure: starting
+    # dashboard can also start dashboard-api and must prepare its stores first.
+    "${ODS_PYTHON_CMD:-python3}" "$INSTALL_DIR/installers/macos/lib/dashboard-private-state.py" \
+        launch --install-dir "$INSTALL_DIR" --flags="$flags" --operation "$action" "${selection[@]}"
+}
+
 _get_base_compose_flags() {
     ensure_hermes_dashboard_session_token
 
-    local flags_file="${INSTALL_DIR}/.compose-flags"
+    local flags_file="${INSTALL_DIR}/.compose-flags" cached_flags
     if [[ -f "$flags_file" ]]; then
-        macos_model_store_compose_flags "$(cat "$flags_file")"
-        return $?
+        cached_flags="$(cat "$flags_file")"
+        # docs/PROFILES.md has owners add docker-compose.override.yml after
+        # install; the cache predates it, so resolve (and scan) it again.
+        if [[ ! -f "${INSTALL_DIR}/docker-compose.override.yml" ]] \
+            || /usr/bin/python3 - "$INSTALL_DIR" "$cached_flags" <<'PY'
+import shlex
+import sys
+from pathlib import Path
+
+try:
+    tokens = shlex.split(sys.argv[2])
+except ValueError:
+    sys.exit(1)
+root = Path(sys.argv[1])
+valid = tokens and len(tokens) % 2 == 0 and all(t == '-f' for t in tokens[::2])
+present = valid and any(root / p == root / 'docker-compose.override.yml' for p in tokens[1::2])
+sys.exit(0 if present else 1)
+PY
+        then
+            macos_model_store_compose_flags "$cached_flags"
+            return $?
+        fi
     fi
     # Fallback: dynamic resolution via resolve-compose-stack.sh so user-installed
     # extensions in data/user-extensions/ are discovered when the .compose-flags
@@ -249,6 +290,7 @@ compose_pull_with_retry() {
 
 read_ods_env() {
     local env_file="${INSTALL_DIR}/.env"
+    local selected_key="${1:-}"
     if [[ ! -f "$env_file" ]]; then
         return
     fi
@@ -260,6 +302,7 @@ read_ods_env() {
         if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
             local key="${BASH_REMATCH[1]}"
             local val="${BASH_REMATCH[2]}"
+            [[ -z "$selected_key" || "$key" == "$selected_key" ]] || continue
             # Apply Docker Compose's value grammar, mirrored from
             # lib/safe-env.sh, before stripping quotes: trim surrounding
             # whitespace (Compose trims leading space, so "KEY=  # x" becomes
@@ -397,6 +440,7 @@ BOOTSTRAP_LAUNCH_PY
 }
 
 macos_maybe_resume_bootstrap_upgrade() {
+    [[ "$NATIVE_LIFECYCLE_CHILD" != true ]] || return 0
     local status_file="${INSTALL_DIR}/data/bootstrap-status.json"
     local args_file="${INSTALL_DIR}/data/bootstrap-upgrade.args"
     local upgrade_script="${INSTALL_DIR}/scripts/bootstrap-upgrade.sh"
@@ -487,16 +531,49 @@ upsert_env_value() {
     local env_file="$1"
     local key="$2"
     local value="$3"
-    if grep -qE "^${key}=" "$env_file" 2>/dev/null; then
-        sed -i '' "s|^${key}=.*|${key}=${value}|" "$env_file"
-    else
-        # Appending after a last line that has no newline would join the new
-        # assignment onto that line and corrupt both keys.
-        if [[ -s "$env_file" && -n "$(tail -c 1 "$env_file")" ]]; then
-            printf '\n' >> "$env_file"
+    # The live file may be bind-mounted, so retain its inode. Stage and back up
+    # private copies before opening it for writing; a recoverable copy failure
+    # can then be rolled back without leaving a truncated or exposed .env.
+    (
+        umask 077
+        [[ ! -L "$env_file" && ( ! -e "$env_file" || -f "$env_file" ) ]] || return 1
+        stage_dir="$(mktemp -d "${env_file}.stage.XXXXXX")" || return 1
+        staged="$stage_dir/next"
+        backup=""
+        preserve_backup=false
+        found=false
+        trap 'rm -f "$staged"; if [[ "$preserve_backup" == false ]]; then if [[ -n "$backup" ]]; then rm -f "$backup"; fi; rmdir "$stage_dir"; fi' EXIT
+        if [[ -f "$env_file" ]]; then
+            backup="$stage_dir/previous"
+            cp "$env_file" "$backup" || return 1
+            cmp -s "$env_file" "$backup" || return 1
+            : > "$staged" || return 1
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                if [[ "$line" == "$key="* ]]; then
+                    printf '%s=%s\n' "$key" "$value" || return 1
+                    found=true
+                else
+                    printf '%s\n' "$line" || return 1
+                fi
+            done < "$env_file" > "$staged" || return 1
+            if [[ "$found" == false ]]; then
+                printf '%s=%s\n' "$key" "$value" >> "$staged" || return 1
+            fi
+            if ! cat "$staged" > "$env_file" || ! cmp -s "$staged" "$env_file"; then
+                if ! cp "$backup" "$env_file" || ! cmp -s "$backup" "$env_file"; then
+                    preserve_backup=true
+                    echo "ERROR: failed to restore $env_file after an incomplete write; original retained at $backup" >&2
+                    return 1
+                fi
+                return 1
+            fi
+        else
+            printf '%s=%s\n' "$key" "$value" > "$staged" || return 1
+            # A hard link publishes the private file without replacing a path
+            # that another process created while we were staging it.
+            ln "$staged" "$env_file" || return 1
         fi
-        printf '%s=%s\n' "$key" "$value" >> "$env_file"
-    fi
+    )
 }
 
 ensure_hermes_dashboard_session_token() {
@@ -555,7 +632,7 @@ require_proxy_auth() {
         return 1
     }
     if [[ "$(read_env_value "$env_file" "WEBUI_AUTH")" != "true" ]]; then
-        upsert_env_value "$env_file" "WEBUI_AUTH" "true"
+        upsert_env_value "$env_file" "WEBUI_AUTH" "true" || return 1
         ai "Network access requires sign-in; set WEBUI_AUTH=true."
     fi
     export WEBUI_AUTH=true
@@ -673,15 +750,29 @@ ensure_llama_cpu_budget() {
 
 # ── Native llama-server management ──
 
+# Whether a PID runs this install's llama-server, by the rule that
+# native-llama-service.sh applies before it stops anything. A failed bootstrap
+# leaves the previous PID in the PID file, and macOS can later give that PID to
+# another program.
+native_llama_pid_is_owned() {
+    local command executable
+    command="$(ps -p "$1" -o command= 2>/dev/null)" || return 1
+    command="${command#"${command%%[![:space:]]*}"}"
+    executable="${command%%[[:space:]]*}"
+    [[ "$command" == "$LLAMA_SERVER_BIN" || "$command" == "$LLAMA_SERVER_BIN "* ]] && return 0
+    [[ "${executable##*/}" == llama-server && "$command" == *" --model $INSTALL_DIR/data/models/"* ]]
+}
+
 get_native_llama_status() {
     NATIVE_LLAMA_RUNNING=false
     NATIVE_LLAMA_PID=0
     NATIVE_LLAMA_HEALTHY=false
 
-    local managed_pid
+    local managed_pid managed=false
     managed_pid="$(launchctl print "gui/$(id -u)/com.ods.llama-server" 2>/dev/null | awk '$1 == "pid" && $2 == "=" {print $3; exit}' || true)"
     if [[ "$managed_pid" =~ ^[0-9]+$ ]] && kill -0 "$managed_pid" 2>/dev/null; then
         printf '%s\n' "$managed_pid" > "$LLAMA_SERVER_PID_FILE"
+        managed=true
     fi
 
     if [[ ! -f "$LLAMA_SERVER_PID_FILE" ]]; then
@@ -692,7 +783,9 @@ get_native_llama_status() {
     saved_pid=$(cat "$LLAMA_SERVER_PID_FILE" 2>/dev/null | tr -d '[:space:]')
     [[ -z "$saved_pid" ]] && return
 
-    if kill -0 "$saved_pid" 2>/dev/null; then
+    # launchd vouches for its own job's PID; any other PID must still be ours.
+    if kill -0 "$saved_pid" 2>/dev/null \
+        && { $managed || native_llama_pid_is_owned "$saved_pid"; }; then
         NATIVE_LLAMA_RUNNING=true
         NATIVE_LLAMA_PID="$saved_pid"
 
@@ -713,8 +806,15 @@ get_native_llama_status() {
 
 start_native_llama() {
     local replace="${1:-false}"
+    local bridge_mode="${2:-required}"
     read_ods_env
-    if ! macos_configure_llm_bridge_from_env "${INSTALL_DIR}/.env" "$INSTALL_DIR"; then
+    # Only the native-only CLI branches may defer container access while
+    # Docker is unavailable. Keep the existing private bridge untouched so
+    # its LaunchAgent can recover when the Colima interface returns.
+    if [[ "$bridge_mode" == "native-only" ]] && ! docker info >/dev/null 2>&1; then
+        ai "Docker is unavailable. Container access is deferred; native inference remains on loopback."
+        ai "Once Docker returns, run ods start llama to verify container access."
+    elif ! macos_configure_llm_bridge_from_env "${INSTALL_DIR}/.env" "$INSTALL_DIR"; then
         ai_err "Could not configure container access to native llama-server"
         return 1
     fi
@@ -751,6 +851,11 @@ start_native_llama() {
     mkdir -p "$(dirname "$LLAMA_SERVER_PID_FILE")"
 
     local reasoning="${ENV_LLAMA_REASONING:-off}"
+    # Modes are case-insensitive, as in ods-host-agent.py; llama-server only
+    # accepts the lowercase spelling.
+    local reasoning_lower
+    reasoning_lower="$(printf '%s' "$reasoning" | tr '[:upper:]' '[:lower:]')"
+    case "$reasoning_lower" in off|on|auto) reasoning="$reasoning_lower" ;; esac
     # Map .env values (off/on/auto) to llama-server --reasoning-format values
     local reasoning_fmt
     case "$reasoning" in
@@ -781,6 +886,11 @@ start_native_llama() {
     macos_resolve_checkpoint_args "$INSTALL_DIR" "$LLAMA_SERVER_BIN" "$reasoning_fmt" || return 1
     llama_args+=(${MACOS_NATIVE_CHECKPOINT_ARGS[@]+"${MACOS_NATIVE_CHECKPOINT_ARGS[@]}"})
     fi
+    # The projector the host agent's switch launches with: a qualified profile's
+    # or a vision import's own (WP2), so a restart keeps the model's vision.
+    [[ -n "${MACOS_NATIVE_PROJECTOR_PATH:-}" ]] && llama_args+=(--mmproj "$MACOS_NATIVE_PROJECTOR_PATH")
+    # A fixed chat template the switch chose for an exact template match (WP5).
+    [[ -n "${MACOS_NATIVE_CHAT_TEMPLATE_PATH:-}" ]] && llama_args+=(--chat-template-file "$MACOS_NATIVE_CHAT_TEMPLATE_PATH")
 
     # Artifact and argument verification must precede termination of working inference.
     [[ "$replace" != true ]] || stop_native_llama
@@ -820,13 +930,9 @@ stop_native_llama() {
         return
     fi
 
-    kill "$NATIVE_LLAMA_PID" 2>/dev/null || true
-    sleep 2
-    # Force kill if still running
-    if kill -0 "$NATIVE_LLAMA_PID" 2>/dev/null; then
-        kill -9 "$NATIVE_LLAMA_PID" 2>/dev/null || true
-    fi
-    rm -f "$LLAMA_SERVER_PID_FILE" 2>/dev/null
+    # native-llama-service.sh stopped every install-owned llama-server and
+    # removed the PID file. Signalling the saved PID again could reach a
+    # program that macOS gave the same PID after llama-server exited.
     ai_ok "Native llama-server stopped (PID ${NATIVE_LLAMA_PID})"
 }
 
@@ -921,11 +1027,70 @@ cmd_status() {
     echo ""
 }
 
+native_lifecycle_selected() {
+    local service="${1:-}" flags
+    [[ "$NATIVE_LIFECYCLE_CHILD" == false ]] || return 1
+    [[ -z "$service" || "$service" == "pixel-native-ingress" ]] || return 1
+    flags=$(get_compose_flags) || return 2
+    [[ "$flags" == *installers/macos/pixel-native.compose.yaml.disabled* ]]
+}
+
+run_native_lifecycle() {
+    local action="$1" service="${2:-}" restarted_mode=""
+    # Freeze the same authenticated selection that the child will recreate.
+    # Changing .env after capture would invalidate the transaction's inputs.
+    if [[ -z "$service" ]] && network_access_is_enabled; then
+        require_proxy_auth || return 1
+    fi
+    if [[ "$action" == restart && -z "$service" ]]; then
+        restarted_mode="$(read_env_value "$INSTALL_DIR/.env" ODS_MODE)"
+    fi
+    "${ODS_PYTHON_CMD:-python3}" "$INSTALL_DIR/installers/macos/lib/pixel-native-ingress-refresh.py" \
+        --install-dir "$INSTALL_DIR" --start-stopped-edge \
+        --lifecycle-action "$action" --lifecycle-service "$service" --lifecycle-bash "$BASH" || return $?
+    # The child only applies its frozen stack. Refresh the independent agent
+    # after the parent has verified that result and released admission.
+    if [[ "$action" == restart && -z "$service" && -f "$INSTALL_DIR/bin/ods-host-agent.py" ]]; then
+        bash "$INSTALL_DIR/ods-cli" agent refresh-mode "$restarted_mode" || return 1
+    fi
+    # Async model continuation begins only after admission has been released;
+    # its existing detached launcher closes inherited file descriptors.
+    [[ -n "$service" ]] || macos_maybe_resume_bootstrap_upgrade || true
+}
+
+native_lifecycle_compose() {
+    if [[ "$NATIVE_LIFECYCLE_CHILD" == true ]]; then
+        "${ODS_PYTHON_CMD:-python3}" "$INSTALL_DIR/installers/macos/lib/pixel-native-lifecycle.py" \
+            --install-dir "$INSTALL_DIR" --verify-child --action "$COMMAND" --service "${native_service:-}" || return 1
+        "${ODS_NATIVE_LIFECYCLE_DOCKER:?Verified Docker selection required}" compose "$@"
+        return $?
+    fi
+    docker compose "$@"
+}
+
 cmd_start() {
     local service="${1:-}"
+    if [[ "$service" == "llama-server" || "$service" == "llama" ]]; then
+        test_install_dir
+        cd "$INSTALL_DIR"
+        ensure_llama_cpu_budget
+        macos_wait_for_bootstrap_compose_safe "start" || return 1
+        start_native_llama false native-only || return 1
+        macos_maybe_resume_bootstrap_upgrade || true
+        return 0
+    fi
     test_install
     cd "$INSTALL_DIR"
-    ensure_llama_cpu_budget
+    [[ "$NATIVE_LIFECYCLE_CHILD" == true ]] || ensure_llama_cpu_budget
+    if native_lifecycle_selected "$service"; then
+        run_native_lifecycle start "$service"
+        return $?
+    else
+        local native_rc=$?
+        [[ "$native_rc" == 1 ]] || return "$native_rc"
+    fi
+    local native_wait=()
+    [[ "$NATIVE_LIFECYCLE_CHILD" != true ]] || native_wait=(--wait --wait-timeout 120 --no-build --pull never)
 
     # Start native llama-server first
     if [[ -z "$service" ]]; then
@@ -961,7 +1126,7 @@ cmd_start() {
     elif [[ -n "$service" ]]; then
         ai "Starting ${service}..."
         # shellcheck disable=SC2086
-        if ! docker compose $flags up -d "$service"; then
+        if ! dashboard_compose_up "$flags" start "$service"; then
             ai_err "Failed to start ${service}."
             return 1
         fi
@@ -969,7 +1134,7 @@ cmd_start() {
     else
         ai "Starting all services..."
         # shellcheck disable=SC2086
-        if ! docker compose $flags up -d; then
+        if ! dashboard_compose_up "$flags" start; then
             ai_err "Failed to start ODS services."
             return 1
         fi
@@ -989,6 +1154,12 @@ cmd_start() {
 
 cmd_stop() {
     local service="${1:-}"
+    if [[ "$service" == "llama-server" || "$service" == "llama" ]]; then
+        test_install_dir
+        cd "$INSTALL_DIR"
+        stop_native_llama
+        return $?
+    fi
     test_install
     cd "$INSTALL_DIR"
 
@@ -1034,9 +1205,27 @@ cmd_stop() {
 
 cmd_restart() {
     local service="${1:-}"
+    if [[ "$service" == "llama-server" || "$service" == "llama" ]]; then
+        test_install_dir
+        cd "$INSTALL_DIR"
+        ensure_llama_cpu_budget
+        macos_wait_for_bootstrap_compose_safe "restart" || return 1
+        start_native_llama true native-only || return 1
+        macos_maybe_resume_bootstrap_upgrade || true
+        return 0
+    fi
     test_install
     cd "$INSTALL_DIR"
-    ensure_llama_cpu_budget
+    [[ "$NATIVE_LIFECYCLE_CHILD" == true ]] || ensure_llama_cpu_budget
+    if native_lifecycle_selected "$service"; then
+        run_native_lifecycle restart "$service"
+        return $?
+    else
+        local native_rc=$?
+        [[ "$native_rc" == 1 ]] || return "$native_rc"
+    fi
+    local native_wait=()
+    [[ "$NATIVE_LIFECYCLE_CHILD" != true ]] || native_wait=(--wait --wait-timeout 120 --no-build --pull never)
 
     local flags
     flags=$(get_compose_flags)
@@ -1066,7 +1255,7 @@ cmd_restart() {
     elif [[ -n "$service" ]]; then
         ai "Restarting ${service}..."
         # shellcheck disable=SC2086
-        if ! docker compose $flags up -d --force-recreate --no-build --pull never "$service"; then
+        if ! dashboard_compose_up "$flags" restart "$service"; then
             ai_err "Failed to restart ${service}."
             return 1
         fi
@@ -1082,11 +1271,18 @@ cmd_restart() {
         macos_wait_for_bootstrap_compose_safe "restart" || return 1
         start_native_llama true || ai_warn "Native llama-server did not restart; continuing with the container services."
 
+        local restarted_mode
+        restarted_mode="$(read_env_value "$INSTALL_DIR/.env" ODS_MODE)"
         ai "Restarting all services..."
         # shellcheck disable=SC2086
-        if ! docker compose $flags up -d --force-recreate --no-build --pull never; then
+        if ! dashboard_compose_up "$flags" restart; then
             ai_err "Failed to restart ODS services."
             return 1
+        fi
+        # The native agent keeps its startup mode independently of Docker.
+        # Reuse the shared authenticated comparison and launchd restart path.
+        if [[ "$NATIVE_LIFECYCLE_CHILD" != true && -f "$INSTALL_DIR/bin/ods-host-agent.py" ]]; then
+            bash "$INSTALL_DIR/ods-cli" agent refresh-mode "$restarted_mode" || return 1
         fi
         ai_ok "All services restarted"
     fi
@@ -1143,7 +1339,7 @@ cmd_config_show() {
         return
     fi
 
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
         line_trimmed=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [[ "$line_trimmed" =~ ^# ]] && echo -e "  ${DGRN}${line_trimmed}${NC}" && continue
         [[ -z "$line_trimmed" ]] && continue
@@ -1200,38 +1396,55 @@ cmd_chat() {
         return 1
     }
 
+    local content
+    content=$(printf '%s' "$response" | jq -er '.choices[0].message.content | select(type == "string") | select(test("\\S"))') || {
+        local backend_error
+        backend_error=$(printf '%s' "$response" | jq -r '.error.message // "No assistant text in the response"' 2>/dev/null || true)
+        ai_err "LLM error: ${backend_error:-Invalid response}"
+        return 1
+    }
+
     echo ""
-    echo "$response" | jq -r '.choices[0].message.content // .error.message // "Error: no response"'
+    printf '%s\n' "$content"
     echo ""
 }
 
 cmd_update_pixel() {
     test_install
     /usr/bin/python3 "${INSTALL_DIR}/installers/macos/lib/pixel-native-update.py" \
-        --install-dir "$INSTALL_DIR" --ods-source "$INSTALL_DIR" "$@"
+        --install-dir "$INSTALL_DIR" --ods-source "$INSTALL_DIR" --prompt-for-sudo "$@"
 }
 
 cmd_update() {
     test_install
     cd "$INSTALL_DIR"
-    ensure_llama_cpu_budget
-
+    [[ "$NATIVE_LIFECYCLE_CHILD" == true ]] || ensure_llama_cpu_budget
     # Upsert SHIELD_API_KEY when missing (pre-PR-#1069 upgrade path).
     # Without it the dashboard Privacy Shield stats panel fails after
     # update because dashboard-api can no longer authenticate its
     # proxied /stats call. Mirrors env-generator.sh upsert pattern.
     local _env_file="${INSTALL_DIR}/.env"
-    if [[ -f "$_env_file" ]] && [[ -z "$(read_env_value "$_env_file" "SHIELD_API_KEY")" ]]; then
+    if [[ "$NATIVE_LIFECYCLE_CHILD" != true && -f "$_env_file" ]] && [[ -z "$(read_env_value "$_env_file" "SHIELD_API_KEY")" ]]; then
         local _shield_key
         _shield_key=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p | tr -d '\n')
         upsert_env_value "$_env_file" "SHIELD_API_KEY" "$_shield_key"
     fi
 
+    if native_lifecycle_selected; then
+        run_native_lifecycle update
+        return $?
+    else
+        local native_rc=$?
+        [[ "$native_rc" == 1 ]] || return "$native_rc"
+    fi
+    local native_wait=()
+    [[ "$NATIVE_LIFECYCLE_CHILD" != true ]] || native_wait=(--wait --wait-timeout 120 --no-build --pull never)
+
     local flags
     flags=$(get_compose_flags)
 
     ai "Pulling latest images..."
-    compose_pull_with_retry "$flags"
+    [[ "$NATIVE_LIFECYCLE_CHILD" == true ]] || compose_pull_with_retry "$flags"
 
     # Recreating everything recreates Open WebUI too.
     if network_access_is_enabled; then
@@ -1240,7 +1453,7 @@ cmd_update() {
 
     ai "Recreating containers..."
     # shellcheck disable=SC2086
-    docker compose $flags up -d --force-recreate
+    dashboard_compose_up "$flags" update || return 1
     ai_ok "Update complete"
     macos_maybe_resume_bootstrap_upgrade || true
 
@@ -1286,7 +1499,27 @@ show_help() {
 # Command Dispatch
 # ============================================================================
 
+# A fresh shell must use the interpreter prepared and saved by the installer.
+# Read only this selector with the existing literal .env grammar; never source
+# the file. A nonempty explicit environment override still takes precedence.
+if [[ -z "${ODS_PYTHON_CMD:-}" ]]; then
+    unset ENV_ODS_PYTHON_CMD
+    read_ods_env ODS_PYTHON_CMD
+    if [[ -n "${ENV_ODS_PYTHON_CMD:-}" ]]; then
+        export ODS_PYTHON_CMD="$ENV_ODS_PYTHON_CMD"
+    fi
+fi
+
 COMMAND="${1:-help}"
+if [[ "$COMMAND" == __native-lifecycle ]]; then
+    [[ $# == 3 ]] || { ai_err "Native lifecycle action is incomplete."; exit 1; }
+    "${ODS_PYTHON_CMD:-python3}" "$INSTALL_DIR/installers/macos/lib/pixel-native-lifecycle.py" \
+        --install-dir "$INSTALL_DIR" --verify-child --action "$2" --service "$3" || exit 1
+    COMMAND="$2"
+    native_service="$3"
+    NATIVE_LIFECYCLE_CHILD=true
+    set -- "$COMMAND" "$native_service"
+fi
 shift || true
 
 case "$COMMAND" in

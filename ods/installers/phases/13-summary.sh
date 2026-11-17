@@ -13,7 +13,9 @@
 #           COMPOSE_FLAGS, SUMMARY_JSON_FILE, PREFLIGHT_REPORT_FILE,
 #           BGRN, GRN, AMB, WHT, NC, DASHBOARD_PORT (:-3001),
 #           CAP_HARDWARE_CLASS_ID (:-unknown), CAP_HARDWARE_CLASS_LABEL (:-Unknown),
-#           BACKEND_SERVICE_NAME (:-llama-server),
+#           BACKEND_SERVICE_NAME (:-llama-server), LLM_BACKEND (vllm names the
+#           vLLM engine, VLLM_GPU_UUID and VLLM_SERVED_MODEL),
+#           SDXL_CHECKPOINT_DIR, SDXL_MODEL (set by phase 11 when ComfyUI is enabled),
 #           show_success_card(), bootline(), signal(), ai_ok(), log()
 # Provides: Desktop shortcut, sidebar pin, summary JSON
 #
@@ -33,6 +35,45 @@ if [[ -f "$INSTALL_DIR/.env" ]]; then
     . "$SCRIPT_DIR/lib/safe-env.sh" 2>/dev/null || true
     load_env_file "$INSTALL_DIR/.env"
     sr_resolve_ports
+fi
+
+# Required published readiness must precede any installation success message.
+if ! $DRY_RUN && command -v ods_readiness_summary >/dev/null 2>&1; then
+    _dashboard_url="http://localhost:${SERVICE_PORTS[dashboard]:-3001}"
+    if ! {
+        printf 'Dashboard|http://127.0.0.1:%s%s|%s|%s\n' \
+            "${SERVICE_PORTS[dashboard]:-3001}" "${SERVICE_HEALTH[dashboard]:-/}" "$(sr_container dashboard)" "$_dashboard_url"
+        if [[ "${ENABLE_OPEN_WEBUI:-true}" == "true" ]]; then
+            printf 'Chat UI (Open WebUI)|http://127.0.0.1:%s%s|%s|%s\n' \
+                "${SERVICE_PORTS[open-webui]:-3000}" "${SERVICE_HEALTH[open-webui]:-/}" "$(sr_container open-webui)" "http://localhost:${SERVICE_PORTS[open-webui]:-3000}"
+        fi
+        ods_readiness_model_line \
+            "${SERVICE_PORTS[llama-server]:-8080}" "${SERVICE_HEALTH[llama-server]:-/health}" \
+            "$(sr_container llama-server)" "${SERVICE_PORTS[litellm]:-4000}"
+        printf 'Dashboard API|http://127.0.0.1:%s%s|%s|%s\n' \
+            "${SERVICE_PORTS[dashboard-api]:-3002}" "${SERVICE_HEALTH[dashboard-api]:-/health}" "$(sr_container dashboard-api)" "http://localhost:${SERVICE_PORTS[dashboard-api]:-3002}"
+        printf 'LiteLLM|http://127.0.0.1:%s%s|%s|%s\n' \
+            "${SERVICE_PORTS[litellm]:-4000}" "${SERVICE_HEALTH[litellm]:-/health/readiness}" "$(sr_container litellm)" "http://localhost:${SERVICE_PORTS[litellm]:-4000}"
+        [[ "${ENABLE_PERPLEXICA:-false}" == "true" ]] && printf 'Perplexica|http://127.0.0.1:%s%s|%s|%s\n' \
+            "${SERVICE_PORTS[perplexica]:-3004}" "${SERVICE_HEALTH[perplexica]:-/}" "$(sr_container perplexica)" "http://localhost:${SERVICE_PORTS[perplexica]:-3004}"
+        [[ "$ENABLE_VOICE" == "true" ]] && printf 'Whisper (STT)|http://127.0.0.1:%s%s|%s|%s\n' \
+            "${SERVICE_PORTS[whisper]:-9000}" "${SERVICE_HEALTH[whisper]:-/health}" "$(sr_container whisper)" "http://localhost:${SERVICE_PORTS[whisper]:-9000}"
+        [[ "$ENABLE_VOICE" == "true" ]] && printf 'Kokoro (TTS)|http://127.0.0.1:%s%s|%s|%s\n' \
+            "${SERVICE_PORTS[tts]:-8880}" "${SERVICE_HEALTH[tts]:-/health}" "$(sr_container tts)" "http://localhost:${SERVICE_PORTS[tts]:-8880}"
+        [[ "$ENABLE_WORKFLOWS" == "true" ]] && printf 'n8n|http://127.0.0.1:%s%s|%s|%s\n' \
+            "${SERVICE_PORTS[n8n]:-5678}" "${SERVICE_HEALTH[n8n]:-/healthz}" "$(sr_container n8n)" "http://localhost:${SERVICE_PORTS[n8n]:-5678}"
+        [[ "${ENABLE_QDRANT:-${ENABLE_RAG:-false}}" == "true" ]] && printf 'Qdrant|http://127.0.0.1:%s%s|%s|%s\n' \
+            "${SERVICE_PORTS[qdrant]:-6333}" "${SERVICE_HEALTH[qdrant]:-/}" "$(sr_container qdrant)" "http://localhost:${SERVICE_PORTS[qdrant]:-6333}"
+        [[ "${ENABLE_COMFYUI:-}" == "true" ]] && printf 'ComfyUI|http://127.0.0.1:%s%s|%s|%s\n' \
+            "${SERVICE_PORTS[comfyui]:-8188}" "${SERVICE_HEALTH[comfyui]:-/}" "$(sr_container comfyui)" "http://localhost:${SERVICE_PORTS[comfyui]:-8188}"
+        # Ensure the block exits 0 regardless of the trailing optional conditionals:
+        # under set -e + pipefail, a false `[[ ENABLE_x ]] && printf` makes the block
+        # return 1, which propagates through the pipe and trips the ERR trap.
+        :
+    } | ods_readiness_summary "ods status" "$LOG_FILE" "$_dashboard_url" "Dashboard"; then
+        ODS_INSTALL_REQUIRED_READINESS_FAILED=true
+        return 1
+    fi
 fi
 
 # Get local IP for LAN access
@@ -55,7 +96,7 @@ if $DRY_RUN; then
     echo ""
 else
     _summary_chat_url=""
-    [[ "${ENABLE_OPEN_WEBUI:-true}" != "true" ]] || _summary_chat_url="http://localhost:3000"
+    [[ "${ENABLE_OPEN_WEBUI:-true}" != "true" ]] || _summary_chat_url="http://localhost:${SERVICE_PORTS[open-webui]:-3000}"
     if [[ -z "$_summary_chat_url" && "${ENABLE_PIXEL_RUNTIME:-false}" == true ]]; then
         _summary_chat_url="http://localhost:${SERVICE_PORTS[dashboard]:-3001}/pixel"
     fi
@@ -110,20 +151,34 @@ if [[ -f "$SCRIPT_DIR/installers/lib/background-tasks.sh" ]]; then
         bg_task_summary >> "$LOG_FILE" 2>&1
 
         # Check SDXL Lightning download specifically
-        if bg_task_status "sdxl-download" &>/dev/null; then sdxl_status=0; else sdxl_status=$?; fi
+        # The downloader renames only a verified file, so a model in place is
+        # ready whatever an older log in the task registry says.
+        if [[ -n "${SDXL_CHECKPOINT_DIR:-}" && -f "$SDXL_CHECKPOINT_DIR/${SDXL_MODEL:-}" ]]; then
+            sdxl_status=4
+        elif bg_task_status "sdxl-download" &>/dev/null; then sdxl_status=0; else sdxl_status=$?; fi
+        # The same command finishes the download by hand; it resumes the part.
+        printf -v sdxl_resume '%q ' "${ODS_PYTHON_CMD:-python3}" "$INSTALL_DIR/bin/extension_assets.py" \
+            "$INSTALL_DIR/extensions/services/comfyui" "$INSTALL_DIR" "$GPU_BACKEND"
+        sdxl_resume="${sdxl_resume% }"
         if [[ $sdxl_status -ne 3 ]]; then
             case $sdxl_status in
                 0)  # Still running
                     ai_warn "SDXL Lightning model download still in progress"
                     ai "ComfyUI image generation will be available once download completes"
                     ai "Check progress: tail -f $INSTALL_DIR/logs/sdxl-download.log"
+                    ai "If it stops, finish it with: $sdxl_resume"
                     ;;
                 1)  # Completed
                     ai_ok "SDXL Lightning model download completed"
                     ;;
+                4)  # In place
+                    ai_ok "SDXL Lightning model is in place"
+                    ;;
                 2)  # Failed
                     ai_warn "SDXL Lightning model download encountered errors"
                     ai "Check log: $INSTALL_DIR/logs/sdxl-download.log"
+                    ai "Fix what the log names, then finish it with: $sdxl_resume"
+                    ai "Need help? Ask on the ODS Discord: ${ODS_HELP_DISCORD_URL:-https://discord.gg/4ntNp9MAwC}"
                     ;;
             esac
         fi
@@ -163,6 +218,8 @@ bootline
 echo "  • Dashboard:     http://localhost:${SERVICE_PORTS[dashboard]:-3001}"
 if [[ -n "${EXTERNAL_LLM_URL:-}" || "${ODS_MODE:-local}" == "cloud" || -n "${NATIVE_LLM_BASE_URL:-}" ]]; then
     echo "  • LLM API:       http://localhost:${SERVICE_PORTS[litellm]:-4000}/v1  (managed LiteLLM gateway)"
+elif [[ "${LLM_BACKEND:-}" == "vllm" ]]; then
+    echo "  • LLM API:       http://localhost:${SERVICE_PORTS[litellm]:-4000}/v1  (LiteLLM gateway to the vLLM engine)"
 else
     echo "  • LLM API:       http://localhost:${SERVICE_PORTS[llama-server]:-11434}/v1  (llama-server)"
 fi
@@ -190,6 +247,9 @@ bootline
 echo "  • Tier: $TIER ($TIER_NAME)"
 if [[ "${ODS_GATEWAY_ONLY:-false}" == true ]]; then
     echo "  • External model: ${EXTERNAL_LLM_MODEL:-unknown}"
+elif [[ "${LLM_BACKEND:-}" == "vllm" ]]; then
+    echo "  • Engine: vLLM on GPU ${VLLM_GPU_UUID:-unknown}"
+    echo "  • Model: ${VLLM_SERVED_MODEL:-$LLM_MODEL} (${LLM_MODEL}, ${MAX_CONTEXT:-?} tokens of context)"
 else
     echo "  • Model: $LLM_MODEL"
 fi
@@ -208,10 +268,13 @@ echo ""
 bootline
 echo -e "${BGRN}QUICK COMMANDS${NC}"
 bootline
+# The stack is a resolved multi-file Compose project with no docker-compose.yml
+# in INSTALL_DIR, so bare `docker compose ...` fails there. The ods CLI passes
+# the resolved -f flags.
 echo "  cd $INSTALL_DIR"
-echo "  docker compose ps                          # Check container status"
-echo "  docker compose logs -f                     # View container logs"
-echo "  docker compose restart                     # Restart containers"
+echo "  ods list                                   # List services and their state"
+echo "  ods logs <service>                         # Follow one service's logs"
+echo "  ods restart                                # Restart the stack"
 echo "  systemctl --user list-timers               # Check maintenance timers"
 echo "  ods status                                 # Check service health"
 [[ "${ENABLE_PIXEL_RUNTIME:-false}" == "true" ]] && echo "  bash install.sh --no-pixel --hermes         # Disable Portal; keep Hermes enabled"
@@ -429,40 +492,6 @@ print("ok" if values.get("setupComplete") and has_model and prefs.get("defaultCh
     fi
 fi
 
-if ! $DRY_RUN && command -v ods_readiness_summary >/dev/null 2>&1; then
-    _dashboard_url="http://localhost:${SERVICE_PORTS[dashboard]:-3001}"
-    {
-        printf 'Dashboard|http://127.0.0.1:%s%s|%s|%s\n' \
-            "${SERVICE_PORTS[dashboard]:-3001}" "${SERVICE_HEALTH[dashboard]:-/}" "$(sr_container dashboard)" "$_dashboard_url"
-        if [[ "${ENABLE_OPEN_WEBUI:-true}" == "true" ]]; then
-            printf 'Chat UI (Open WebUI)|http://127.0.0.1:%s%s|%s|%s\n' \
-                "${SERVICE_PORTS[open-webui]:-3000}" "${SERVICE_HEALTH[open-webui]:-/}" "$(sr_container open-webui)" "http://localhost:${SERVICE_PORTS[open-webui]:-3000}"
-        fi
-        ods_readiness_model_line \
-            "${SERVICE_PORTS[llama-server]:-8080}" "${SERVICE_HEALTH[llama-server]:-/health}" \
-            "$(sr_container llama-server)" "${SERVICE_PORTS[litellm]:-4000}"
-        printf 'Dashboard API|http://127.0.0.1:%s%s|%s|%s\n' \
-            "${SERVICE_PORTS[dashboard-api]:-3002}" "${SERVICE_HEALTH[dashboard-api]:-/health}" "$(sr_container dashboard-api)" "http://localhost:${SERVICE_PORTS[dashboard-api]:-3002}"
-        printf 'LiteLLM|http://127.0.0.1:%s%s|%s|%s\n' \
-            "${SERVICE_PORTS[litellm]:-4000}" "${SERVICE_HEALTH[litellm]:-/health/readiness}" "$(sr_container litellm)" "http://localhost:${SERVICE_PORTS[litellm]:-4000}"
-        [[ "${ENABLE_PERPLEXICA:-false}" == "true" ]] && printf 'Perplexica|http://127.0.0.1:%s%s|%s|%s\n' \
-            "${SERVICE_PORTS[perplexica]:-3004}" "${SERVICE_HEALTH[perplexica]:-/}" "$(sr_container perplexica)" "http://localhost:${SERVICE_PORTS[perplexica]:-3004}"
-        [[ "$ENABLE_VOICE" == "true" ]] && printf 'Whisper (STT)|http://127.0.0.1:%s%s|%s|%s\n' \
-            "${SERVICE_PORTS[whisper]:-9000}" "${SERVICE_HEALTH[whisper]:-/health}" "$(sr_container whisper)" "http://localhost:${SERVICE_PORTS[whisper]:-9000}"
-        [[ "$ENABLE_VOICE" == "true" ]] && printf 'Kokoro (TTS)|http://127.0.0.1:%s%s|%s|%s\n' \
-            "${SERVICE_PORTS[tts]:-8880}" "${SERVICE_HEALTH[tts]:-/health}" "$(sr_container tts)" "http://localhost:${SERVICE_PORTS[tts]:-8880}"
-        [[ "$ENABLE_WORKFLOWS" == "true" ]] && printf 'n8n|http://127.0.0.1:%s%s|%s|%s\n' \
-            "${SERVICE_PORTS[n8n]:-5678}" "${SERVICE_HEALTH[n8n]:-/healthz}" "$(sr_container n8n)" "http://localhost:${SERVICE_PORTS[n8n]:-5678}"
-        [[ "${ENABLE_QDRANT:-${ENABLE_RAG:-false}}" == "true" ]] && printf 'Qdrant|http://127.0.0.1:%s%s|%s|%s\n' \
-            "${SERVICE_PORTS[qdrant]:-6333}" "${SERVICE_HEALTH[qdrant]:-/}" "$(sr_container qdrant)" "http://localhost:${SERVICE_PORTS[qdrant]:-6333}"
-        [[ "${ENABLE_COMFYUI:-}" == "true" ]] && printf 'ComfyUI|http://127.0.0.1:%s%s|%s|%s\n' \
-            "${SERVICE_PORTS[comfyui]:-8188}" "${SERVICE_HEALTH[comfyui]:-/}" "$(sr_container comfyui)" "http://localhost:${SERVICE_PORTS[comfyui]:-8188}"
-        # Ensure the block exits 0 regardless of the trailing optional conditionals:
-        # under set -e + pipefail, a false `[[ ENABLE_x ]] && printf` makes the block
-        # return 1, which propagates through the pipe and trips the ERR trap.
-        :
-    } | ods_readiness_summary "ods status" "$LOG_FILE" "$_dashboard_url"
-fi
 
 echo ""
 if $DRY_RUN; then
@@ -526,7 +555,10 @@ if [[ -n "$SUMMARY_JSON_FILE" ]]; then
         PYTHON_CMD="python"
     fi
 
-    "$PYTHON_CMD" - "$SUMMARY_JSON_FILE" "$VERSION" "$INSTALL_DIR" "$TIER" "$TIER_NAME" "$GPU_BACKEND" "${BACKEND_SERVICE_NAME:-llama-server}" "$LLM_MODEL" "$COMPOSE_FLAGS" "$DRY_RUN" "$PREFLIGHT_REPORT_FILE" "${CAP_HARDWARE_CLASS_ID:-unknown}" "${CAP_HARDWARE_CLASS_LABEL:-Unknown}" "${PIXEL_AGENT_MODE:-hermes}" <<'PY'
+    # The model server's compose service: vllm-server for the vLLM engine.
+    _summary_backend_service="${BACKEND_SERVICE_NAME:-llama-server}"
+    [[ "${LLM_BACKEND:-}" != "vllm" ]] || _summary_backend_service=vllm-server
+    "$PYTHON_CMD" - "$SUMMARY_JSON_FILE" "$VERSION" "$INSTALL_DIR" "$TIER" "$TIER_NAME" "$GPU_BACKEND" "$_summary_backend_service" "$LLM_MODEL" "$COMPOSE_FLAGS" "$DRY_RUN" "$PREFLIGHT_REPORT_FILE" "${CAP_HARDWARE_CLASS_ID:-unknown}" "${CAP_HARDWARE_CLASS_LABEL:-Unknown}" "${PIXEL_AGENT_MODE:-hermes}" <<'PY'
 import json
 import os
 import pathlib
